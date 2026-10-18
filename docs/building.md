@@ -71,7 +71,9 @@ Both workflows use hosted Windows runners. There is no self-hosted bridge job an
 
 `ci.yml` publishes the host, runs `tests/HostBehaviorCheck`, validates every entry in `dist/bridge/versions.json` and its package structure, and parses the PowerShell scripts.
 
-`release.yml` runs for tags matching `v*` or `workflow_dispatch`. It publishes the host, resolves the latest tracked bridge package, assembles the release ZIP, and uploads it. A tag also creates a GitHub release; a manual dispatch produces the release ZIP artifact.
+`release.yml` runs for tags matching `v*` or `workflow_dispatch`. It publishes the release ZIP as both an Actions artifact and a GitHub release asset.
+
+A tag run (including manual dispatch on a tag) creates or updates a normal release. A branch dispatch creates or updates a prerelease tagged `v0.0.0-dev.<run number>` at the selected commit.
 
 The release ZIP contains:
 

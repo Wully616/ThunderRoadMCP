@@ -115,15 +115,17 @@ jobs:
           if-no-files-found: error
 
       - name: Create or update GitHub release
-        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$env:GITHUB_REF_NAME" --json tagName *> $null
+          $releaseTag = $env:RELEASE_VERSION
+          gh release view "$releaseTag" --json tagName *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload "$env:GITHUB_REF_NAME" "$env:RELEASE_ARCHIVE" --clobber
+            gh release upload "$releaseTag" "$env:RELEASE_ARCHIVE" --clobber
           } else {
-            gh release create "$env:GITHUB_REF_NAME" "$env:RELEASE_ARCHIVE" --title "$env:GITHUB_REF_NAME" --generate-notes
+            $releaseOptions = @('--target', $env:GITHUB_SHA)
+            if ($env:GITHUB_REF_TYPE -ne 'tag') { $releaseOptions += '--prerelease' }
+            gh release create "$releaseTag" "$env:RELEASE_ARCHIVE" --title "$releaseTag" --generate-notes @releaseOptions
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
