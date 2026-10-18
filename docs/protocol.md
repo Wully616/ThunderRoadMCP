@@ -1,0 +1,51 @@
+# Local bridge protocol
+
+The in-game mod listens only on `127.0.0.1` (default TCP port `47831`). Each connection carries one UTF-8 JSON Lines request (one JSON object followed by newline); the server returns one response and closes the connection. Request and response lines are limited to 64 KiB. Oversized results return a small error response rather than truncated JSON.
+
+## Local bridge configuration
+
+The bridge config path is `%LOCALAPPDATA%\ThunderRoadMcp\bridge.json` by default. `THUNDERROAD_MCP_CONFIG` overrides that path; the MCP host and game process must use the same path. The bridge stays disabled unless this file exists, parses, and sets `enabled` to `true`. Installing the mod alone does not open a listener. Keep this file out of source control.
+
+Generate a fresh 32-byte cryptographically random secret and encode it as 64 hexadecimal characters. Do not use a password or reuse another credential. Use the Windows PowerShell 5.1-compatible recipe in the [bridge configuration](usage.md#bridge-configuration) section of the usage guide, which creates the file without overwriting an existing config.
+
+```json
+{
+  "enabled": true,
+  "host": "127.0.0.1",
+  "port": 47831,
+  "token": "<64 hex characters>"
+}
+```
+
+The separate host launch config is `%LOCALAPPDATA%\ThunderRoadMcp\launch.json` with `{ "executablePath": "<absolute path>", "arguments": ["<argument>"] }`. `THUNDERROAD_MCP_LAUNCH_CONFIG` can override the config path. Arguments are passed as an array, never through a shell; use `["-level", "arena"]` to start in Arena. The host stops/restarts only processes it launched itself, and does not stop one on host exit. Never pass the bridge token through command-line arguments or check in either local config.
+
+`game_install_mod` accepts `{ "packagePath": "<absolute path to ThunderRoadMcp.zip>" }`. It derives `<game executable directory>/<executable stem>_Data/StreamingAssets/Mods/ThunderRoadMcp` from `launch.json`, accepts only the root bridge DLL, a `manifest.json` naming `ThunderRoadMcp`, and `runtime/*.dll.payload` files, rejects duplicate/unexpected/traversal paths and content over 256 MiB, stages extraction, then moves the completed directory into place. It refuses any existing destination and does not launch or reload the game; restart manually after installation.
+
+The host executable also supports `--list-installations` (the same JSON envelope as `game_installations`) and `--install-bridge <absolute-zip> --game-executable <absolute-exe>`. These CLI modes run before MCP startup, reuse the same discovery and staged package validation, do not write either config or launch the game, and emit only JSON on stdout. Run `--help` for usage.
+
+## Wire messages
+
+Request:
+
+```json
+{"id":"request-1","token":"<secret>","method":"status","parameters":{}}
+```
+
+Success response:
+
+```json
+{"id":"request-1","success":true,"result":{}}
+```
+
+Failure response: `{"id":"request-1","success":false,"error":"message"}`. Unknown methods, malformed input, invalid credentials, and invalid parameters fail without executing code. Every accepted request gets one response before its connection closes.
+
+## Methods and result shapes
+
+- `status`, parameters `{}` by default or `{"includeAssemblies":true}` to opt in: always returns `{ "bridgeReady": true, "processId": 1, "productName": "...", "gameVersion": "...", "unityVersion": "...", "currentLevel": "..."|null, "levelState": "...", "sceneReady": true }`. With `includeAssemblies:true`, it also returns `loadedAssemblies` (file-backed assemblies with MVIDs, capped at 128 entries), `loadedAssemblyCount` (full eligible count), and `loadedAssembliesTruncated`. With the default false value, the bridge does not enumerate or sort assemblies and omits all inventory fields. Host `game_status` strips `loadedAssemblies` from nested status when false to remain compact with older bridges, while retaining other raw fields. `game_wait_ready` always uses compact status.
+- `logs`, parameters `{ "since": 0 }`: `{ "entries": [{ "sequence": 1, "timestamp": "...", "level": "...", "message": "...", "stackTrace": "..." }], "nextSequence": 1 }`. The ring retains 512 entries; each response returns at most 3 entries. When `since` is `0` or omitted, the newest up to 3 entries are returned and `nextSequence` is the current newest sequence. When `since` is positive, entries after that sequence are returned and `nextSequence` is the last returned sequence, or the current newest sequence when fewer than 3 entries were returned. Each message/stack trace is capped at 512/2048 characters and carries an explicit `…[truncated]` marker when clipped.
+- `runtime`, parameters `{ "action": "list" }`, `{ "action": "stop", "key": "..." }`, or `{ "action": "clear" }`: manages only bridge-owned state on the Unity main thread. `McpRuntime.Current` is created on a dedicated `DontDestroyOnLoad` GameObject when the bridge starts and is cleared when the bridge stops; it is null when the bridge is unavailable. `list` returns `{ "coroutines": [{ "key": "...", "type": "UnityEngine.Coroutine" }], "objects": [{ "key": "...", "type": "..." }], "coroutineCount": 0, "objectCount": 0 }`. `stop` requires a non-empty key of at most 128 characters and returns `{ "action": "stop", "key": "...", "stopped": true|false }`; an unknown key is not an error. `clear` stops every managed coroutine and clears every stored object reference, returning `{ "action": "clear", "cleared": true }`. Keys are non-empty and at most 128 characters; at most 128 coroutines and 128 objects are retained.
+- `load_level`, parameters `{ "levelId": "...", "mode": "..." }`: validates both as non-empty strings of at most 256 characters and calls `LevelManager.LoadLevel(levelId, mode)` on the Unity main thread. Returns `{ "levelId": "...", "mode": "...", "currentLevelBefore": "..."|null, "levelStateBefore": "...", "sceneReadyBefore": true|false }`. The returned fields describe the state immediately before the request. Loading is asynchronous; `currentLevelBefore` can still name the previous level while the load is in progress. Exceptions from the game surface as bridge errors.
+- `spawn_item`, parameters `{ "itemId": "...", "x": 0, "y": 0, "z": 0, "key": "...", "disallowDespawn": true }`: resolves `Catalog.GetData<ItemData>(itemId)` and starts `ItemData.SpawnAsync` through a bridge-managed coroutine on the Unity main thread. `x`, `y`, and `z` are optional, but must be supplied together, must be finite, and must be within ±1000000; when omitted the item spawns at the player's head plus 1.5 m forward. `key` is optional and defaults to a generated `item-<12 hex>` value. `disallowDespawn` defaults to true and sets `Item.DisallowDespawn`. The network handler waits up to 12 seconds (the coroutine itself gives the spawn callback 8 seconds) without blocking the main thread. Returns `{ "key": "...", "itemId": "...", "position": { "x": 0, "y": 0, "z": 0 }, "instanceId": 0, "name": "..." }` with the actual world position, Unity instance ID, and object name. An unknown or empty catalog id is an error; a partial coordinate triple, a key longer than 128 characters, or a spawn timeout is an error.
+- `evaluate`, parameters `{ "code": "...", "timeoutMs": 10000 }`: compiles a C# statement body into a method returning `object`, invokes it synchronously on Unity's main thread, and returns its JSON-safe result. The generated source imports `ThunderRoadMcp.Bridge`, so snippets can use `McpRuntime.Current` directly. Compilation runs off-thread and its references are cached from loaded process assemblies plus the installed game's `Managed` directory; dynamic/evaluation assemblies without a file location are excluded. `timeoutMs` covers compilation, compiler-queue wait, and dispatch, bounded to 1–30000 ms. Expired queued work is skipped. A running C# method or serialization cannot be forcibly interrupted. Compiler diagnostics and full runtime exception details are errors, bounded to 4 KiB; snippet diagnostics refer to `evaluation.cs` line numbers. Top-level `await`, returned `Task` values, and frame-aware evaluation are unsupported; a returned `Task` is rejected before serialization rather than blocked on. Compiled evaluation assemblies remain loaded until the game process restarts. Evaluation does not patch methods or preserve/reload mod state.
+
+The result object is serialized on Unity's main thread, before it is detached from game objects and sent over TCP. No Unity API calls are made by the network/compiler workers. The bridge caps clients and queued work; stopping/unloading closes the listener and active sockets and cancels pending work. A running evaluation cannot be preempted. The protocol has no frame-aware/asynchronous evaluation guarantee.

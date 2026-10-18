@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Publish host
+        shell: pwsh
+        run: dotnet publish src/ThunderRoadMcp.Host/ThunderRoadMcp.Host.csproj -c Release -o "$env:RUNNER_TEMP/host"
+
+      - name: Run host behavior check
+        shell: pwsh
+        run: dotnet run --project tests/HostBehaviorCheck -c Release -- "$env:RUNNER_TEMP/host/ThunderRoadMcp.Host.dll"
+
+      - name: Upload host artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: host
+          path: ${{ runner.temp }}/host
+          if-no-files-found: error
+
+  package:
+    needs: host
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download host artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: host
+          path: ${{ runner.temp }}/host
+
+      - name: Resolve tracked bridge package
+        shell: pwsh
+        run: |
+          $metadataPath = 'dist/bridge/versions.json'
+          if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+            throw "Missing bridge version metadata: $metadataPath. Track dist/bridge/versions.json and its latest package."
+          }
+          try { $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json }
+          catch { throw "Invalid bridge version metadata in $metadataPath : $($_.Exception.Message)" }
+
+          $latest = [string]$metadata.latest
+          if ([string]::IsNullOrWhiteSpace($latest)) {
+            throw "$metadataPath must define a non-empty 'latest' game version."
+          }
+          $matches = @($metadata.versions | Where-Object { [string]$_.gameVersion -eq $latest })
+          if ($matches.Count -ne 1) {
+            throw "$metadataPath must contain exactly one entry for latest '$latest'."
+          }
+          $packageName = [string]$matches[0].package
+          if ($packageName -notmatch '^[A-Za-z0-9._-]+\.zip$') {
+            throw "Latest bridge package name is invalid: '$packageName'."
+          }
+          $packagePath = Join-Path 'dist/bridge' $packageName
+          if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+            throw "Latest bridge package is missing: $packagePath"
+          }
+
+          "BRIDGE_PACKAGE=$packagePath" >> $env:GITHUB_ENV
+          "BRIDGE_GAME_VERSION=$latest" >> $env:GITHUB_ENV
+          Write-Host "Resolved bridge package for game $latest : $packagePath"
+
+      - name: Assemble release package
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'release'
+          New-Item -ItemType Directory -Path $stage | Out-Null
+
+          $hostStage = Join-Path $stage 'host'
+          New-Item -ItemType Directory -Path $hostStage | Out-Null
+          Copy-Item -Path (Join-Path $env:RUNNER_TEMP 'host/*') -Destination $hostStage -Recurse
+
+          Copy-Item -Path scripts -Destination (Join-Path $stage 'scripts') -Recurse
+          Copy-Item -Path src -Destination (Join-Path $stage 'src') -Recurse
+          Copy-Item -Path docs -Destination (Join-Path $stage 'docs') -Recurse
+          Copy-Item -Path skills -Destination (Join-Path $stage 'skills') -Recurse
+          Copy-Item -Path README.md, Directory.Build.props, Directory.Build.targets, GameManagedDir.props.example, ThunderRoadMcp.sln -Destination $stage
+
+          $bridgeStage = Join-Path $stage 'bridge'
+          New-Item -ItemType Directory -Path $bridgeStage | Out-Null
+          Copy-Item -LiteralPath $env:BRIDGE_PACKAGE -Destination (Join-Path $bridgeStage 'ThunderRoadMcp.zip')
+          Copy-Item -LiteralPath 'dist/bridge/versions.json' -Destination (Join-Path $bridgeStage 'versions.json')
+
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'v0.0.0-dev.' + $env:GITHUB_RUN_NUMBER }
+          $archive = Join-Path $env:RUNNER_TEMP ("ThunderRoadMcp-$version.zip")
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "RELEASE_ARCHIVE=$archive" >> $env:GITHUB_ENV
+          Get-ChildItem -LiteralPath $stage -Force | Select-Object Name
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-zip
+          path: ${{ env.RELEASE_ARCHIVE }}
+          if-no-files-found: error
+
+      - name: Create or update GitHub release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$env:GITHUB_REF_NAME" --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$env:GITHUB_REF_NAME" "$env:RELEASE_ARCHIVE" --clobber
+          } else {
+            gh release create "$env:GITHUB_REF_NAME" "$env:RELEASE_ARCHIVE" --title "$env:GITHUB_REF_NAME" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

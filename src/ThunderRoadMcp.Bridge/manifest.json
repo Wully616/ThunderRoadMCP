@@ -1,0 +1,7 @@
+{
+  "Name": "ThunderRoadMcp",
+  "Description": "A local MCP bridge for Blade & Sorcery PC Mono builds.",
+  "Author": "Wully",
+  "ModVersion": "0.1.0",
+  "GameVersion": "1.0.0.0"
+}

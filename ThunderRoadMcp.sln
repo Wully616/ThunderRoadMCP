@@ -1,0 +1,36 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ThunderRoadMcp.Host", "src\ThunderRoadMcp.Host\ThunderRoadMcp.Host.csproj", "{B8C45074-278B-43D3-90B9-0D1E5C4A6496}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ThunderRoadMcp.Bridge", "src\ThunderRoadMcp.Bridge\ThunderRoadMcp.Bridge.csproj", "{485D1D8C-919E-442A-A708-2B82C0616D9B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ThunderRoadMcp.Compiler", "src\ThunderRoadMcp.Compiler\ThunderRoadMcp.Compiler.csproj", "{D801444D-7B48-4197-A331-C35E1E22C667}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ThunderRoadMcp.Bridge.SelfTest", "src\ThunderRoadMcp.Bridge.SelfTest\ThunderRoadMcp.Bridge.SelfTest.csproj", "{F48F6E76-27D6-4AF0-B8E0-5C0F8F2A3441}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B8C45074-278B-43D3-90B9-0D1E5C4A6496}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B8C45074-278B-43D3-90B9-0D1E5C4A6496}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B8C45074-278B-43D3-90B9-0D1E5C4A6496}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B8C45074-278B-43D3-90B9-0D1E5C4A6496}.Release|Any CPU.Build.0 = Release|Any CPU
+		{485D1D8C-919E-442A-A708-2B82C0616D9B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{485D1D8C-919E-442A-A708-2B82C0616D9B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{485D1D8C-919E-442A-A708-2B82C0616D9B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{485D1D8C-919E-442A-A708-2B82C0616D9B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F48F6E76-27D6-4AF0-B8E0-5C0F8F2A3441}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F48F6E76-27D6-4AF0-B8E0-5C0F8F2A3441}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F48F6E76-27D6-4AF0-B8E0-5C0F8F2A3441}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F48F6E76-27D6-4AF0-B8E0-5C0F8F2A3441}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D801444D-7B48-4197-A331-C35E1E22C667}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D801444D-7B48-4197-A331-C35E1E22C667}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D801444D-7B48-4197-A331-C35E1E22C667}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D801444D-7B48-4197-A331-C35E1E22C667}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

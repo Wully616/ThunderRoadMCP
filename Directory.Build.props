@@ -1,0 +1,10 @@
+<Project>
+  <!-- Keep local IDE builds working without -p:GameManagedDir. An existing GameManagedDir
+       property (including an environment variable) wins; GAME_MANAGED_DIR is the shared
+       fallback; otherwise import the untracked local props file when present. -->
+  <PropertyGroup Condition="'$(GameManagedDir)' == '' and '$(GAME_MANAGED_DIR)' != ''">
+    <GameManagedDir>$(GAME_MANAGED_DIR)</GameManagedDir>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)GameManagedDir.props"
+          Condition="'$(GameManagedDir)' == '' and Exists('$(MSBuildThisFileDirectory)GameManagedDir.props')" />
+</Project>

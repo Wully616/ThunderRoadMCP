@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="Fixtures/**/*.cs" />
+    <ProjectReference Include="Fixtures/GameBase/GameBase.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="Fixtures/GameShared/GameShared.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="Fixtures/ModShared/ModShared.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="Fixtures/ChangedShared/ChangedShared.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../../src/ThunderRoadMcp.Host/ThunderRoadMcp.Host.csproj" />
+  </ItemGroup>
+  <Target Name="CopyApiFixtures" AfterTargets="Build">
+    <MakeDir Directories="$(OutDir)api-fixtures/game;$(OutDir)api-fixtures/mod;$(OutDir)api-fixtures/changed" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/GameBase/bin/$(Configuration)/net10.0/Fixture.Base.dll" DestinationFiles="$(OutDir)api-fixtures/game/Fixture.Base.dll" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/GameShared/bin/$(Configuration)/net10.0/Fixture.Shared.dll" DestinationFiles="$(OutDir)api-fixtures/game/Fixture.Shared.dll" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/ModShared/bin/$(Configuration)/net10.0/Fixture.Shared.dll" DestinationFiles="$(OutDir)api-fixtures/mod/Fixture.Shared.dll" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/ChangedShared/bin/$(Configuration)/net10.0/Fixture.Shared.dll" DestinationFiles="$(OutDir)api-fixtures/changed/Fixture.Shared.dll" />
+  </Target>
+</Project>

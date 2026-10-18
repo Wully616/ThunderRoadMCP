@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+.vs/
+artifacts/
+/.idea/
+/.omp/
+*.user
+*.suo
+bridge.json
+launch.json
+*.local.json
+GameManagedDir.props

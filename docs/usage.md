@@ -1,0 +1,139 @@
+# Usage
+
+The host is a local stdio MCP server. Offline tools work without the game running and without the bridge. Bridge-backed tools require the game, an installed bridge mod, an enabled bridge config, and in-game readiness.
+
+## Offline workflow
+
+These tools work without launching the game or enabling the bridge:
+
+- `game_installations` lists detected Steam and Meta Horizon Link installs.
+- `game_guide(topic?)` is a read-only tool that returns one section of the embedded game guide as `{topic, content}` plus text; it needs no game or bridge. The default topic is `bootstrap`. Topics are `bootstrap`, `unity`, `runtime`, `spawning`, `levels`, `api`, `logs`, `eval`, `example`, `troubleshooting`, and `version`; aliases are `overview` (bootstrap), `console`/`workflow` (api), and `worked-example` (example). An unknown topic is a tool error listing the canonical topics. The guide is embedded in the host DLL, so guide edits take effect only after the host is published again and the MCP client reconnects.
+- `api_assemblies`, `api_search`, `api_type`, and `api_decompile` inspect installed metadata and reconstructed source. See [API and catalog discovery](api-discovery.md).
+- `catalog_search` and `catalog_read` browse the read-only shipped catalog. Mods add their own catalog JSON and require `manifest.json`.
+- `game_logs` with the `current` or `previous` source reads log files from disk.
+- `game_status` is safe to call and reports `bridgeConnected: false` with a `bridgeError` when the bridge is unavailable. Its status is compact by default; pass `includeAssemblies=true` only when the loaded assembly inventory is needed.
+
+Offline discovery reads metadata and IL and does not load or execute installed target assemblies. It needs no game restart. After updating the host, restart the MCP host and reconnect or restart the MCP client so the new tools are exposed.
+
+## Host-only installs
+
+A release install is host-only when no game is found or `-SkipBridge` is passed. A source install can also be host-only when no game is found. The host starts, `game_status` reports the bridge as unavailable, and `game_logs` reads existing logs. API and catalog discovery require an installed game. Bridge-backed tools stay unavailable until the bridge mod is installed and a bridge config is enabled. No bridge config is created on a host-only install.
+
+To add the bridge later, install the release `bridge/ThunderRoadMcp.zip` with `game_install_mod` and create a bridge config, or rerun the installer with the game available and a new `-InstallDirectory`.
+
+## Bridge workflow
+
+Bridge-backed tools require the game, an installed bridge mod, an enabled bridge config, and in-game readiness. `game_install_mod` and `game_launch` are setup and process tools and do not require an enabled bridge.
+
+- `game_install_mod` installs a `ThunderRoadMcp.zip` package into the selected game and refuses an occupied destination. Restart the game after installation.
+- `game_launch` starts the selected installation and returns its PID without waiting for bridge readiness. It accepts an optional `arguments` array (for example `["-level","arena"]`), passed without a shell. Launch works without an enabled bridge. `game_launch`, `game_stop`, and `game_restart` control only a process launched and owned by this host; force termination for stop and restart is opt-in. Exiting the host does not stop the game.
+- `game_wait_ready` polls the bridge and optionally waits for a specific `level`; `timeoutMs` bounds the wait. It returns `ready`, `timedOut`, `elapsedMs`, and `status`; `ready:false, timedOut:true` is a normal result, not a tool error or proof that the game failed.
+- `game_status` reports bridge connectivity and readiness with a compact status by default. Pass `includeAssemblies=true` to include loaded assembly inventory and MVIDs. A launch does not mean the bridge is ready; enter Home or another level, then check `bridgeReady`, `currentLevel`, `levelState`, and `sceneReady`.
+- `game_load_level` requests a level load from a catalog `LevelData` id and a game-mode id. Its result is a pre-call snapshot (`levelId`, `mode`, `currentLevelBefore`, `levelStateBefore`, `sceneReadyBefore`); loading is asynchronous, so confirm the new level through `game_status` and compare the lowercase level id case-insensitively.
+- `game_spawn_item` resolves a catalog `ItemData` id and spawns it at the player's head plus 1.5 m forward or at explicit coordinates. It returns `{key,itemId,position,instanceId,name}`; `disallowDespawn` defaults to true and sets `Item.DisallowDespawn`. See [live game runtime](#live-game-runtime).
+- `game_runtime` lists managed coroutines and references, stops one coroutine by required `key`, or clears all managed coroutines and references.
+- `evaluate_csharp` requires a ready bridge. See [Live C# evaluation safety](#live-c-evaluation-safety).
+- `game_logs` with the `bridge` source reads the authenticated in-game log ring.
+
+## Live game runtime
+
+`evaluate_csharp` runs synchronously and each call compiles its own assembly, so a variable or a coroutine local to one snippet does not survive it. The bridge provides a persistent `McpRuntime` host for work that must outlive the call. `McpRuntime` is in `ThunderRoadMcp.Bridge`, and the evaluator imports that namespace, so snippets use `McpRuntime.Current` directly:
+
+- `McpRuntime.Current.StartManagedCoroutine("key", routine)` starts a coroutine on the bridge's runtime object; `StopManagedCoroutine("key")` stops it.
+- `McpRuntime.Current.Set("key", value)`, `Get<T>("key")`, and `Remove("key")` store and retrieve named references between calls.
+- `game_runtime(action:"list")` returns `{coroutines:[{key,type}],objects:[{key,type}],coroutineCount,objectCount}`; `action:"stop"` requires `key`, stops that coroutine, and returns `{action,key,stopped}`; `action:"clear"` stops all managed coroutines, clears references, and returns `{action:"clear",cleared:true}`. A missing `key` on `stop` is a validation error and stops nothing.
+
+Coroutines still run on Unity's main thread. Never call `StopAllCoroutines` on a game-owned manager such as `Player`, `LevelManager`, or a creature controller, because it also stops the game's own routines. Manage only coroutines you started through `McpRuntime`.
+
+`game_spawn_item` resolves a catalog `ItemData` id and returns a runtime key, so later calls can retrieve the spawned `Item` with `McpRuntime.Current.Get<Item>(key)`. A level load destroys the object; remove the stale key and spawn again. Creatures do not have a dedicated tool yet: discover the spawn API with `api_search`/`api_type`, then spawn through `evaluate_csharp` and keep the reference with `McpRuntime.Current.Set`. See the [game guide](game-guide.md).
+
+## Prebuilt bridge compatibility
+
+Release installs use the tracked prebuilt bridge built against Blade & Sorcery 1.3.2. The installer prints the provenance from `bridge/versions.json`, for example `Using prebuilt bridge for game 1.3.2`.
+
+Compatibility is informational. It does not compare or block against the locally detected game version. Newer game versions may require a new tracked package or a local source build. See [tracked bridge packages](building.md#tracked-bridge-packages).
+
+## Live C# evaluation safety
+
+`evaluate_csharp` compiles a C# statement body into a method returning `object`, invokes it synchronously on Unity's main thread, and returns a JSON-safe result. Compilation runs off-thread. References are cached from the game's `Managed` directory, file-backed loaded process assemblies, and the bridge DLL adjacent to the configured runtime payload; dynamic and evaluation assemblies without a file location are excluded.
+
+The code is trusted arbitrary C# with full game-process, game API, and filesystem access. There is no sandbox. Only enable the bridge for agents and prompts you trust.
+
+`timeoutMs` covers compilation, compiler-queue wait, and dispatch, bounded to 1 to 30000 ms. Expired queued work is skipped. A running C# method or result serialization cannot be forcibly interrupted. Compiler diagnostics and runtime exception details are errors, bounded to 4 KiB; snippet diagnostics refer to `evaluation.cs` line numbers.
+
+Top-level `await`, returned `Task` values, and frame-aware or asynchronous evaluation are unsupported. A returned `Task` is rejected before serialization rather than blocked on. Compiled evaluation assemblies remain loaded until the game process restarts. Evaluation does not patch methods or preserve or reload mod state. Keep live probes read-only unless mutation is intended.
+
+The result object is serialized on Unity's main thread before it is detached from game objects and sent over TCP. No Unity API calls are made by the network or compiler workers. A running evaluation cannot be preempted.
+
+## Logging
+
+`game_logs` sources:
+
+- `current` reads `Player.log`.
+- `previous` reads `Player-prev.log`.
+- `bridge` reads the authenticated in-game ring and accepts `since`. When `since` is omitted or `0`, it returns the newest entries; pass the returned `nextSequence` as the next `since`.
+
+By default the log directory is `%USERPROFILE%\AppData\LocalLow\WarpFrog\BladeAndSorcery`. `THUNDERROAD_MCP_LOG_DIR` overrides it for the host. Log files can be read directly from disk even if the bridge is unavailable, and they may contain private data.
+
+File pages accept `tailLines` from 1 to 2000. To continue backward, pass the returned `nextBeforeByteOffset` as the next `beforeByteOffset` with the same `snapshotId`; a changed log session invalidates the snapshot and requires restarting pagination. The bridge ring retains 512 entries and returns at most 3 entries per response. See [protocol and limits](protocol.md) for the wire shapes.
+
+Host diagnostics are written to standard error so MCP messages on standard output stay valid. Check your harness's server log if the host starts but the agent reports no tools.
+
+## Bridge configuration
+
+The bridge uses authenticated loopback TCP and bounded NDJSON messages. It is disabled unless a bridge config exists, parses, and sets `enabled` to `true`. Installing the mod alone does not open a listener. The default config path is `%LOCALAPPDATA%\ThunderRoadMcp\bridge.json`. `THUNDERROAD_MCP_CONFIG` overrides it, and the host and game must use the same path. Keep this file out of source control.
+
+The host accepts only a loopback host, a valid port, and a 64-character hexadecimal token. Generate a fresh 32-byte cryptographically random secret; do not use a password or reuse another credential. This Windows PowerShell 5.1 recipe creates the file without overwriting an existing config:
+
+```powershell
+$bridgePath = if ($env:THUNDERROAD_MCP_CONFIG) { [IO.Path]::GetFullPath($env:THUNDERROAD_MCP_CONFIG) } else { Join-Path $env:LOCALAPPDATA 'ThunderRoadMcp\bridge.json' }
+$configDirectory = Split-Path -Parent $bridgePath
+New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+if (Test-Path -LiteralPath $bridgePath) { throw "Preserve the existing config; choose a separate THUNDERROAD_MCP_CONFIG path." }
+$bytes = New-Object byte[] 32
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+$token = [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
+$json = @{ enabled = $true; host = '127.0.0.1'; port = 47831; token = $token } | ConvertTo-Json
+[IO.File]::WriteAllText($bridgePath, $json, [System.Text.UTF8Encoding]::new($false))
+```
+
+The resulting config has this shape:
+
+```json
+{
+  "enabled": true,
+  "host": "127.0.0.1",
+  "port": 47831,
+  "token": "<64 hexadecimal characters; keep private>"
+}
+```
+
+The installer creates this config by default when it installs the bridge mod and no config exists, so a normal install leaves the bridge enabled. It never enables, disables, or rewrites an existing config; if that config is disabled, the installer warns and preserves it. Pass `-NoBridgeConfig` to install the bridge mod without creating a config, which leaves the bridge offline. Setting `enabled` to `false` keeps the mod offline. A placeholder token is not a usable credential; generate a new random token instead of copying one. Never put the token in agent configuration, source control, or prompts. Restart the game after changing the bridge config.
+
+## Host commands
+
+Run the installed `ThunderRoadMcp.Host.exe` with one of these arguments to use a command mode instead of MCP startup:
+
+```text
+--help
+--list-installations
+--install-bridge <absolute-zip> --game-executable <absolute-exe>
+```
+
+`--list-installations` returns the same JSON envelope as `game_installations`, and `--install-bridge` reuses the same discovery and staged package validation as `game_install_mod`. Both emit JSON on standard output and do not write either local config or launch the game. `--help` prints usage text, not JSON. Run the host without arguments to start the stdio MCP server.
+
+## Runtime troubleshooting
+
+- **Host-only install has no bridge tools:** this is expected without a game or with `-SkipBridge`. Install the game and bridge, then enable the bridge config. See [host-only installs](#host-only-installs).
+- **Release install asks for the .NET SDK:** run `scripts/install.ps1` from the extracted release root so the sibling `host/` directory is found. Otherwise the installer treats the folder as a source checkout.
+- **Bridge reports offline or not ready:** confirm the bridge config exists, is enabled, and is at the same path for host and game. Restart the game after installing or changing the mod, enter Home or a level, then check `game_status`. Inspect the config without sharing its token.
+- **Bridge config is rejected:** the host requires `enabled: true`, host `127.0.0.1`, a valid port, and a 64-character hexadecimal token. Preserve and fix the existing file instead of overwriting it.
+- **`evaluate_csharp` fails:** compile diagnostics point at `evaluation.cs` line numbers. Runtime exceptions are returned as errors. Correct the snippet and retry; a timeout does not stop code that is already running.
+- **Launch succeeds but the bridge never becomes ready:** launch returns before readiness. Call `game_wait_ready`, confirm the bridge config is enabled, and enter Home or a level. A `ready:false, timedOut:true` result is not proof the game failed; inspect its `status` or call `game_status` and the logs.
+- **`game_load_level` returns the old level:** the result is a pre-call snapshot (`currentLevelBefore`), not the loaded level. Loading is asynchronous; poll `game_status` until `currentLevel` (lowercase) matches case-insensitively and `sceneReady` is true. Confirm the level and mode ids with `catalog_search`.
+- **A spawned item or managed reference is `null`:** a level load destroys scene objects. Clear the stale key and spawn or resolve the object again. Coroutines started on `McpRuntime` keep running until the item is gone or you stop them.
+- **Logs are missing:** check `game_logs` with the `current` or `previous` source, verify the log directory, or set `THUNDERROAD_MCP_LOG_DIR`. The `bridge` source also requires a ready bridge.
+- **The prebuilt bridge targets another game version:** the installer's provenance line is informational and does not block a different local version. Use a new tracked package or a local source build if the bridge fails on a newer game version. See [prebuilt bridge compatibility](#prebuilt-bridge-compatibility).
+- **The game reports an older mod build:** compare `game_status(includeAssemblies=true).status.loadedAssemblies` module version IDs with `api_assemblies`. Restart the game after replacing the mod DLL.
+- **The agent has no tools or the host will not start:** use the absolute EXE `command` with empty `args` from `mcp-config.json`, confirm the .NET 10 runtime is installed, then restart or reconnect the agent. See [installation troubleshooting](installation.md#installation-troubleshooting).

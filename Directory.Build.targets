@@ -1,0 +1,17 @@
+<Project>
+  <Target Name="ValidateGameManagedDir" BeforeTargets="PrepareForBuild"
+          Condition="'$(MSBuildProjectName)' == 'ThunderRoadMcp.Bridge' or '$(MSBuildProjectName)' == 'ThunderRoadMcp.Compiler' or '$(MSBuildProjectName)' == 'ThunderRoadMcp.Bridge.SelfTest'">
+    <Error Condition="'$(GameManagedDir)' == ''"
+           Text="GameManagedDir is required. Copy GameManagedDir.props.example to GameManagedDir.props and set the path, set the GAME_MANAGED_DIR environment variable, or build with -p:GameManagedDir=&quot;C:\path\to\BladeAndSorcery_Data\Managed&quot;." />
+    <Error Condition="'$(GameManagedDir)' != '' and !Exists('$(GameManagedDir)')"
+           Text="GameManagedDir '$(GameManagedDir)' does not exist. Pass the installed game's BladeAndSorcery_Data\Managed directory with -p:GameManagedDir." />
+    <Error Condition="'$(GameManagedDir)' != '' and !Exists('$(GameManagedDir)\ThunderRoad.dll')"
+           Text="GameManagedDir is missing ThunderRoad.dll: '$(GameManagedDir)'. Select the installed game's Managed directory." />
+    <Error Condition="'$(MSBuildProjectName)' != 'ThunderRoadMcp.Compiler' and '$(GameManagedDir)' != '' and !Exists('$(GameManagedDir)\UnityEngine.dll')"
+           Text="GameManagedDir is missing UnityEngine.dll: '$(GameManagedDir)'." />
+    <Error Condition="'$(MSBuildProjectName)' != 'ThunderRoadMcp.Compiler' and '$(GameManagedDir)' != '' and !Exists('$(GameManagedDir)\UnityEngine.CoreModule.dll')"
+           Text="GameManagedDir is missing UnityEngine.CoreModule.dll: '$(GameManagedDir)'." />
+    <Error Condition="'$(MSBuildProjectName)' != 'ThunderRoadMcp.Compiler' and '$(GameManagedDir)' != '' and !Exists('$(GameManagedDir)\Newtonsoft.Json.dll')"
+           Text="GameManagedDir is missing Newtonsoft.Json.dll: '$(GameManagedDir)'." />
+  </Target>
+</Project>
