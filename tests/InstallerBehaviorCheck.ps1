@@ -151,7 +151,7 @@ function Invoke-Installer($Game, [string]$HostPath, [string]$ConfigRoot, [switch
     Invoke-Process $powershell $arguments $environment
 }
 
-function Invoke-Upgrader($Game, [string]$HostPath, [string]$UpgradeScript = (Join-Path $sourceRoot 'scripts\upgrade.ps1'), [switch]$SkipBridge, [switch]$NoBridgeConfig, [string]$DotnetPath, [hashtable]$EnvironmentOverride = @{}) {
+function Invoke-Upgrader($Game, [string]$HostPath, [string]$UpgradeScript = (Join-Path $sourceRoot 'scripts\upgrade.ps1'), [switch]$SkipBridge, [switch]$NoBridgeConfig, [string]$DotnetPath, [hashtable]$EnvironmentOverride = @{}, [string]$PowerShellPath) {
     $environment = @{}
     if ($Game) {
         $environment.THUNDERROAD_MCP_CONFIG = Join-Path (Split-Path -Parent $HostPath) 'upgrade-bridge.json'
@@ -163,7 +163,7 @@ function Invoke-Upgrader($Game, [string]$HostPath, [string]$UpgradeScript = (Joi
     if ($DotnetPath) { $arguments += @('-DotnetPath', $DotnetPath) }
     if ($SkipBridge) { $arguments += '-SkipBridge' }
     if ($NoBridgeConfig) { $arguments += '-NoBridgeConfig' }
-    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $powershell = if ($PowerShellPath) { $PowerShellPath } else { Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
     Invoke-Process $powershell $arguments $environment
 }
 
@@ -366,6 +366,21 @@ try {
         throw 'Release upgrade retained obsolete files, changed configs/unrelated mods, or exposed a backup to game mod discovery.'
     }
     Test-GeneratedStdioServer ((Get-Content -LiteralPath $releaseMcpPath -Raw | ConvertFrom-Json).mcpServers.ThunderRoadMcp)
+
+    $pwshCommand = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pwshCommand) {
+        $pwshUpgrade = Invoke-Upgrader $gameRelease $hostRelease -UpgradeScript (Join-Path $releaseScripts 'upgrade.ps1') -PowerShellPath $pwshCommand.Source -EnvironmentOverride @{
+            THUNDERROAD_MCP_CONFIG = $releaseBridgePath
+            THUNDERROAD_MCP_LAUNCH_CONFIG = $releaseLaunchPath
+        }
+        if ($pwshUpgrade.ExitCode -ne 0 -or
+            ($pwshUpgrade.Output + $pwshUpgrade.Error).Contains([string]$releaseConfig.token) -or
+            -not (Test-ByteEqual $savedReleaseBridge ([IO.File]::ReadAllBytes($releaseBridgePath)))) {
+            throw "PowerShell 7 upgrade rejected or changed a valid existing bridge config: $($pwshUpgrade.Output)`n$($pwshUpgrade.Error)"
+        }
+    } else {
+        Write-Warning 'Skipping PowerShell 7 bridge config upgrade check: pwsh was not found on PATH.'
+    }
 
     $sourceDrive = [IO.Path]::GetPathRoot($sourceRoot)
     $temporaryDrive = [IO.Path]::GetPathRoot([IO.Path]::GetTempPath())

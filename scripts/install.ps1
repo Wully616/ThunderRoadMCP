@@ -24,6 +24,13 @@ function Test-Executable([string]$Path) {
     }
 }
 
+function Test-BridgePort($Value) {
+    # Windows PowerShell 5.1 parses JSON integers as Int32, PowerShell 7 as Int64; both are valid JSON numbers.
+    if ($null -eq $Value -or $Value -isnot [ValueType] -or $Value -is [bool]) { return $false }
+    try { $Number = [decimal]$Value } catch { return $false }
+    return $Number -ge 1 -and $Number -le 65535 -and $Number -eq [math]::Truncate($Number)
+}
+
 function Format-InstallationCandidate($Installation, [int]$Number) {
     $path = [string]$Installation.executablePath
     $version = $null
@@ -347,9 +354,10 @@ $newBridgeConfig = $null
 if ($bridgeConfigExists) {
     try { $bridgeConfig = Get-Content -LiteralPath $bridgeConfigPath -Raw | ConvertFrom-Json }
     catch { Stop-Install "Existing bridge config is invalid JSON; preserving it: $bridgeConfigPath ($($_.Exception.Message))" }
-    if ($bridgeConfig.enabled -isnot [bool] -or $bridgeConfig.host -ne '127.0.0.1' -or
-        $bridgeConfig.port -isnot [int] -or $bridgeConfig.port -lt 1 -or $bridgeConfig.port -gt 65535 -or
-        [string]$bridgeConfig.token -notmatch '^[0-9a-fA-F]{64}$') {
+    if ($bridgeConfig.enabled -isnot [bool] -or
+        $bridgeConfig.host -isnot [string] -or $bridgeConfig.host -cne '127.0.0.1' -or
+        -not (Test-BridgePort $bridgeConfig.port) -or
+        $bridgeConfig.token -isnot [string] -or $bridgeConfig.token -notmatch '\A[0-9a-fA-F]{64}\z') {
         Stop-Install "Existing bridge config must have boolean enabled, loopback host, valid port, and a 64-hex token; preserving it: $bridgeConfigPath"
     }
 }
