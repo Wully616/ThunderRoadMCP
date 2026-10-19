@@ -197,6 +197,8 @@ public static class ApiReuseCheck
                                                     warning.Contains("missing", StringComparison.OrdinalIgnoreCase)) &&
                    count(context.LastDiagnostics, "api.source.decompileBuild") == 1,
                 "restoring a dependency invalidates snapshot-bound source and removes the missing-reference warning");
+            await ApiDecompileBatchCheck.RunAsync(apiToolJsonAsync, assert);
+            await ApiNavigationCheck.RunAsync(apiToolJsonAsync, assert);
         }
         finally
         {

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 
@@ -50,6 +51,45 @@ internal static class ToolInvocation
         {
             RecordFailure(started);
             throw;
+        }
+        catch (ArgumentException exception)
+        {
+            if (ToolTiming.Enabled)
+            {
+                ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+                ToolTiming.WriteDiagnostics();
+            }
+            var error = new JsonObject
+            {
+                ["error"] = new JsonObject
+                {
+                    ["code"] = "request.invalid",
+                    ["message"] = exception.Message.Length <= 512 ? exception.Message : exception.Message[..512],
+                    ["messageTruncated"] = exception.Message.Length > 512,
+                    ["recovery"] = null,
+                },
+            };
+            return new CallToolResult
+            {
+                IsError = true,
+                Content = [new TextContentBlock { Text = error.ToJsonString() }],
+                StructuredContent = JsonSerializer.SerializeToElement(error),
+            };
+        }
+        catch (ApiDiscoveryException exception)
+        {
+            if (ToolTiming.Enabled)
+            {
+                ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+                ToolTiming.WriteDiagnostics();
+            }
+            var error = new JsonObject { ["error"] = exception.ToJson() };
+            return new CallToolResult
+            {
+                IsError = true,
+                Content = [new TextContentBlock { Text = error.ToJsonString() }],
+                StructuredContent = JsonSerializer.SerializeToElement(error),
+            };
         }
         catch (McpException)
         {

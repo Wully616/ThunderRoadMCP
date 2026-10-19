@@ -1118,4 +1118,71 @@ public sealed partial class InstalledApiCatalog
 
     private sealed record LookupContinuationPayload(int Version, string SnapshotId, string QueryFingerprint, string? AssemblyId,
         string? Kind, int MaxResults, int MaxChars, bool IncludeExamples, string RankingVersion, int Offset);
+    private async Task ThrowMissingMemberDiagnosticAsync(CatalogSnapshot snapshot, string query, string? assemblyId,
+        CancellationToken cancellationToken)
+    {
+        var lastDot = query.LastIndexOf('.');
+        if (lastDot < 1 || lastDot == query.Length - 1)
+            return;
+
+        for (var dot = lastDot; dot > 0; dot = query.LastIndexOf('.', dot - 1))
+        {
+            var typeName = query[..dot];
+            var memberName = query[(dot + 1)..];
+            var types = new List<(AssemblyEntry Entry, ApiTypeRecord Type)>();
+            foreach (var entry in SelectAssemblies(snapshot, assemblyId))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                using var lease = await GetApiIndexAsync(snapshot, entry, cancellationToken);
+                if (lease.Index.TypesByName.TryGetValue(typeName, out var matches))
+                    types.AddRange(matches.Select(type => (entry, type)));
+            }
+            if (types.Count == 0)
+                continue;
+
+            if (types.Count > 1)
+                throw new ApiDiscoveryException("type.ambiguous",
+                    $"The type prefix '{typeName}' resolves to multiple installed types; select one assembly before retrying.",
+                    new
+                    {
+                        candidates = types.Take(8).Select(candidate => ErrorCandidate(candidate.Type.Symbol.Hit)).ToArray(),
+                        candidateLimit = 8,
+                        hasMore = types.Count > 8,
+                        nextSearch = new { tool = "api_search", arguments = new { query = typeName, kind = "type", offset = 0, limit = 20, snapshotId = snapshot.Id } },
+                    });
+
+            var (resolvedEntry, resolvedType) = types[0];
+            var candidates = resolvedType.Members
+                .Select(member => member.Hit)
+                .OrderBy(hit => hit.qualifiedName.EndsWith("." + memberName, StringComparison.OrdinalIgnoreCase) ? 0 :
+                    hit.qualifiedName[(hit.qualifiedName.LastIndexOf('.') + 1)..].Contains(memberName, StringComparison.OrdinalIgnoreCase) ? 1 : 2)
+                .ThenBy(hit => hit.qualifiedName, StringComparer.OrdinalIgnoreCase)
+                .Take(8)
+                .Select(ErrorCandidate)
+                .ToArray();
+            throw new ApiDiscoveryException("member.not_found",
+                $"Type '{ClipErrorText(resolvedType.FullName, 256)}' resolves in the installed snapshot, but member '{memberName}' was not found.",
+                new
+                {
+                    diagnostic = "Type.MissingMember",
+                    notFound = true,
+                    requestedMember = memberName,
+                    resolvedType = new
+                    {
+                        assemblyId = resolvedEntry.Id,
+                        symbolId = resolvedType.Symbol.Hit.symbolId,
+                        qualifiedName = ClipErrorText(resolvedType.FullName, 128),
+                        qualifiedNameTruncated = resolvedType.FullName.Length > 128,
+                        origin = resolvedEntry.Origin,
+                        relativePath = ClipErrorText(resolvedEntry.RelativePath, 128),
+                        relativePathTruncated = resolvedEntry.RelativePath.Length > 128,
+                        signature = ClipErrorText(resolvedType.Symbol.Hit.signature, 256),
+                        signatureTruncated = resolvedType.Symbol.Hit.signature.Length > 256,
+                    },
+                    candidates,
+                    candidateLimit = 8,
+                    nextTool = new { tool = "api_type", arguments = new { assemblyId = resolvedEntry.Id, typeSymbolId = resolvedType.Symbol.Hit.symbolId, snapshotId = snapshot.Id, limit = 100 } },
+                });
+        }
+    }
 }

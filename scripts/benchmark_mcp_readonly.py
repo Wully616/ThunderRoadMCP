@@ -18,6 +18,10 @@ ALLOWED_TOOLS = (
     "api_search",
     "api_type",
     "api_decompile",
+    "api_decompile_batch",
+    "api_find_callers",
+    "api_find_callees",
+    "api_find_usages",
     "api_assemblies",
     "catalog_search",
     "catalog_read",
@@ -232,6 +236,8 @@ def smoke_test() -> int:
              "params": {"name": "game_spawn_item", "arguments": {"itemId": "must_not_forward"}}},
             {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
              "params": {"name": "api_lookup", "arguments": {"query": "fixture"}}},
+            {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+             "params": {"name": "api_decompile_batch", "arguments": {"items": []}}},
         ]
         command = [sys.executable, str(Path(__file__).resolve()), "--use-fake-backend"]
         completed = subprocess.run(command, input="".join(json.dumps(item) + "\n" for item in requests),
@@ -243,20 +249,20 @@ def smoke_test() -> int:
         listed = by_id.get(2, {}).get("result", {}).get("tools", [])
         names = [tool.get("name") for tool in listed]
         if names != list(ALLOWED_TOOLS):
-            raise RuntimeError("read-only MCP proxy did not expose exactly the configured eight tools")
+            raise RuntimeError("read-only MCP proxy did not expose exactly the configured tools")
         if "nextCursor" in by_id.get(2, {}).get("result", {}):
             raise RuntimeError("read-only MCP proxy leaked the backend tools/list cursor")
         for request_id in (3, 4):
             if by_id.get(request_id, {}).get("error", {}).get("code") != -32601:
                 raise RuntimeError("read-only MCP proxy did not reject a forbidden tool call")
-        if "result" not in by_id.get(5, {}):
-            raise RuntimeError("read-only MCP proxy did not forward an allowed tool call")
+        if "result" not in by_id.get(5, {}) or "result" not in by_id.get(6, {}):
+            raise RuntimeError("read-only MCP proxy did not forward allowed discovery tool calls")
         forwarded = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
         if any(item.get("tool") in {"evaluate_csharp", "game_spawn_item"} for item in forwarded):
             raise RuntimeError("read-only MCP proxy forwarded a forbidden tool call")
         print(json.dumps({"exposed_tools": len(names), "exposed_names": names,
                           "rejected_not_forwarded": ["evaluate_csharp", "game_spawn_item"],
-                          "allowed_call_forwarded": "api_lookup"}, indent=2))
+                          "allowed_calls_forwarded": ["api_lookup", "api_decompile_batch"]}, indent=2))
     return 0
 
 

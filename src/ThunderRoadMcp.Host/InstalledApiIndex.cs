@@ -852,7 +852,7 @@ public sealed partial class InstalledApiCatalog
         }
     }
 
-    private object CreateSourcePage(CatalogSnapshot snapshot, AssemblyEntry entry, ApiIndexedSymbol symbol,
+    private ApiSourcePage CreateSourcePage(CatalogSnapshot snapshot, AssemblyEntry entry, ApiIndexedSymbol symbol,
         SourceDocument document, int startLine, int lineCount)
     {
         var first = startLine - 1;
@@ -877,26 +877,11 @@ public sealed partial class InstalledApiCatalog
         }
         var hasMore = first + count < document.TotalLines;
         var hit = symbol.Hit;
-        return new
-        {
-            assemblyId = entry.Id,
-            assemblyName = entry.Name,
-            origin = entry.Origin,
-            relativePath = entry.RelativePath,
-            symbolId = hit.symbolId,
-            qualifiedName = hit.qualifiedName,
-            sourceKind = "reconstructed-csharp",
-            provenance = new { origin = entry.Origin, relativePath = entry.RelativePath, assemblyName = entry.Name, assemblyId = entry.Id, symbolId = hit.symbolId },
-            source = string.Join('\n', lines),
-            startLine,
-            totalLines = document.TotalLines,
-            lineCount = count,
-            hasMore,
-            nextLine = hasMore ? startLine + count : (int?)null,
-            snapshotId = snapshot.Id,
-            warnings = document.Warnings,
-            diagnostics = snapshot.Diagnostics,
-        };
+        return new ApiSourcePage(entry.Id, entry.Name, entry.Origin, entry.RelativePath,
+            hit.symbolId, hit.qualifiedName, "reconstructed-csharp",
+            new { origin = entry.Origin, relativePath = entry.RelativePath, assemblyName = entry.Name, assemblyId = entry.Id, symbolId = hit.symbolId },
+            string.Join('\n', lines), startLine, document.TotalLines, count, hasMore,
+            hasMore ? startLine + count : null, snapshot.Id, document.Warnings, snapshot.Diagnostics);
     }
 
     private void CacheSourceDocument(string identity, SourceDocument document)

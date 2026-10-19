@@ -713,7 +713,7 @@ async Task CheckApiToolsAsync()
     using var list = await CallAsync("tools/list", new { });
     var toolNames = list.RootElement.GetProperty("result").GetProperty("tools")
         .EnumerateArray().Select(tool => tool.GetProperty("name").GetString() ?? "").ToHashSet(StringComparer.Ordinal);
-    foreach (var toolName in new[] { "game_installations", "game_status", "game_guide", "game_launch", "game_wait_ready", "game_load_level", "game_spawn_item", "game_runtime", "game_install_mod", "game_stop", "game_restart", "game_logs", "evaluate_csharp", "api_assemblies", "api_search", "api_type", "api_decompile", "api_lookup", "catalog_search", "catalog_read" })
+    foreach (var toolName in new[] { "game_installations", "game_status", "game_guide", "game_launch", "game_wait_ready", "game_load_level", "game_spawn_item", "game_runtime", "game_install_mod", "game_stop", "game_restart", "game_logs", "evaluate_csharp", "api_assemblies", "api_search", "api_type", "api_decompile", "api_decompile_batch", "api_find_callers", "api_find_callees", "api_find_usages", "api_lookup", "catalog_search", "catalog_read" })
         Assert(toolNames.Contains(toolName), $"{toolName} is exposed through tools/list");
     var toolDefinitions = list.RootElement.GetProperty("result").GetProperty("tools").EnumerateArray()
         .ToDictionary(tool => tool.GetProperty("name").GetString()!, tool => tool, StringComparer.Ordinal);
@@ -1015,6 +1015,26 @@ async Task CheckApiToolsAsync()
     using var invalidTypeId = await ToolAsync("api_type", new { assemblyId = gameAssemblyId, typeSymbolId = "invalid-type-id" });
     using var invalidSymbolId = await ToolAsync("api_decompile", new { assemblyId = gameAssemblyId, symbolId = "invalid-symbol-id" });
     Assert(IsError(invalidAssemblyId) && IsError(invalidTypeId) && IsError(invalidSymbolId), "invalid opaque assembly and symbol IDs return MCP tool errors");
+    using var signatureTypeSearch = await ApiToolJsonAsync("api_search", new { query = "SignatureSurface", kind = "type", assemblyId = gameAssemblyId });
+    var signatureTypeId = signatureTypeSearch.RootElement.GetProperty("results").EnumerateArray()
+        .Single(hit => hit.GetProperty("qualifiedName").GetString() == "Fixture.Shared.SignatureSurface")
+        .GetProperty("symbolId").GetString()!;
+    using var missingMember = await ToolAsync("api_lookup", new
+    {
+        query = "Fixture.Shared.SignatureSurface.MissingMemberProbe",
+        mode = "symbol",
+        assemblyId = gameAssemblyId,
+    });
+    var missingMemberResult = missingMember.RootElement.GetProperty("result");
+    var missingMemberError = missingMemberResult.GetProperty("structuredContent").GetProperty("error");
+    var missingMemberRecovery = missingMemberError.GetProperty("recovery");
+    Assert(IsError(missingMember) && missingMemberError.GetProperty("code").GetString() == "member.not_found" &&
+           missingMemberRecovery.GetProperty("diagnostic").GetString() == "Type.MissingMember" &&
+           missingMemberRecovery.GetProperty("notFound").GetBoolean() &&
+           missingMemberRecovery.GetProperty("resolvedType").GetProperty("symbolId").GetString() == signatureTypeId &&
+           missingMemberRecovery.GetProperty("candidates").GetArrayLength() is > 0 and <= 20 &&
+           missingMemberRecovery.GetProperty("nextTool").GetProperty("tool").GetString() == "api_type",
+        "qualified missing member reports the resolved type, bounded real member candidates, and an actionable api_type recovery");
     using var invalidBounds = await ToolAsync("api_assemblies", new { offset = 0, limit = 0 });
     Assert(IsError(invalidBounds), "invalid pagination bounds return an MCP tool error");
 
@@ -1044,15 +1064,37 @@ async Task CheckApiToolsAsync()
     Assert(nextLookupSource.GetProperty("startLine").GetInt32() == staleLookupNextLine &&
            nextLookupSource.GetProperty("source").GetString() != lookupSourcePage.GetProperty("source").GetString(),
         "exact api_lookup continues reconstructed source with the returned snapshot and next line");
+    using var navigationWrongKind = await ToolAsync("api_find_callers", new { assemblyId = gameAssemblyId, symbolId = signatureTypeId, scope = "assembly" });
+    using var navigationInvalidId = await ToolAsync("api_find_callees", new { assemblyId = gameAssemblyId, symbolId = "invalid-symbol-id" });
+    using var navigationInvalidBounds = await ToolAsync("api_find_usages", new { assemblyId = gameAssemblyId, symbolId = sharedTypeId, scope = "assembly", offset = -1 });
+    Assert(IsError(navigationWrongKind) && navigationWrongKind.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error").GetProperty("code").GetString() == "symbol.wrong_kind" &&
+           IsError(navigationInvalidId) && navigationInvalidId.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error").GetProperty("code").GetString() == "symbol.invalid_or_stale" &&
+           IsError(navigationInvalidBounds) && navigationInvalidBounds.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error").GetProperty("code").GetString() == "request.invalid",
+        "navigation wrong-kind, invalid-symbol, and invalid-page requests expose structured MCP error codes");
+    using var oversizedBatchId = await ToolAsync("api_decompile_batch", new
+    {
+        items = new[] { new { assemblyId = new string('x', 100_000), symbolId = "sym_invalid", startLine = 1, lineCount = 1 } },
+    });
+    Assert(IsError(oversizedBatchId) &&
+           oversizedBatchId.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error").GetProperty("code").GetString() == "request.invalid" &&
+           oversizedBatchId.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString()!.Length < 2048,
+        "batch rejects oversized untrusted IDs without echoing them into an unbounded structured error");
     File.Copy(changedAssemblyPath, apiGameSharedPath, overwrite: true);
     using var refreshedAssemblies = await ApiToolJsonAsync("api_assemblies", new { name = "Fixture.Shared", origin = "game", limit = 50 });
     var refreshedAssemblyId = refreshedAssemblies.RootElement.GetProperty("assemblies")[0].GetProperty("assemblyId").GetString()!;
     Assert(refreshedAssemblyId != gameAssemblyId, "replacing assembly content yields a fresh assembly ID");
-    using var staleAssemblyPage = await ToolAsync("api_assemblies", new { offset = staleSnapshotNextOffset, limit = 1, snapshotId = staleSnapshotId });
-    Assert(IsError(staleAssemblyPage) &&
-           (ErrorText(staleAssemblyPage).Contains("stale", StringComparison.OrdinalIgnoreCase) ||
-            ErrorText(staleAssemblyPage).Contains("snapshot", StringComparison.OrdinalIgnoreCase)),
-        "changed assembly invalidates the prior page snapshot with an explicit stale-page error");
+    using var staleBatchSnapshot = await ToolAsync("api_decompile_batch", new
+    {
+        snapshotId = staleSnapshotId,
+        items = new[] { new { assemblyId = gameAssemblyId, symbolId = sharedTypeId, startLine = 1, lineCount = 1 } },
+    });
+    Assert(IsError(staleBatchSnapshot) &&
+           staleBatchSnapshot.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error").GetProperty("code").GetString() == "snapshot.stale",
+        "batch rejects stale snapshots as request-level structured MCP errors");
+    using var navigationStaleSnapshot = await ToolAsync("api_find_callees", new { assemblyId = gameAssemblyId, symbolId = sharedTypeId, snapshotId = staleSnapshotId });
+    Assert(IsError(navigationStaleSnapshot) &&
+           navigationStaleSnapshot.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error").GetProperty("code").GetString() == "snapshot.stale",
+        "navigation rejects stale snapshot IDs through structured MCP errors");
     using var staleLookupContinuation = await ToolAsync("api_lookup", new
     {
         assemblyId = gameAssemblyId,
@@ -1062,8 +1104,9 @@ async Task CheckApiToolsAsync()
         snapshotId = staleLookupSnapshotId,
     });
     Assert(IsError(staleLookupContinuation) &&
-           ErrorText(staleLookupContinuation).Contains("restart the search without snapshotId", StringComparison.Ordinal),
-        "stale lookup continuation is rejected with an actionable fresh-search path");
+           staleLookupContinuation.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error").GetProperty("code").GetString() == "snapshot.stale" &&
+           staleLookupContinuation.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error").GetProperty("recovery").GetProperty("tool").GetString() == "api_assemblies",
+        "stale lookup continuation returns structured snapshot recovery");
     var oldGameSharedSymbolId = sharedHits.Single(hit => hit.GetProperty("assemblyId").GetString() == gameAssemblyId)
         .GetProperty("symbolId").GetString()!;
     using var staleAssemblySearch = await ToolAsync("api_search", new { query = "SharedSurface", assemblyId = gameAssemblyId });

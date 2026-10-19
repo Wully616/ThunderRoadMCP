@@ -257,19 +257,23 @@ public sealed partial class InstalledApiCatalog
         {
             ToolTiming.Count("api.type.overflowFallback");
             var fallbackSymbol = await FindIndexedSymbolByIdAsync(snapshot, entry, typeSymbolId, cancellationToken);
-            if (fallbackSymbol is null || !IsTypeKind(fallbackSymbol.Hit.kind))
-                throw new InvalidOperationException("typeSymbolId is invalid, stale, or does not identify a type in assemblyId.");
+            if (fallbackSymbol is not null && !IsTypeKind(fallbackSymbol.Hit.kind))
+                throw WrongKind(entry, fallbackSymbol.Hit, "api_type");
+            if (fallbackSymbol is null)
+                throw MissingSymbol("typeSymbolId", entry.Id, typeSymbolId, "type");
             typeSymbol = fallbackSymbol;
         }
         else
         {
-            throw new InvalidOperationException("typeSymbolId is invalid, stale, or does not identify a type in assemblyId.");
+            if (apiIndexLease.Index.SymbolsById.TryGetValue(typeSymbolId, out var wrongKind))
+                throw WrongKind(entry, wrongKind.Hit, "api_type");
+            throw MissingSymbol("typeSymbolId", entry.Id, typeSymbolId, "type");
         }
         using var main = await LoadPeAsync(entry, cancellationToken);
         using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
         var type = FindType(typeSystem.MainModule, typeSymbol.MetadataToken)
-            ?? throw new InvalidOperationException("typeSymbolId is invalid, stale, or does not identify a type in assemblyId.");
+            ?? throw MissingSymbol("typeSymbolId", entry.Id, typeSymbolId, "type");
         var typeWarnings = ObsoleteWarnings(type);
         if (!apiIndexLease.Index.Complete)
             AddWarnings(typeWarnings, new[] { IndexOmissionMessage(entry, apiIndexLease.Index) });
@@ -358,7 +362,7 @@ public sealed partial class InstalledApiCatalog
         return SerializeResponse(source);
     }
 
-    private async Task<(ApiHit? Hit, object Source)> DecompileSnapshotAsync(CatalogSnapshot snapshot, AssemblyEntry entry,
+    private async Task<(ApiHit? Hit, ApiSourcePage Source)> DecompileSnapshotAsync(CatalogSnapshot snapshot, AssemblyEntry entry,
         string symbolId, int startLine, int lineCount, bool includeHit, CancellationToken cancellationToken)
     {
         using var timing = ToolTiming.Measure("decompileMs");
@@ -367,7 +371,7 @@ public sealed partial class InstalledApiCatalog
         {
             ToolTiming.Count("api.index.nonPublicTokenFallback");
             symbol = await FindIndexedSymbolByIdAsync(snapshot, entry, symbolId, cancellationToken)
-                ?? throw new InvalidOperationException("symbolId is invalid, stale, or does not identify a type/member in assemblyId.");
+                ?? throw MissingSymbol("symbolId", entry.Id, symbolId, "type/member");
         }
         using var documentLease = await GetSourceDocumentAsync(snapshot, entry, symbol, cancellationToken);
         return (includeHit ? symbol.Hit : null,
@@ -380,6 +384,18 @@ public sealed partial class InstalledApiCatalog
         using var main = await LoadPeAsync(entry, cancellationToken);
         using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
+        foreach (var methodHandle in main.File.Metadata.MethodDefinitions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!SymbolId(entry.Id, (EntityHandle)methodHandle).Equals(symbolId, StringComparison.Ordinal))
+                continue;
+            var method = typeSystem.MainModule.ResolveEntity(methodHandle, default) as IMethod;
+            var declaringType = method?.DeclaringTypeDefinition;
+            if (method is null || declaringType is null)
+                return null;
+            var hit = CreateMemberHit(snapshot, entry, declaringType, method, new List<string>());
+            return hit is null ? null : CreateIndexedSymbol(hit, MetadataTokens.GetToken(methodHandle), method);
+        }
         foreach (var type in typeSystem.MainModule.TypeDefinitions)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -393,12 +409,10 @@ public sealed partial class InstalledApiCatalog
                     FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type));
                 return CreateIndexedSymbol(hit, MetadataTokens.GetToken(type.MetadataToken), type);
             }
-            foreach (var member in DeclaredSearchMembers(type, includeConstructors: true))
+            foreach (var member in type.Members.Concat(type.Methods))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (member.MetadataToken.IsNil)
-                    continue;
-                if (!SymbolId(entry.Id, member.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
+                if (member.MetadataToken.IsNil || !SymbolId(entry.Id, member.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
                     continue;
                 var hit = CreateMemberHit(snapshot, entry, type, member, new List<string>());
                 return hit is null ? null : CreateIndexedSymbol(hit, MetadataTokens.GetToken(member.MetadataToken), member);
@@ -457,6 +471,8 @@ public sealed partial class InstalledApiCatalog
             var hits = exactHitCount > 0
                 ? searchHits.Where(hit => hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase)).ToArray()
                 : searchHits;
+            if (hits.Length == 0)
+                await ThrowMissingMemberDiagnosticAsync(snapshot, query, assemblyId, cancellationToken);
             if (hits.Length != 1)
             {
                 var candidates = hits.Take(20).ToArray();
@@ -853,7 +869,9 @@ public sealed partial class InstalledApiCatalog
     private static void CheckSnapshot(CatalogSnapshot snapshot, string? expected)
     {
         if (expected is not null && !expected.Equals(snapshot.Id, StringComparison.Ordinal))
-            throw new InvalidOperationException("snapshotId is stale; installed files changed since the previous page; restart the search without snapshotId, then use the current assemblyId and symbolId returned by the search.");
+            throw new ApiDiscoveryException("snapshot.stale",
+                "snapshotId is stale; restart discovery without it and use IDs from the new result.",
+                new { tool = "api_assemblies", arguments = new { offset = 0, limit = 50 } });
     }
 
     private static AssemblyEntry[] SelectAssemblies(CatalogSnapshot snapshot, string? assemblyId)
@@ -864,7 +882,46 @@ public sealed partial class InstalledApiCatalog
 
     private static AssemblyEntry SelectAssembly(CatalogSnapshot snapshot, string assemblyId) =>
         snapshot.Assemblies.FirstOrDefault(a => a.Id.Equals(assemblyId, StringComparison.Ordinal))
-        ?? throw new InvalidOperationException("assemblyId is invalid or stale; rerun api_assemblies and use a current catalog-issued ID.");
+        ?? throw new ApiDiscoveryException("assembly.invalid_or_stale",
+            "assemblyId is invalid or stale; obtain a current catalog-issued ID.",
+            new { tool = "api_assemblies", arguments = new { offset = 0, limit = 50 } });
+
+    private static ApiDiscoveryException MissingSymbol(string parameter, string assemblyId, string symbolId, string expectedKind) =>
+        new("symbol.invalid_or_stale", $"{parameter} is invalid, stale, or does not identify a {expectedKind} in assemblyId.",
+            new { tool = "api_assemblies", arguments = new { offset = 0, limit = 50 }, next = "Use a current assemblyId, then search by the intended symbol name." });
+
+    private static object ErrorCandidate(ApiHit hit) => new
+    {
+        assemblyId = hit.assemblyId,
+        symbolId = hit.symbolId,
+        kind = hit.kind,
+        qualifiedName = ClipErrorText(hit.qualifiedName, 128),
+        qualifiedNameTruncated = hit.qualifiedName.Length > 128,
+        declaringType = hit.declaringType is null ? null : ClipErrorText(hit.declaringType, 128),
+        declaringTypeTruncated = hit.declaringType?.Length > 128,
+        signature = ClipErrorText(hit.signature, 256),
+        signatureTruncated = hit.signature.Length > 256,
+        provenance = new
+        {
+            origin = hit.origin,
+            relativePath = ClipErrorText(hit.relativePath, 128),
+            relativePathTruncated = hit.relativePath.Length > 128,
+        },
+    };
+
+    private static string ClipErrorText(string value, int maximum) =>
+        value.Length <= maximum ? value : value[..maximum];
+
+    private static ApiDiscoveryException WrongKind(AssemblyEntry entry, ApiHit hit, string expectedTool) =>
+        new("symbol.wrong_kind", $"This symbol is a {hit.kind}, not the {expectedTool} target kind.",
+            new
+            {
+                candidates = new[] { ErrorCandidate(hit) },
+                nextTool = new { tool = "api_decompile", arguments = new { assemblyId = entry.Id, symbolId = hit.symbolId } },
+                provenance = new { assemblyId = entry.Id, origin = entry.Origin, relativePath = entry.RelativePath },
+                signature = ClipErrorText(hit.signature, 512),
+                signatureTruncated = hit.signature.Length > 512,
+            });
 
     private static ITypeDefinition? FindType(MetadataModule module, int metadataToken) =>
         module.ResolveEntity(MetadataTokens.EntityHandle(metadataToken), default) as ITypeDefinition;
@@ -1750,6 +1807,9 @@ public sealed partial class InstalledApiCatalog
     internal sealed record ApiHit(string assemblyId, string assemblyName, string origin, string relativePath, string symbolId,
         string kind, string qualifiedName, string? declaringType, string signature, string accessibility, bool isStatic,
         string[] warnings, bool isInherited = false, ApiAttribute[]? attributes = null, bool attributesTruncated = false);
+    private sealed record ApiSourcePage(string assemblyId, string assemblyName, string origin, string relativePath,
+        string symbolId, string qualifiedName, string sourceKind, object provenance, string source, int startLine,
+        int totalLines, int lineCount, bool hasMore, int? nextLine, string snapshotId, string[] warnings, List<string> diagnostics);
 
     private sealed class LoadedPe : IDisposable
     {

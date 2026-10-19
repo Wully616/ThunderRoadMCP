@@ -3,6 +3,13 @@ using System.Text.Json.Nodes;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
+public sealed record ApiDecompileBatchItem(
+    [property: Description("Exact assemblyId from api_assemblies/api_search.")] string AssemblyId,
+    [property: Description("Exact symbolId from api_search/api_type.")] string SymbolId,
+    [property: Description("One-based source line.")] int StartLine = 1,
+    [property: Description("Source lines for this member, 1 to 500.")] int LineCount = 200);
+
+
 [McpServerToolType]
 public static class ApiDiscoveryTools
 {
@@ -72,4 +79,12 @@ public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCa
         [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(() => catalog.DecompileAsync(assemblyId, symbolId, startLine, lineCount, snapshotId, cancellationToken));
+    [McpServerTool(Name = "api_decompile_batch", Title = "Read multiple reconstructed API sources", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
+    [Description("Reconstruct source for 1 to 20 exact assemblyId/symbolId pairs in one installed snapshot. Each item may page source independently. The total serialized response is bounded by maxChars; partial results return nextItems to continue. Installed code is never executed.")]
+    public static Task<CallToolResult> ApiDecompileBatch(InstalledApiCatalog catalog,
+        [Description("Nonempty bounded list of exact assemblyId/symbolId pairs with optional source page controls.")] ApiDecompileBatchItem[] items,
+        [Description("Snapshot identifier shared by all members.")] string? snapshotId = null,
+        [Description("Hard maximum serialized response size in characters, 2000 to 64000.")] int maxChars = 32000,
+        CancellationToken cancellationToken = default) =>
+        ToolInvocation.Run(() => catalog.DecompileBatchAsync(items, snapshotId, maxChars, cancellationToken));
 }
