@@ -22,7 +22,7 @@ public static class GameTools
         });
 
     [McpServerTool(Name = "game_launch", Title = "Launch Blade & Sorcery", OpenWorld = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
-    [Description("Start the selected game installation and return its PID without waiting for bridge readiness; use game_wait_ready or game_status after entering Home or another level. Optional raw arguments override the launch.json array and are preserved by game_restart.")]
+    [Description("Start the selected game installation and return its PID without waiting for bridge readiness. On cold start, explicitly pass arguments [\"-level\", \"Home\"] unless the user requested another level; pass that target directly as the startup -level argument. The bridge initializes only after main-menu/Home startup, so use game_wait_ready or game_status before bridge-backed calls. Optional raw arguments override the launch.json array and are preserved by game_restart.")]
     public static Task<CallToolResult> GameLaunch(GameProcess gameProcess,
         [Description("Optional raw process arguments, at most 64 strings of 4096 characters each; omit to use launch.json.")] string[]? arguments = null,
         CancellationToken cancellationToken = default) =>
@@ -37,7 +37,7 @@ public static class GameTools
         ToolInvocation.Run(() => gameProcess.WaitForReadyAsync(level, timeoutMs, cancellationToken));
 
     [McpServerTool(Name = "game_load_level", Title = "Load a Blade & Sorcery level", Destructive = true, OpenWorld = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
-    [Description("Request a level load from a catalog LevelData id and game mode id. Returns the pre-request level state; loading is asynchronous, so poll game_status or game_wait_ready afterwards.")]
+    [Description("Requires a ready bridge. Do not use to fulfill a requested level before initial startup/readiness; pass the target as game_launch's startup -level argument instead. Requests a level load from a catalog LevelData id and game mode id. Returns the pre-request level state; loading is asynchronous, so poll game_status or game_wait_ready afterwards.")]
     public static Task<CallToolResult> GameLoadLevel(BridgeClient bridgeClient,
         [Description("Catalog LevelData id, for example Arena or Home.")] string levelId,
         [Description("Game mode id, for example Sandbox.")] string mode,

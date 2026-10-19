@@ -11,7 +11,7 @@ Read the full workflow in [`docs/game-guide.md`](../../docs/game-guide.md) and i
 
 - **Load the embedded guide first.** Before live work, call `game_guide("bootstrap")` and `game_guide("unity")`; use the other topics as needed.
 - **Discover before writing code.** `api_search` → `api_type`; `api_decompile` only when behavior matters. Search `ConsoleCommands` first for actions the game already exposes. Never guess ThunderRoad members.
-- **Launch is not readiness.** `game_launch` returns a PID immediately. Call `game_wait_ready` (or poll `game_status`) and check `bridgeConnected`, `bridgeReady`, and `sceneReady` before bridge work. Launch `arguments` are an array, never a shell string.
+- **Launch is not readiness.** If the game is not running, launch with `arguments: ["-level", "Home"]` unless the user requests another level; pass a requested level directly as startup `-level`. Wait for `game_wait_ready` or verify `game_status` before bridge tools. The bridge loads after main-menu/Home startup; do not rely on `game_load_level` for initial startup.
 - **Levels:** `game_load_level(levelId, mode)` is asynchronous and returns a **pre-call** snapshot (`currentLevelBefore`, `levelStateBefore`, `sceneReadyBefore`), not the loaded level. Poll `game_status` until the new `currentLevel` (lowercase, compare case-insensitively) and `sceneReady` match. Find ids with `catalog_search(catalogType="LevelData")`.
 - **Readiness waits are structured.** `game_wait_ready` returns `ready`, `timedOut`, `elapsedMs`, and `status`; `ready:false, timedOut:true` is a normal result, not a tool error.
 - **Eval is synchronous.** `evaluate_csharp` compiles a statement body returning `object`, runs it on Unity's main thread, and rejects `Task`/top-level `await`. `timeoutMs` cannot stop code that is already running. Eval assemblies stay loaded until the game restarts; prefer few purposeful snippets.
@@ -25,12 +25,14 @@ Read the full workflow in [`docs/game-guide.md`](../../docs/game-guide.md) and i
 
 ```text
 game_installations
-game_launch(arguments: ["-level","arena"])
+game_launch(arguments: ["-level", "Home"])
 game_wait_ready(timeoutMs: 60000)
 game_status
 catalog_search(catalogType="ItemData", query="sword")
 game_spawn_item(itemId: "<id>", key: "demo")
 game_runtime(action: "list")
 ```
+
+For a requested level, use `game_launch(arguments: ["-level", "<level>"])` instead.
 
 For a worked orbit example and the full readiness, level, spawn, and logging details, use [`docs/game-guide.md`](../../docs/game-guide.md). Tool parameters and runtime limits are in [`docs/usage.md`](../../docs/usage.md).
