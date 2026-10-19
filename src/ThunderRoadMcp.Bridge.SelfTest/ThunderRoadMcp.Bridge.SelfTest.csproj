@@ -7,6 +7,7 @@
     <GenerateBindingRedirectsOutputType>false</GenerateBindingRedirectsOutputType>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\ThunderRoadMcp.Host\GameplayExamples.cs" Link="GameplayExamples.cs" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
     <ProjectReference Include="..\ThunderRoadMcp.Bridge\ThunderRoadMcp.Bridge.csproj" AdditionalProperties="GameManagedDir=$(GameManagedDir)" />
     <Reference Include="ThunderRoad"><HintPath>$(GameManagedDir)\ThunderRoad.dll</HintPath><Private>false</Private></Reference>

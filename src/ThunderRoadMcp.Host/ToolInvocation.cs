@@ -1,5 +1,6 @@
-using System.Text.Json;
 using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 
@@ -12,44 +13,61 @@ internal static class ToolInvocation
     private static async Task<CallToolResult> Run(Func<Task<string>> action, bool structured)
     {
         using var invocation = ToolTiming.BeginInvocation();
-        var started = Stopwatch.GetTimestamp();
+        var started = ToolTiming.Enabled ? Stopwatch.GetTimestamp() : 0;
         try
         {
             var text = await action();
-            var value = structured ? JsonSerializer.Deserialize<JsonElement>(text) : default;
-            var content = structured
-                ? value.ValueKind == JsonValueKind.Object ? value : JsonSerializer.SerializeToElement(new { value })
-                : JsonSerializer.SerializeToElement(new { value = text });
-            ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
-            var timings = ToolTiming.Snapshot();
-            return new CallToolResult
+            if (ToolTiming.Enabled)
+                ToolTiming.Add("hostHandlerMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+
+            CallToolResult result;
+            using (ToolTiming.Measure("responseConstructionMs"))
             {
-                Content =
-                [
-                    new TextContentBlock { Text = text },
-                    new TextContentBlock { Text = "Server timings (ms): " + JsonSerializer.Serialize(timings) },
-                ],
-                StructuredContent = content,
-                Meta = new System.Text.Json.Nodes.JsonObject
+                var value = structured ? JsonSerializer.Deserialize<JsonElement>(text) : default;
+                var content = structured
+                    ? value.ValueKind == JsonValueKind.Object ? value : JsonSerializer.SerializeToElement(new { value })
+                    : JsonSerializer.SerializeToElement(new { value = text });
+                result = new CallToolResult
                 {
-                    ["timings"] = JsonSerializer.SerializeToNode(timings),
-                },
-            };
+                    Content = [new TextContentBlock { Text = text }],
+                    StructuredContent = content,
+                };
+                if (ToolTiming.Enabled)
+                {
+                    ToolTiming.Count("host.textBytes", Encoding.UTF8.GetByteCount(text));
+                    ToolTiming.Count("host.responseContentBlocks");
+                }
+            }
+
+            if (ToolTiming.Enabled)
+            {
+                ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+                ToolTiming.WriteDiagnostics();
+            }
+            return result;
         }
         catch (OperationCanceledException)
         {
-            ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            RecordFailure(started);
             throw;
         }
         catch (McpException)
         {
-            ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            RecordFailure(started);
             throw;
         }
         catch (Exception exception)
         {
-            ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            RecordFailure(started);
             throw new McpException(exception.Message, exception);
         }
+    }
+
+    private static void RecordFailure(long started)
+    {
+        if (!ToolTiming.Enabled)
+            return;
+        ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+        ToolTiming.WriteDiagnostics();
     }
 }

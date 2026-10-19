@@ -1,7 +1,6 @@
 using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using System.Text.Json;
 
 public sealed class BridgeClient
@@ -12,11 +11,16 @@ public sealed class BridgeClient
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ThunderRoadMcp", "bridge.json");
     private static readonly JsonSerializerOptions ConfigJsonOptions = new() { PropertyNameCaseInsensitive = true };
     private const double MaxBridgeTimingMs = 60_000;
+    private static readonly byte[] LineEnding = "\n"u8.ToArray();
     private static readonly HashSet<string> BridgeTimingNames = new(StringComparer.Ordinal)
     {
         "bridgeRequestTotalMs",
         "compilerQueueWaitMs",
+        "referenceInitializationMs",
         "compilationMs",
+        "parseMs",
+        "emitMs",
+        "assemblyLoadMs",
         "mainThreadQueueWaitMs",
         "invocationMs",
         "serializationMs",
@@ -38,58 +42,84 @@ public sealed class BridgeClient
 
     private async Task<string> RequestCoreAsync(string method, object parameters, CancellationToken cancellationToken)
     {
-        var config = await ReadBridgeConfigAsync(cancellationToken);
+        BridgeConfig config;
+        using (ToolTiming.Measure("bridgeConfigMs"))
+            config = await ReadBridgeConfigAsync(cancellationToken);
         using var client = new TcpClient(AddressFamily.InterNetwork);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var requestTimeout = method == "status" ? TimeSpan.FromSeconds(3) : RequestTimeout;
         timeout.CancelAfter(requestTimeout);
         var token = timeout.Token;
-        await client.ConnectAsync(IPAddress.Loopback, config.Port, token);
+        using (ToolTiming.Measure("bridgeConnectMs"))
+            await client.ConnectAsync(IPAddress.Loopback, config.Port, token);
         await using var stream = client.GetStream();
         var id = Guid.NewGuid().ToString("N");
-        var request = JsonSerializer.SerializeToUtf8Bytes(new { id, token = config.Token, method, parameters });
-        if (request.Length + 1 > MaxLineBytes)
+        ToolTiming.SetBridgeRequestId(id);
+        var request = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            id,
+            token = config.Token,
+            method,
+            parameters,
+            diagnostics = ToolTiming.Enabled,
+        });
+        if (request.Length + LineEnding.Length > MaxLineBytes)
             throw new InvalidOperationException("Bridge request exceeds the 64 KiB line limit.");
-        await stream.WriteAsync(request, token);
-        await stream.WriteAsync("\n"u8.ToArray(), token);
+        using (ToolTiming.Measure("bridgeWriteMs"))
+        {
+            await stream.WriteAsync(request, token);
+            await stream.WriteAsync(LineEnding, token);
+        }
+        ToolTiming.Count("bridge.requests");
+        ToolTiming.Count("bridge.requestBytes", request.Length + LineEnding.Length);
 
         var responseBytes = new ArrayBufferWriter<byte>(1024);
         var buffer = new byte[4096];
         var hasLineEnd = false;
-        while (responseBytes.WrittenCount < MaxLineBytes)
+        using (ToolTiming.Measure("bridgeReadMs"))
         {
-            var read = await stream.ReadAsync(buffer, token);
-            if (read == 0)
-                throw new IOException("Bridge closed the connection before responding.");
-            var lineEnd = Array.IndexOf(buffer, (byte)'\n', 0, read);
-            var count = lineEnd < 0 ? read : lineEnd;
-            var lineLength = responseBytes.WrittenCount + count + (lineEnd >= 0 ? 1 : 0);
-            if (lineLength > MaxLineBytes)
-                throw new IOException("Bridge response exceeds the 64 KiB line limit.");
-            buffer.AsSpan(0, count).CopyTo(responseBytes.GetSpan(count));
-            responseBytes.Advance(count);
-            if (lineEnd >= 0)
+            while (responseBytes.WrittenCount < MaxLineBytes)
             {
-                hasLineEnd = true;
-                break;
+                var read = await stream.ReadAsync(buffer, token);
+                if (read == 0)
+                    throw new IOException("Bridge closed the connection before responding.");
+                var lineEnd = Array.IndexOf(buffer, (byte)'\n', 0, read);
+                var count = lineEnd < 0 ? read : lineEnd;
+                var lineLength = responseBytes.WrittenCount + count + (lineEnd >= 0 ? 1 : 0);
+                if (lineLength > MaxLineBytes)
+                    throw new IOException("Bridge response exceeds the 64 KiB line limit.");
+                buffer.AsSpan(0, count).CopyTo(responseBytes.GetSpan(count));
+                responseBytes.Advance(count);
+                if (lineEnd >= 0)
+                {
+                    hasLineEnd = true;
+                    break;
+                }
             }
         }
         if (!hasLineEnd)
             throw new IOException("Bridge response exceeds the 64 KiB line limit.");
-        using var document = JsonDocument.Parse(responseBytes.WrittenMemory);
-        var root = document.RootElement;
-        if (root.GetProperty("id").GetString() != id)
-            throw new IOException("Bridge response ID did not match the request.");
-        if (root.TryGetProperty("timings", out var timings) && timings.ValueKind == JsonValueKind.Object)
-            foreach (var timing in timings.EnumerateObject())
-                if (BridgeTimingNames.Contains(timing.Name) &&
-                    timing.Value.ValueKind == JsonValueKind.Number &&
-                    timing.Value.TryGetDouble(out var milliseconds) &&
-                    double.IsFinite(milliseconds) && milliseconds is >= 0 and <= MaxBridgeTimingMs)
-                    ToolTiming.Add(timing.Name, milliseconds);
-        if (!root.GetProperty("success").GetBoolean())
-            throw new InvalidOperationException(root.GetProperty("error").GetString() ?? "Bridge request failed.");
-        return root.GetProperty("result").GetRawText();
+        ToolTiming.Count("bridge.responseBytes", responseBytes.WrittenCount + LineEnding.Length);
+        JsonDocument document;
+        using (ToolTiming.Measure("bridgeResponseParseMs"))
+            document = JsonDocument.Parse(responseBytes.WrittenMemory);
+        using (document)
+        {
+            var root = document.RootElement;
+            if (root.GetProperty("id").GetString() != id)
+                throw new IOException("Bridge response ID did not match the request.");
+            if (ToolTiming.Enabled &&
+                root.TryGetProperty("timings", out var timings) && timings.ValueKind == JsonValueKind.Object)
+                foreach (var timing in timings.EnumerateObject())
+                    if (BridgeTimingNames.Contains(timing.Name) &&
+                        timing.Value.ValueKind == JsonValueKind.Number &&
+                        timing.Value.TryGetDouble(out var milliseconds) &&
+                        double.IsFinite(milliseconds) && milliseconds is >= 0 and <= MaxBridgeTimingMs)
+                        ToolTiming.Add(timing.Name, milliseconds);
+            if (!root.GetProperty("success").GetBoolean())
+                throw new InvalidOperationException(root.GetProperty("error").GetString() ?? "Bridge request failed.");
+            return root.GetProperty("result").GetRawText();
+        }
     }
 
 

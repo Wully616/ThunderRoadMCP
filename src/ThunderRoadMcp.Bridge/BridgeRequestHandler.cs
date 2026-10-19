@@ -21,6 +21,7 @@ namespace ThunderRoadMcp.Bridge
         public string token { get; set; }
         public string method { get; set; }
         public JObject parameters { get; set; }
+        public bool diagnostics { get; set; }
     }
     internal sealed class BridgeJsonResult
     {
@@ -397,7 +398,7 @@ namespace ThunderRoadMcp.Bridge
                     compile = Task.Run(() =>
                     {
                         using (timings.Measure("compilationMs"))
-                            return CSharpEvaluator.Compile(code, token);
+                            return CSharpEvaluator.Compile(code, token, timings);
                     }, token);
                     try { evaluation = await AwaitWithCancellation(compile, token).ConfigureAwait(false); }
                     catch

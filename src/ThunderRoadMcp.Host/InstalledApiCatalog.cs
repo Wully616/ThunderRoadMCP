@@ -5,23 +5,29 @@ using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
 
-public sealed class InstalledApiCatalog
+public sealed partial class InstalledApiCatalog
 {
     private const int MaxDllFiles = 20000;
     private const int MaxDiagnostics = 200;
     private const int MaxDiagnosticsChars = 600;
     private const int MaxAssemblyBytes = 256 * 1024 * 1024;
+    // ScanAsync still reads and hashes every enumerated DLL; this only avoids repeat reads within one request.
+    private const long MaxSnapshotRetainedBytes = 64L * 1024 * 1024;
+    private const int MaxAssemblyReadAttempts = 3;
     private const int MaxResults = 50000;
     private const int MaxPageSize = 100;
     private const int MaxDependencies = 128;
     private const long MaxDependencyBytes = 512L * 1024 * 1024;
     private const int MaxDecompiledChars = 8 * 1024 * 1024;
     private const int MaxResponseChars = 16 * 1024 * 1024;
+    // ponytail: cap retained snapshots at two; raise with a larger shared byte budget.
+    private static readonly SemaphoreSlim SnapshotLifetimeSlots = new(2, 2);
     private static readonly StringComparer PathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     public async Task<string> AssembliesAsync(string? name, string? origin, int offset, int limit, string? snapshotId, CancellationToken cancellationToken)
@@ -31,7 +37,7 @@ public sealed class InstalledApiCatalog
         ValidatePage(offset, limit, MaxPageSize);
         if (origin is not null && !origin.Equals("game", StringComparison.OrdinalIgnoreCase) && !origin.Equals("mod", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("origin must be 'game' or 'mod'.", nameof(origin));
-        var snapshot = await ScanAsync(cancellationToken);
+        using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
         var assemblies = snapshot.Assemblies.Where(a =>
             (name is null || a.Name.Contains(name, StringComparison.OrdinalIgnoreCase)) &&
@@ -75,7 +81,7 @@ public sealed class InstalledApiCatalog
         if (string.IsNullOrWhiteSpace(query) || query.Length > 128)
             throw new ArgumentException("query must contain 1 to 128 characters.", nameof(query));
         var kindFilter = ParseKind(kind);
-        var snapshot = await ScanAsync(cancellationToken);
+        using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
         var (ordered, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, includeNonPublic, cancellationToken);
         if (offset > ordered.Length)
@@ -97,56 +103,43 @@ public sealed class InstalledApiCatalog
     private async Task<(ApiHit[] Hits, List<string> Diagnostics)> SearchHitsAsync(CatalogSnapshot snapshot, string query,
         string? assemblyId, string? kindFilter, bool includeNonPublic, CancellationToken cancellationToken)
     {
-        var entries = SelectAssemblies(snapshot, assemblyId);
+        using var timing = ToolTiming.Measure("apiSearchMs");
         var hits = new List<ApiHit>();
         var diagnostics = new List<string>(snapshot.Diagnostics);
-        foreach (var entry in entries)
+        foreach (var entry in SelectAssemblies(snapshot, assemblyId))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                using var main = await LoadPeAsync(entry, cancellationToken);
-                using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
-                var settings = CreateDecompilerSettings();
-                var typeSystem = new DecompilerTypeSystem(main.File, resolver, settings);
-
-                foreach (var type in typeSystem.MainModule.TypeDefinitions)
+                using var indexLease = await GetApiIndexAsync(snapshot, entry, cancellationToken);
+                if (!indexLease.Index.Complete)
+                    AddDiagnostic(diagnostics, IndexOmissionMessage(entry, indexLease.Index));
+                foreach (var symbol in indexLease.Index.Symbols)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (!includeNonPublic && type.EffectiveAccessibility() != Accessibility.Public)
+                    var hit = symbol.Hit;
+                    if (!includeNonPublic && hit.accessibility != "public")
                         continue;
-                    var typeName = FormatTypeName(type.FullTypeName.FullName);
-                    var typeKind = TypeKindName(type.Kind);
-                    if ((kindFilter is null || kindFilter == "type" || kindFilter == typeKind) &&
-                        Matches(query, type.Name, typeName))
+                    var isType = hit.kind is "class" or "struct" or "interface" or "enum" or "delegate" or "type";
+                    if (isType && (kindFilter is null || kindFilter is "type" || kindFilter == hit.kind) ||
+                        !isType && (kindFilter is null || kindFilter is "member" || kindFilter == hit.kind))
                     {
-                        AddHit(hits, CreateHit(entry, type, typeKind, typeName,
-                            type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName),
-                            FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type)));
-                    }
-
-                    if (kindFilter is not null && kindFilter is not "member" && kindFilter is not "constructor" &&
-                        kindFilter is not "method" && kindFilter is not "field" && kindFilter is not "property" && kindFilter is not "event")
-                        continue;
-                    foreach (var member in DeclaredSearchMembers(type, includeConstructors: true))
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        if (!includeNonPublic && member.EffectiveAccessibility() != Accessibility.Public)
-                            continue;
-                        var memberKind = MemberKind(member);
-                        if (kindFilter is not null && kindFilter != "member" && kindFilter != memberKind)
-                            continue;
-                        var qualifiedName = $"{typeName}.{member.Name}";
-                        if (!Matches(query, member.Name, qualifiedName))
-                            continue;
-                        var actualEntry = FindEntry(snapshot, member.ParentModule?.MetadataFile?.FileName) ?? entry;
-                        AddHit(hits, CreateHit(actualEntry, member.MemberDefinition, memberKind, qualifiedName,
-                            member.DeclaringTypeDefinition is null ? null : FormatTypeName(member.DeclaringTypeDefinition.FullTypeName.FullName),
-                            FormatMemberSignature(member), member.EffectiveAccessibility(), member.IsStatic,
-                            ObsoleteWarnings(member.MemberDefinition)));
+                        var name = hit.qualifiedName[(hit.qualifiedName.LastIndexOf('.') + 1)..];
+                        if (Matches(query, name, hit.qualifiedName))
+                            AddHit(hits, hit);
                     }
                 }
-                AddWarnings(diagnostics, resolver.Warnings.Select(w => $"{entry.Origin}/{entry.RelativePath}: {w}"));
+                if (includeNonPublic)
+                {
+                    ToolTiming.Count("api.search.nonPublicFallback");
+                    await AddNonPublicSearchHitsAsync(snapshot, entry, query, kindFilter, hits, cancellationToken);
+                }
+                if (indexLease.Index.LimitReached)
+                {
+                    ToolTiming.Count("api.search.overflowFallback");
+                    await AddOverflowSearchHitsAsync(snapshot, entry, query, kindFilter, includeNonPublic,
+                        indexLease.Index, hits, cancellationToken);
+                }
             }
             catch (OperationCanceledException) { throw; }
             catch (AssemblyChangedException) { throw; }
@@ -156,7 +149,8 @@ public sealed class InstalledApiCatalog
                 AddDiagnostic(diagnostics, $"Could not inspect {entry.Origin}/{entry.RelativePath}: {exception.Message}");
             }
         }
-        var ordered = hits.OrderBy(h => h.assemblyName, StringComparer.OrdinalIgnoreCase)
+        var ordered = hits.GroupBy(hit => hit.symbolId, StringComparer.Ordinal).Select(group => group.First())
+            .OrderBy(h => h.assemblyName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(h => h.origin, StringComparer.Ordinal)
             .ThenBy(h => h.relativePath, StringComparer.OrdinalIgnoreCase)
             .ThenBy(h => h.qualifiedName, StringComparer.OrdinalIgnoreCase)
@@ -164,36 +158,151 @@ public sealed class InstalledApiCatalog
             .ToArray();
         return (ordered, diagnostics);
     }
+    private async Task AddOverflowSearchHitsAsync(CatalogSnapshot snapshot, AssemblyEntry entry, string query,
+        string? kindFilter, bool includeNonPublic, ApiAssemblyIndex index, List<ApiHit> hits,
+        CancellationToken cancellationToken)
+    {
+        using var main = await LoadPeAsync(entry, cancellationToken);
+        using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
+        var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
+        foreach (var type in typeSystem.MainModule.TypeDefinitions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (type.MetadataToken.IsNil)
+                continue;
+            var typeName = FormatTypeName(type.FullTypeName.FullName);
+            var isType = type.Kind switch
+            {
+                TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum or TypeKind.Delegate => true,
+                _ => false,
+            };
+            if (isType && (kindFilter is null || kindFilter is "type" || kindFilter == TypeKindName(type.Kind)))
+            {
+                var simpleName = typeName[(typeName.LastIndexOf('.') + 1)..];
+                if (Matches(query, simpleName, typeName))
+                {
+                    var hit = CreateHit(entry, type, TypeKindName(type.Kind), typeName,
+                        type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName),
+                        FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type));
+                    if ((includeNonPublic || hit.accessibility == "public") && !index.SymbolsById.ContainsKey(hit.symbolId))
+                        AddHit(hits, hit);
+                }
+            }
+            foreach (var member in DeclaredSearchMembers(type, includeConstructors: true))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (member.MetadataToken.IsNil)
+                    continue;
+                if (!includeNonPublic && member.EffectiveAccessibility() != Accessibility.Public)
+                    continue;
+                var kind = MemberKind(member);
+                if (kindFilter is not null && kindFilter is not "member" && kindFilter != kind)
+                    continue;
+                var declaringType = typeName;
+                if (!Matches(query, member.Name, $"{declaringType}.{member.Name}"))
+                    continue;
+                var hit = CreateMemberHit(snapshot, entry, type, member, new List<string>());
+                if (hit is not null && !index.SymbolsById.ContainsKey(hit.symbolId))
+                    AddHit(hits, hit);
+            }
+        }
+    }
+
+    private async Task AddNonPublicSearchHitsAsync(CatalogSnapshot snapshot, AssemblyEntry entry, string query,
+        string? kindFilter, List<ApiHit> hits, CancellationToken cancellationToken)
+    {
+        using var main = await LoadPeAsync(entry, cancellationToken);
+        using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
+        var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
+        foreach (var type in typeSystem.MainModule.TypeDefinitions)
+        foreach (var member in DeclaredSearchMembers(type, includeConstructors: true))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (member.MetadataToken.IsNil)
+                continue;
+            if (member.EffectiveAccessibility() == Accessibility.Public)
+                continue;
+            var kind = MemberKind(member);
+            if (kindFilter is not null && kindFilter is not "member" && kindFilter != kind)
+                continue;
+            var declaringType = FormatTypeName(type.FullTypeName.FullName);
+            var name = member.Name;
+            var qualifiedName = $"{declaringType}.{name}";
+            if (!Matches(query, name, qualifiedName))
+                continue;
+            var hit = CreateMemberHit(snapshot, entry, type, member, new List<string>());
+            if (hit is not null)
+                AddHit(hits, hit);
+        }
+    }
+
 
 
     public async Task<string> TypeAsync(string assemblyId, string typeSymbolId, bool includeInherited, bool includeNonPublic,
         int offset, int limit, string? snapshotId, CancellationToken cancellationToken)
     {
         ValidatePage(offset, limit, MaxPageSize);
-        var snapshot = await ScanAsync(cancellationToken);
+        using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
         var entry = SelectAssembly(snapshot, assemblyId);
+        using var apiIndexLease = await GetApiIndexAsync(snapshot, entry, cancellationToken);
+        ApiTypeRecord? indexedType = null;
+        ApiIndexedSymbol typeSymbol;
+        if (apiIndexLease.Index.TypesById.TryGetValue(typeSymbolId, out var foundType))
+        {
+            indexedType = foundType;
+            typeSymbol = foundType.Symbol;
+        }
+        else if (apiIndexLease.Index.LimitReached)
+        {
+            ToolTiming.Count("api.type.overflowFallback");
+            var fallbackSymbol = await FindIndexedSymbolByIdAsync(snapshot, entry, typeSymbolId, cancellationToken);
+            if (fallbackSymbol is null || !IsTypeKind(fallbackSymbol.Hit.kind))
+                throw new InvalidOperationException("typeSymbolId is invalid, stale, or does not identify a type in assemblyId.");
+            typeSymbol = fallbackSymbol;
+        }
+        else
+        {
+            throw new InvalidOperationException("typeSymbolId is invalid, stale, or does not identify a type in assemblyId.");
+        }
         using var main = await LoadPeAsync(entry, cancellationToken);
         using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
-        var type = FindType(typeSystem.MainModule, entry, typeSymbolId)
+        var type = FindType(typeSystem.MainModule, typeSymbol.MetadataToken)
             ?? throw new InvalidOperationException("typeSymbolId is invalid, stale, or does not identify a type in assemblyId.");
         var typeWarnings = ObsoleteWarnings(type);
-        var options = includeInherited ? GetMemberOptions.None : GetMemberOptions.IgnoreInheritedMembers;
-        var members = new List<ApiHit>();
-        foreach (var member in type.GetMembers(null, options).Cast<IMember>().Concat(type.GetConstructors(null, options)))
+        if (!apiIndexLease.Index.Complete)
+            AddWarnings(typeWarnings, new[] { IndexOmissionMessage(entry, apiIndexLease.Index) });
+        ApiHit[] orderedMembers;
+        if (!includeInherited && !includeNonPublic && indexedType is not null && !apiIndexLease.Index.LimitReached)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!includeNonPublic && member.EffectiveAccessibility() != Accessibility.Public)
-                continue;
-            var hit = CreateMemberHit(snapshot, entry, type, member, typeWarnings);
-            if (hit is not null)
-                members.Add(hit);
-            if (members.Count > MaxResults)
-                throw new InvalidOperationException($"Type has more than {MaxResults} members; request a narrower non-public/inherited surface.");
+            orderedMembers = indexedType.Members.Select(symbol => symbol.Hit)
+                .OrderBy(member => member.qualifiedName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(member => member.symbolId, StringComparer.Ordinal).ToArray();
         }
-        var orderedMembers = members.OrderBy(m => m.qualifiedName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(m => m.symbolId, StringComparer.Ordinal).ToArray();
+        else
+        {
+            ToolTiming.Count("api.type.onDemandMembers");
+            var members = new List<ApiHit>();
+            var typeMembers = includeInherited
+                ? type.GetMembers(null, GetMemberOptions.None).Cast<IMember>().Concat(type.GetConstructors(null, GetMemberOptions.None))
+                : DeclaredSearchMembers(type, includeConstructors: true);
+            foreach (var member in typeMembers)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (member.MetadataToken.IsNil)
+                    continue;
+                if (!includeNonPublic && member.EffectiveAccessibility() != Accessibility.Public)
+                    continue;
+                var hit = CreateMemberHit(snapshot, entry, type, member, typeWarnings);
+                if (hit is not null)
+                    members.Add(hit);
+                if (members.Count > MaxResults)
+                    throw new InvalidOperationException($"Type has more than {MaxResults} members; request a narrower non-public/inherited surface.");
+            }
+            orderedMembers = members.OrderBy(member => member.qualifiedName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(member => member.symbolId, StringComparer.Ordinal).ToArray();
+        }
         if (offset > orderedMembers.Length)
             throw new ArgumentOutOfRangeException(nameof(offset), $"offset {offset} exceeds the member count {orderedMembers.Length}.");
         var page = orderedMembers.Skip(offset).Take(limit).ToArray();
@@ -213,11 +322,18 @@ public sealed class InstalledApiCatalog
             qualifiedName = FormatTypeName(type.FullTypeName.FullName),
             typeKind = TypeKindName(type.Kind),
             typeDeclaration = FormatTypeDeclaration(type),
+            attributes = typeSymbol.Hit.attributes,
+            attributesTruncated = typeSymbol.Hit.attributesTruncated,
             baseType = baseType is null ? null : FormatType(baseType),
             interfaces,
-            genericConstraints = FormatConstraints(type.TypeParameters),
+            genericConstraints = FormatConstraints(OwnTypeParameters(type)),
             warnings = typeWarnings,
-            members = page,
+            members = page.Select(member =>
+            {
+                var node = JsonSerializer.SerializeToNode(member)!.AsObject();
+                node["name"] = member.qualifiedName[(member.qualifiedName.LastIndexOf('.') + 1)..];
+                return node;
+            }).ToArray(),
             total = orderedMembers.Length,
             offset,
             limit,
@@ -235,7 +351,7 @@ public sealed class InstalledApiCatalog
             throw new ArgumentOutOfRangeException(nameof(startLine), "startLine must be at least 1.");
         if (lineCount is < 1 or > 500)
             throw new ArgumentOutOfRangeException(nameof(lineCount), "lineCount must be between 1 and 500.");
-        var snapshot = await ScanAsync(cancellationToken);
+        using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
         var entry = SelectAssembly(snapshot, assemblyId);
         var (_, source) = await DecompileSnapshotAsync(snapshot, entry, symbolId, startLine, lineCount, includeHit: false, cancellationToken);
@@ -245,136 +361,109 @@ public sealed class InstalledApiCatalog
     private async Task<(ApiHit? Hit, object Source)> DecompileSnapshotAsync(CatalogSnapshot snapshot, AssemblyEntry entry,
         string symbolId, int startLine, int lineCount, bool includeHit, CancellationToken cancellationToken)
     {
-        using var main = await LoadPeAsync(entry, cancellationToken);
-        using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
-        var settings = CreateDecompilerSettings();
-        var typeSystem = new DecompilerTypeSystem(main.File, resolver, settings);
-        var entity = FindEntity(typeSystem.MainModule, entry, symbolId, cancellationToken)
-            ?? throw new InvalidOperationException("symbolId is invalid, stale, or does not identify a type/member in assemblyId.");
-        var hit = includeHit ? CreateExactHit(snapshot, entry, entity) : null;
-        var source = BuildDecompiledSource(snapshot, entry, symbolId, entity, typeSystem, resolver, settings,
-            startLine, lineCount, cancellationToken);
-        return (hit, source);
+        using var timing = ToolTiming.Measure("decompileMs");
+        using var indexLease = await GetApiIndexAsync(snapshot, entry, cancellationToken);
+        if (!indexLease.Index.SymbolsById.TryGetValue(symbolId, out var symbol))
+        {
+            ToolTiming.Count("api.index.nonPublicTokenFallback");
+            symbol = await FindIndexedSymbolByIdAsync(snapshot, entry, symbolId, cancellationToken)
+                ?? throw new InvalidOperationException("symbolId is invalid, stale, or does not identify a type/member in assemblyId.");
+        }
+        using var documentLease = await GetSourceDocumentAsync(snapshot, entry, symbol, cancellationToken);
+        return (includeHit ? symbol.Hit : null,
+            CreateSourcePage(snapshot, entry, symbol, documentLease.Document, startLine, lineCount));
     }
 
-    private static object BuildDecompiledSource(CatalogSnapshot snapshot, AssemblyEntry entry, string symbolId,
-        IEntity entity, DecompilerTypeSystem typeSystem, RootedAssemblyResolver resolver, DecompilerSettings settings,
-        int startLine, int lineCount, CancellationToken cancellationToken)
+    private async Task<ApiIndexedSymbol?> FindIndexedSymbolByIdAsync(CatalogSnapshot snapshot, AssemblyEntry entry,
+        string symbolId, CancellationToken cancellationToken)
     {
-        using var timing = ToolTiming.Measure("decompileMs");
-        var warnings = ObsoleteWarnings(entity).ToList();
-        string source;
-        if (entity is IMethod method && !method.HasBody)
+        using var main = await LoadPeAsync(entry, cancellationToken);
+        using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
+        var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
+        foreach (var type in typeSystem.MainModule.TypeDefinitions)
         {
-            source = FormatMemberSignature(method) + ";";
-            warnings.Add("The selected method has no managed IL body (for example, it is abstract, extern, or has no implementation); no body was reconstructed.");
+            cancellationToken.ThrowIfCancellationRequested();
+            if (type.MetadataToken.IsNil)
+                continue;
+            if (SymbolId(entry.Id, type.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
+            {
+                var typeName = FormatTypeName(type.FullTypeName.FullName);
+                var hit = CreateHit(entry, type, TypeKindName(type.Kind), typeName,
+                    type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName),
+                    FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type));
+                return CreateIndexedSymbol(hit, MetadataTokens.GetToken(type.MetadataToken), type);
+            }
+            foreach (var member in DeclaredSearchMembers(type, includeConstructors: true))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (member.MetadataToken.IsNil)
+                    continue;
+                if (!SymbolId(entry.Id, member.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
+                    continue;
+                var hit = CreateMemberHit(snapshot, entry, type, member, new List<string>());
+                return hit is null ? null : CreateIndexedSymbol(hit, MetadataTokens.GetToken(member.MetadataToken), member);
+            }
         }
-        else
-        {
-            var decompiler = new CSharpDecompiler(typeSystem, settings) { CancellationToken = cancellationToken };
-            source = entity is ITypeDefinition definition
-                ? decompiler.DecompileTypeAsString(definition.FullTypeName)
-                : decompiler.DecompileAsString(entity.MetadataToken);
-            AddWarnings(warnings, decompiler.Errors.Select(CSharpDecompiler.GetErrorHeadline));
-        }
-        cancellationToken.ThrowIfCancellationRequested();
-        if (source.Length > MaxDecompiledChars)
-            throw new InvalidOperationException($"Reconstructed source exceeds the {MaxDecompiledChars} character safety limit; select a smaller member.");
-        var normalizedSource = source.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
-        var totalLines = 1;
-        for (var i = 0; i < normalizedSource.Length; i++)
-        {
-            if ((i & 0xffff) == 0) cancellationToken.ThrowIfCancellationRequested();
-            if (normalizedSource[i] == '\n') totalLines++;
-        }
-        var first = startLine - 1;
-        if (first >= totalLines)
-            throw new ArgumentOutOfRangeException(nameof(startLine), $"startLine {startLine} exceeds the source line count {totalLines}.");
-        var page = new string[Math.Min(lineCount, totalLines - first)];
-        var sourceLine = 0;
-        var pageIndex = 0;
-        var lineStart = 0;
-        for (var i = 0; i <= normalizedSource.Length; i++)
-        {
-            if ((i & 0xffff) == 0) cancellationToken.ThrowIfCancellationRequested();
-            if (i < normalizedSource.Length && normalizedSource[i] != '\n') continue;
-            if (sourceLine >= first && pageIndex < page.Length)
-                page[pageIndex++] = normalizedSource[lineStart..i];
-            sourceLine++;
-            lineStart = i + 1;
-        }
-        var hasMore = first + page.Length < totalLines;
-        AddWarnings(warnings, resolver.Warnings);
-        AddWarnings(snapshot.Diagnostics, resolver.Warnings.Select(w => $"{entry.Origin}/{entry.RelativePath}: {w}"));
-        return new
-        {
-            assemblyId = entry.Id,
-            assemblyName = entry.Name,
-            origin = entry.Origin,
-            relativePath = entry.RelativePath,
-            symbolId,
-            qualifiedName = entity is ITypeDefinition type ? FormatTypeName(type.FullTypeName.FullName) :
-                $"{FormatTypeName(entity.DeclaringTypeDefinition?.FullTypeName.FullName ?? string.Empty)}.{entity.Name}",
-            sourceKind = "reconstructed-csharp",
-            provenance = new { origin = entry.Origin, relativePath = entry.RelativePath, assemblyName = entry.Name, assemblyId = entry.Id, symbolId },
-            source = string.Join('\n', page),
-            startLine,
-            totalLines,
-            lineCount = page.Length,
-            hasMore,
-            nextLine = hasMore ? startLine + page.Length : (int?)null,
-            snapshotId = snapshot.Id,
-            warnings,
-            diagnostics = snapshot.Diagnostics,
-        };
+        return null;
     }
     public async Task<string> LookupAsync(string? query, string? assemblyId, string? symbolId, string? kind,
-        int startLine, int lineCount, string? snapshotId, CancellationToken cancellationToken)
+        string? mode, int startLine, int lineCount, string? snapshotId, int maxResults, int maxChars,
+        bool includeExamples, string? continuation, BaseCatalogDataCatalog? baseCatalog, CancellationToken cancellationToken)
     {
         using var timing = ToolTiming.Measure("apiLookupMs");
-        if (startLine < 1)
-            throw new ArgumentOutOfRangeException(nameof(startLine), "startLine must be at least 1.");
-        if (lineCount is < 1 or > 500)
-            throw new ArgumentOutOfRangeException(nameof(lineCount), "lineCount must be between 1 and 500.");
         if (query is not null && symbolId is not null)
             throw new ArgumentException("Provide either query or the exact assemblyId and symbolId pair, not both.");
         if (query is null && (string.IsNullOrWhiteSpace(assemblyId) || string.IsNullOrWhiteSpace(symbolId)))
             throw new ArgumentException("Provide a query or both exact assemblyId and symbolId values.");
-        if (query is null && kind is not null)
-            throw new ArgumentException("kind is only valid with query mode.", nameof(kind));
-
-        string? kindFilter = null;
+        var lookupMode = (mode ?? (query is null ? "symbol" : "task")).Trim().ToLowerInvariant();
+        if (lookupMode is not "task" and not "symbol")
+            throw new ArgumentException("mode must be 'task' or 'symbol'.", nameof(mode));
+        if (query is null && lookupMode != "symbol")
+            throw new ArgumentException("An exact assemblyId and symbolId pair uses symbol mode.", nameof(mode));
+        if (query is null && (kind is not null || continuation is not null))
+            throw new ArgumentException("kind and continuation are only valid with query mode.");
         if (query is not null)
         {
-            if (string.IsNullOrWhiteSpace(query) || query.Length > 128)
-                throw new ArgumentException("query must contain 1 to 128 characters.", nameof(query));
-            kindFilter = ParseKind(kind);
+            var maxQueryLength = lookupMode == "task" ? 2048 : 128;
+            if (string.IsNullOrWhiteSpace(query) || query.Length > maxQueryLength)
+                throw new ArgumentException($"query must contain 1 to {maxQueryLength} characters.", nameof(query));
         }
+        if (continuation is not null && lookupMode != "task")
+            throw new ArgumentException("continuation is only valid in task mode.", nameof(continuation));
 
-        var snapshot = await ScanAsync(cancellationToken);
+        var kindFilter = query is null ? null : ParseKind(kind);
+        using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
+        if (lookupMode == "task")
+        {
+            if (query is null)
+                throw new ArgumentException("Task mode requires query.");
+            if (maxResults is < 1 or > 20)
+                throw new ArgumentOutOfRangeException(nameof(maxResults), "maxResults must be between 1 and 20.");
+            if (maxChars is < 3000 or > 32000)
+                throw new ArgumentOutOfRangeException(nameof(maxChars), "maxChars must be between 3000 and 32000.");
+            return await TaskLookupAsync(snapshot, query, assemblyId, kindFilter, maxResults, maxChars,
+                includeExamples, continuation, baseCatalog, cancellationToken);
+        }
+        if (startLine < 1)
+            throw new ArgumentOutOfRangeException(nameof(startLine), "startLine must be at least 1.");
+        if (lineCount is < 1 or > 500)
+            throw new ArgumentOutOfRangeException(nameof(lineCount), "lineCount must be between 1 and 500.");
+
         if (query is not null)
         {
             var (searchHits, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, false, cancellationToken);
-            var exactHitCount = 0;
-            foreach (var hit in searchHits)
-                if (hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase))
-                    exactHitCount++;
-            var hits = searchHits;
-            if (exactHitCount > 0 && exactHitCount < searchHits.Length)
-            {
-                hits = new ApiHit[exactHitCount];
-                var exactHitIndex = 0;
-                foreach (var hit in searchHits)
-                    if (hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase))
-                        hits[exactHitIndex++] = hit;
-            }
+            var exactHitCount = searchHits.Count(hit => hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase));
+            var hits = exactHitCount > 0
+                ? searchHits.Where(hit => hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase)).ToArray()
+                : searchHits;
             if (hits.Length != 1)
             {
                 var candidates = hits.Take(20).ToArray();
                 var hasMore = hits.Length > candidates.Length;
                 return SerializeResponse(new
                 {
+                    mode = "symbol",
                     query,
                     found = hits.Length > 0,
                     ambiguous = hits.Length > 1,
@@ -406,7 +495,7 @@ public sealed class InstalledApiCatalog
             var match = hits[0];
             var entry = SelectAssembly(snapshot, match.assemblyId);
             var (_, source) = await DecompileSnapshotAsync(snapshot, entry, match.symbolId, startLine, lineCount, includeHit: false, cancellationToken);
-            return SerializeResponse(new { query, found = true, ambiguous = false, match, source, snapshotId = snapshot.Id, diagnostics });
+            return SerializeResponse(new { mode = "symbol", query, found = true, ambiguous = false, match, source, snapshotId = snapshot.Id, diagnostics });
         }
 
         var exactEntry = SelectAssembly(snapshot, assemblyId!);
@@ -414,6 +503,7 @@ public sealed class InstalledApiCatalog
             snapshot, exactEntry, symbolId!, startLine, lineCount, includeHit: true, cancellationToken);
         return SerializeResponse(new
         {
+            mode = "symbol",
             found = true,
             ambiguous = false,
             match = exactMatch!,
@@ -439,6 +529,20 @@ public sealed class InstalledApiCatalog
 
     private async Task<CatalogSnapshot> ScanAsync(CancellationToken cancellationToken)
     {
+        await SnapshotLifetimeSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await ScanCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            SnapshotLifetimeSlots.Release();
+            throw;
+        }
+    }
+
+    private async Task<CatalogSnapshot> ScanCoreAsync(CancellationToken cancellationToken)
+    {
         using var timing = ToolTiming.Measure("apiScanMs");
         var options = await GameInstallConfiguration.ReadLaunchOptionsAsync(cancellationToken);
         var roots = new[]
@@ -446,8 +550,9 @@ public sealed class InstalledApiCatalog
             new InstallRoot("game", GameInstallConfiguration.ManagedDirectory(options)),
             new InstallRoot("mod", GameInstallConfiguration.ModsDirectory(options)),
         };
-        var diagnostics = new List<string>();
         var entries = new List<AssemblyEntry>();
+        var diagnostics = new List<string>();
+        long retainedScanBytes = 0;
         var fingerprints = new List<string>();
         var canonicalRoots = new List<string>();
         var truncated = false;
@@ -468,28 +573,30 @@ public sealed class InstalledApiCatalog
                 AddDiagnostic(diagnostics, $"{configuredRoot.Origin} root is missing: {root}");
                 continue;
             }
-            var files = EnumerateDllFiles(root, configuredRoot.Origin, diagnostics, cancellationToken, ref truncated);
+            IEnumerable<string> files;
+            using (ToolTiming.Measure("apiInventoryEnumerationMs"))
+                files = EnumerateDllFiles(root, configuredRoot.Origin, diagnostics, cancellationToken, ref truncated);
             foreach (var file in files)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                ToolTiming.Count("api.scan.filesConsidered");
                 string relativePath = Path.GetRelativePath(root, file).Replace(Path.DirectorySeparatorChar, '/');
                 try
                 {
-                    var info = new FileInfo(file);
-                    if (info.Length > MaxAssemblyBytes)
+                    byte[] bytes;
+                    try
                     {
-                        AddDiagnostic(diagnostics, $"Ignored {configuredRoot.Origin}/{relativePath}: DLL exceeds the {MaxAssemblyBytes} byte scan limit.");
-                        fingerprints.Add($"{configuredRoot.Origin}|{relativePath}|oversize|{info.Length}|{info.LastWriteTimeUtc.Ticks}");
-                        continue;
+                        bytes = await ReadEntryBytesAsync(root, file, cancellationToken);
                     }
-                    var bytes = await ReadEntryBytesAsync(root, file, cancellationToken);
-                    if (bytes.LongLength > MaxAssemblyBytes)
+                    catch (AssemblyTooLargeException tooLarge)
                     {
+                        var oversizedContentHash = await HashOversizedEntryAsync(root, file, tooLarge.Length, cancellationToken);
                         AddDiagnostic(diagnostics, $"Ignored {configuredRoot.Origin}/{relativePath}: DLL exceeds the {MaxAssemblyBytes} byte scan limit.");
-                        fingerprints.Add($"{configuredRoot.Origin}|{relativePath}|oversize|{bytes.LongLength}");
+                        fingerprints.Add($"{configuredRoot.Origin}|{relativePath}|oversize|{oversizedContentHash}");
                         continue;
                     }
                     var contentHash = Convert.ToHexString(SHA256.HashData(bytes));
+                    ToolTiming.Count("api.scan.bytesHashed", bytes.LongLength);
                     fingerprints.Add($"{configuredRoot.Origin}|{relativePath}|{contentHash}");
                     using var loaded = OpenPe(file, bytes);
                     var metadata = loaded.File.Metadata;
@@ -503,9 +610,13 @@ public sealed class InstalledApiCatalog
                     var version = definition.Version.ToString();
                     var moduleVersionId = metadata.GetGuid(metadata.GetModuleDefinition().Mvid).ToString("D");
                     var id = MakeAssemblyId(configuredRoot.Origin, root, relativePath, contentHash);
-                    entries.Add(new AssemblyEntry(id, assemblyName, version, moduleVersionId, configuredRoot.Origin, root, relativePath, file, contentHash));
+                    var retainedBytes = bytes.LongLength <= MaxSnapshotRetainedBytes - retainedScanBytes ? bytes : null;
+                    if (retainedBytes is not null)
+                        retainedScanBytes += bytes.LongLength;
+                    entries.Add(new AssemblyEntry(id, assemblyName, version, moduleVersionId, configuredRoot.Origin, root, relativePath, file, contentHash, retainedBytes));
                 }
                 catch (OperationCanceledException) { throw; }
+                catch (AssemblyChangedException) { throw; }
                 catch (BadImageFormatException)
                 {
                     AddDiagnostic(diagnostics, $"Ignored {configuredRoot.Origin}/{relativePath}: file is native or not a valid managed assembly.");
@@ -525,9 +636,9 @@ public sealed class InstalledApiCatalog
         var snapshotParts = canonicalRoots.Concat(fingerprints.OrderBy(f => f, StringComparer.Ordinal));
         var snapshotText = JsonSerializer.Serialize(snapshotParts);
         var snapshotId = "snap_" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(snapshotText))).Substring(0, 32);
-        return new CatalogSnapshot(snapshotId, entries, diagnostics, truncated);
+        return new CatalogSnapshot(snapshotId, entries, diagnostics, truncated,
+            new SnapshotBufferLifetime(() => SnapshotLifetimeSlots.Release()));
     }
-
     private static IEnumerable<string> EnumerateDllFiles(string root, string origin, List<string> diagnostics,
         CancellationToken cancellationToken, ref bool truncated)
     {
@@ -612,30 +723,115 @@ public sealed class InstalledApiCatalog
 
     private async Task<LoadedPe> LoadPeAsync(AssemblyEntry entry, CancellationToken cancellationToken)
     {
-        var bytes = await ReadEntryBytesAsync(entry.Root, entry.FullPath, cancellationToken);
-        if (!Convert.ToHexString(SHA256.HashData(bytes)).Equals(entry.ContentHash, StringComparison.Ordinal))
+        if (entry.ScanBytes is { } scanBytes)
+            return OpenPe(entry.FullPath, scanBytes);
+
+        byte[] bytes;
+        try
+        {
+            bytes = await ReadEntryBytesAsync(entry.Root, entry.FullPath, cancellationToken);
+        }
+        catch (AssemblyTooLargeException)
+        {
+            throw AssemblyChanged(entry.FullPath);
+        }
+        var contentHash = Convert.ToHexString(SHA256.HashData(bytes));
+        ToolTiming.Count("api.scan.bytesHashed", bytes.LongLength);
+        if (!contentHash.Equals(entry.ContentHash, StringComparison.Ordinal))
             throw new AssemblyChangedException($"Assembly '{entry.Origin}/{entry.RelativePath}' changed during the request; rerun api_assemblies and use its fresh IDs.");
         return OpenPe(entry.FullPath, bytes);
     }
 
     private static async Task<byte[]> ReadEntryBytesAsync(string root, string fullPath, CancellationToken cancellationToken)
     {
-        var canonical = ResolveCanonicalPath(fullPath);
-        if (!IsUnderRoot(canonical, root))
-            throw new IOException("Resolved assembly path leaves its configured installation root.");
-        await using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        if (stream.Length > MaxAssemblyBytes)
-            throw new IOException($"Assembly exceeds the {MaxAssemblyBytes} byte scan limit.");
-        var bytes = new byte[checked((int)stream.Length)];
-        await stream.ReadExactlyAsync(bytes, cancellationToken);
-        if (stream.ReadByte() != -1 || stream.Length != bytes.LongLength)
-            throw new AssemblyChangedException("Assembly changed while it was being read.");
+        using var timing = ToolTiming.Measure("apiFileValidationMs");
+        Exception? lastFailure = null;
+        for (var attempt = 0; attempt < MaxAssemblyReadAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var canonical = ResolveCanonicalPath(fullPath);
+                if (!IsUnderRoot(canonical, root))
+                    throw new IOException("Resolved assembly path leaves its configured installation root.");
+                await using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                if (stream.Length > MaxAssemblyBytes)
+                {
+                    VerifyEntryPath(root, fullPath, canonical);
+                    throw new AssemblyTooLargeException(stream.Length);
+                }
+                var bytes = new byte[checked((int)stream.Length)];
+                await stream.ReadExactlyAsync(bytes, cancellationToken);
+                if (stream.ReadByte() != -1 || stream.Length != bytes.LongLength)
+                    throw new AssemblyChangedException("Assembly changed while it was being read.");
+                VerifyEntryPath(root, fullPath, canonical);
+                return bytes;
+            }
+            catch (AssemblyTooLargeException) { throw; }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                lastFailure = exception;
+                if (attempt + 1 < MaxAssemblyReadAttempts)
+                    await Task.Delay(10 * (attempt + 1), cancellationToken);
+            }
+        }
+        throw AssemblyChanged(fullPath, lastFailure);
+    }
+
+    private static async Task<string> HashOversizedEntryAsync(string root, string fullPath, long expectedLength,
+        CancellationToken cancellationToken)
+    {
+        using var timing = ToolTiming.Measure("apiFileValidationMs");
+        var buffer = new byte[65536];
+        Exception? lastFailure = null;
+        for (var attempt = 0; attempt < MaxAssemblyReadAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var canonical = ResolveCanonicalPath(fullPath);
+                if (!IsUnderRoot(canonical, root))
+                    throw new IOException("Resolved assembly path leaves its configured installation root.");
+                await using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, buffer.Length, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                if (stream.Length != expectedLength || stream.Length <= MaxAssemblyBytes)
+                    throw new AssemblyChangedException("Assembly size changed while it was being scanned.");
+                using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                long bytesRead = 0;
+                int count;
+                while ((count = await stream.ReadAsync(buffer.AsMemory(), cancellationToken)) != 0)
+                {
+                    hash.AppendData(buffer, 0, count);
+                    bytesRead += count;
+                    ToolTiming.Count("api.scan.bytesHashed", count);
+                }
+                if (bytesRead != stream.Length || stream.Length != expectedLength)
+                    throw new AssemblyChangedException("Assembly changed while it was being hashed.");
+                VerifyEntryPath(root, fullPath, canonical);
+                return Convert.ToHexString(hash.GetHashAndReset());
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                lastFailure = exception;
+                if (attempt + 1 < MaxAssemblyReadAttempts)
+                    await Task.Delay(10 * (attempt + 1), cancellationToken);
+            }
+        }
+        throw AssemblyChanged(fullPath, lastFailure);
+    }
+
+    private static void VerifyEntryPath(string root, string fullPath, string canonical)
+    {
         var after = ResolveCanonicalPath(fullPath);
         if (!IsUnderRoot(after, root) || !PathComparer.Equals(canonical, after))
             throw new AssemblyChangedException("Assembly path changed while it was being read.");
-        return bytes;
     }
+
+    private static AssemblyChangedException AssemblyChanged(string fullPath, Exception? innerException = null) =>
+        new($"Installed assembly '{Path.GetFileName(fullPath)}' changed or could not be read consistently after {MaxAssemblyReadAttempts} attempts; rerun api_assemblies and use its current IDs.", innerException);
 
     private static void ValidatePage(int offset, int limit, int maxLimit)
     {
@@ -670,25 +866,11 @@ public sealed class InstalledApiCatalog
         snapshot.Assemblies.FirstOrDefault(a => a.Id.Equals(assemblyId, StringComparison.Ordinal))
         ?? throw new InvalidOperationException("assemblyId is invalid or stale; rerun api_assemblies and use a current catalog-issued ID.");
 
-    private static ITypeDefinition? FindType(MetadataModule module, AssemblyEntry entry, string symbolId) =>
-        module.TypeDefinitions.FirstOrDefault(type => !type.MetadataToken.IsNil && SymbolId(entry.Id, type.MetadataToken).Equals(symbolId, StringComparison.Ordinal));
+    private static ITypeDefinition? FindType(MetadataModule module, int metadataToken) =>
+        module.ResolveEntity(MetadataTokens.EntityHandle(metadataToken), default) as ITypeDefinition;
 
-    private static IEntity? FindEntity(MetadataModule module, AssemblyEntry entry, string symbolId, CancellationToken cancellationToken)
-    {
-        foreach (var type in module.TypeDefinitions)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!type.MetadataToken.IsNil && SymbolId(entry.Id, type.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
-                return type;
-            foreach (var member in DeclaredSearchMembers(type, includeConstructors: true))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!member.MetadataToken.IsNil && SymbolId(entry.Id, member.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
-                    return member;
-            }
-        }
-        return null;
-    }
+    private static IEntity? FindEntity(MetadataModule module, int metadataToken) =>
+        module.ResolveEntity(MetadataTokens.EntityHandle(metadataToken), default);
 
 
     private static IEnumerable<IMember> DeclaredSearchMembers(ITypeDefinition type) => DeclaredSearchMembers(type, includeConstructors: false);
@@ -746,11 +928,143 @@ public sealed class InstalledApiCatalog
         throw new InvalidOperationException("symbolId does not identify a supported type or member.");
     }
 
+    private const int MaxApiAttributes = 32;
+    private const int MaxApiAttributeArguments = 16;
+    private const int MaxApiAttributeChars = 8192;
+
     private static ApiHit CreateHit(AssemblyEntry entry, IEntity entity, string kind, string qualifiedName, string? declaringType,
-        string signature, Accessibility accessibility, bool isStatic, List<string> warnings, bool isInherited = false) =>
-        new(entry.Id, entry.Name, entry.Origin, entry.RelativePath, SymbolId(entry.Id, entity.MetadataToken), kind,
+        string signature, Accessibility accessibility, bool isStatic, List<string> warnings, bool isInherited = false)
+    {
+        var (attributes, attributesTruncated) = ReadApiAttributes(entity);
+        return new ApiHit(entry.Id, entry.Name, entry.Origin, entry.RelativePath, SymbolId(entry.Id, entity.MetadataToken), kind,
             qualifiedName, declaringType, signature, AccessibilityKeyword(accessibility).ToLowerInvariant(), isStatic,
-            warnings, isInherited);
+            warnings.ToArray(), isInherited, attributes, attributesTruncated);
+    }
+
+    private static (ApiAttribute[] Attributes, bool Truncated) ReadApiAttributes(IEntity entity)
+    {
+        var relevant = new List<(string Target, IAttribute Attribute)>(MaxApiAttributes);
+        var truncated = false;
+        void Add(IEnumerable<IAttribute> attributes, string? target)
+        {
+            foreach (var attribute in attributes)
+            {
+                if (!IsRelevantApiAttribute(attribute.AttributeType.FullName))
+                    continue;
+                if (relevant.Count >= MaxApiAttributes)
+                {
+                    truncated = true;
+                    continue;
+                }
+                relevant.Add((target ?? "", attribute));
+            }
+        }
+
+        Add(entity.GetAttributes(), null);
+        IEnumerable<IParameter> parameters = entity switch
+        {
+            IMethod method => method.Parameters,
+            IProperty property => property.Parameters,
+            _ => Array.Empty<IParameter>(),
+        };
+        var parameterIndex = 0;
+        foreach (var parameter in parameters)
+        {
+            Add(parameter.GetAttributes(), $"parameter:{parameterIndex}:{parameter.Name}");
+            parameterIndex++;
+        }
+
+        relevant.Sort((left, right) =>
+        {
+            var result = StringComparer.Ordinal.Compare(left.Target, right.Target);
+            return result != 0 ? result : StringComparer.Ordinal.Compare(left.Attribute.AttributeType.FullName, right.Attribute.AttributeType.FullName);
+        });
+
+        var result = new List<ApiAttribute>(Math.Min(relevant.Count, MaxApiAttributes));
+        var usedChars = 0;
+        foreach (var (target, attribute) in relevant)
+        {
+            if (result.Count >= MaxApiAttributes) break;
+            var name = attribute.AttributeType.FullName;
+            var fixedArguments = ReadApiAttributeArguments(attribute.FixedArguments.Select(argument => (Name: (string?)null, Value: argument.Value)),
+                ref usedChars, ref truncated);
+            var namedArguments = ReadApiAttributeArguments(attribute.NamedArguments.Select(argument => (Name: (string?)argument.Name, Value: argument.Value))
+                .OrderBy(argument => argument.Name, StringComparer.Ordinal), ref usedChars, ref truncated);
+            var cost = name.Length + target.Length;
+            if (usedChars + cost > MaxApiAttributeChars)
+            {
+                truncated = true;
+                break;
+            }
+            usedChars += cost;
+            result.Add(new ApiAttribute(name, target.Length == 0 ? null : target, fixedArguments, namedArguments));
+            if (truncated && usedChars >= MaxApiAttributeChars) break;
+        }
+        return (result.ToArray(), truncated);
+    }
+
+    private static ApiAttributeArgument[] ReadApiAttributeArguments(
+        IEnumerable<(string? Name, object? Value)> arguments, ref int usedChars, ref bool truncated)
+    {
+        var result = new List<ApiAttributeArgument>();
+        foreach (var (name, rawValue) in arguments)
+        {
+            if (result.Count >= MaxApiAttributeArguments)
+            {
+                truncated = true;
+                break;
+            }
+            var value = rawValue switch
+            {
+                null or bool or byte or sbyte or short or ushort or int or uint or long or ulong => rawValue,
+                float number => number.ToString("R", CultureInfo.InvariantCulture),
+                double number => number.ToString("R", CultureInfo.InvariantCulture),
+                char character => character.ToString(),
+                string text => text,
+                _ => null,
+            };
+            if (rawValue is not null && value is null)
+            {
+                truncated = true;
+                continue;
+            }
+            var nameLength = name?.Length ?? 0;
+            var valueLength = value switch
+            {
+                null => 0,
+                string text => text.Length,
+                _ => Convert.ToString(value, CultureInfo.InvariantCulture)?.Length ?? 0,
+            };
+            var remaining = MaxApiAttributeChars - usedChars;
+            if (nameLength + valueLength > remaining)
+            {
+                truncated = true;
+                break;
+            }
+            usedChars += nameLength + valueLength;
+            result.Add(new ApiAttributeArgument(name, value));
+        }
+        return result.ToArray();
+    }
+
+    private static bool IsRelevantApiAttribute(string name) =>
+        name is "System.ObsoleteAttribute" or "System.FlagsAttribute" or "System.ParamArrayAttribute" or
+            "System.Runtime.CompilerServices.ExtensionAttribute" or "System.NonSerializedAttribute" or
+            "UnityEngine.SerializeField" or "UnityEngine.SerializeFieldAttribute" or
+            "UnityEngine.SerializeReference" or "UnityEngine.SerializeReferenceAttribute" or
+            "UnityEngine.HideInInspector" or "UnityEngine.HideInInspectorAttribute" or
+            "UnityEngine.Serialization.FormerlySerializedAs" or "UnityEngine.Serialization.FormerlySerializedAsAttribute" ||
+        !name.StartsWith("System.", StringComparison.Ordinal) && !name.StartsWith("UnityEngine.", StringComparison.Ordinal);
+
+    internal sealed record ApiAttribute(
+        [property: System.Text.Json.Serialization.JsonPropertyName("name")] string Name,
+        [property: System.Text.Json.Serialization.JsonPropertyName("target")] string? Target,
+        [property: System.Text.Json.Serialization.JsonPropertyName("fixedArguments")] ApiAttributeArgument[] FixedArguments,
+        [property: System.Text.Json.Serialization.JsonPropertyName("namedArguments")] ApiAttributeArgument[] NamedArguments);
+    internal sealed record ApiAttributeArgument(
+        [property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
+        [property: System.Text.Json.Serialization.JsonPropertyName("value")] object? Value);
+
 
     private static AssemblyEntry? FindEntry(CatalogSnapshot snapshot, string? metadataPath)
     {
@@ -792,6 +1106,9 @@ public sealed class InstalledApiCatalog
         _ => "member",
     };
 
+    private static bool IsTypeKind(string kind) =>
+        kind is "class" or "struct" or "interface" or "enum" or "delegate" or "type";
+
     private static string TypeKindName(TypeKind kind) => kind switch
     {
         TypeKind.Class => "class",
@@ -811,16 +1128,30 @@ public sealed class InstalledApiCatalog
         else if (type.Kind == TypeKind.Class && type.IsAbstract) modifiers.Add("abstract");
         else if (type.Kind == TypeKind.Class && type.IsSealed) modifiers.Add("sealed");
         var name = FormatTypeName(type.Name);
-        if (type.TypeParameters.Count > 0)
-            name += "<" + string.Join(", ", type.TypeParameters.Select(p => p.Name)) + ">";
+        var ownParameters = OwnTypeParameters(type);
+        if (ownParameters.Length > 0)
+            name += "<" + string.Join(", ", ownParameters.Select(p => p.Name)) + ">";
         if (type.Kind == TypeKind.Delegate && type.Methods.FirstOrDefault(m => m.Name == "Invoke") is { } invoke)
         {
+            var refReturn = invoke.ReturnType is ByReferenceType
+                ? invoke.ReturnTypeIsRefReadOnly ? "ref readonly " : "ref "
+                : "";
             var declaration = string.Join(" ", modifiers.Append("delegate").Append(
-                $"{FormatType(invoke.ReturnType)} {name}({string.Join(", ", invoke.Parameters.Select(FormatParameter))})"));
-            var constraints = FormatConstraints(type.TypeParameters);
+                $"{refReturn}{FormatType(invoke.ReturnType)} {name}({string.Join(", ", invoke.Parameters.Select(parameter => FormatParameter(parameter)))})"));
+            var constraints = FormatConstraints(ownParameters);
             return constraints.Length == 0 ? declaration : declaration + " " + string.Join(" ", constraints);
         }
         return string.Join(" ", modifiers.Append(TypeKindName(type.Kind)).Append(name));
+    }
+
+    private static ITypeParameter[] OwnTypeParameters(ITypeDefinition type)
+    {
+        var total = type.TypeParameters.Count;
+        var inherited = type.DeclaringType?.TypeParameterCount ?? 0;
+        var ownCount = Math.Max(0, total - inherited);
+        if (ownCount == 0)
+            return Array.Empty<ITypeParameter>();
+        return type.TypeParameters.Skip(total - ownCount).ToArray();
     }
 
     private static string FormatMemberSignature(IMember member)
@@ -837,8 +1168,15 @@ public sealed class InstalledApiCatalog
             var name = method.IsConstructor ? FormatTypeName(method.DeclaringTypeDefinition?.Name ?? method.Name) : method.Name;
             if (method.TypeParameters.Count > 0)
                 name += "<" + string.Join(", ", method.TypeParameters.Select(p => p.Name)) + ">";
-            var parameters = string.Join(", ", method.Parameters.Select(FormatParameter));
-            var prefix = method.IsConstructor ? string.Empty : FormatType(method.ReturnType) + " ";
+            var extensionMethod = method.IsExtensionMethod ||
+                (method.IsStatic && method.DeclaringTypeDefinition?.HasExtensions == true) ||
+                HasRawExtensionAttribute(method);
+            var parameters = string.Join(", ", method.Parameters.Select((parameter, index) =>
+                FormatParameter(parameter, index == 0 && extensionMethod)));
+            var refReturn = method.ReturnType is ByReferenceType
+                ? method.ReturnTypeIsRefReadOnly ? "ref readonly " : "ref "
+                : "";
+            var prefix = method.IsConstructor ? string.Empty : refReturn + FormatType(method.ReturnType) + " ";
             var signature = string.Join(" ", modifiers.Append(prefix + name + "(" + parameters + ")"));
             var constraints = FormatConstraints(method.TypeParameters);
             return constraints.Length == 0 ? signature : signature + " " + string.Join(" ", constraints);
@@ -847,20 +1185,68 @@ public sealed class InstalledApiCatalog
         {
             if (field.IsConst) modifiers.Add("const");
             else if (field.IsReadOnly) modifiers.Add("readonly");
-            return string.Join(" ", modifiers.Append(FormatType(field.ReturnType) + " " + field.Name));
+            var refField = field.ReturnTypeIsRefReadOnly && field.ReturnType is ByReferenceType ? "ref readonly " : "";
+            return string.Join(" ", modifiers.Append(refField + FormatType(field.ReturnType) + " " + field.Name));
         }
         if (member is IProperty property)
         {
-            var name = property.IsIndexer ? "this[" + string.Join(", ", property.Parameters.Select(FormatParameter)) + "]" : property.Name;
-            var accessors = string.Join(" ", new[] { property.CanGet ? "get;" : null, property.CanSet ? "set;" : null }.Where(x => x is not null));
-            return string.Join(" ", modifiers.Append(FormatType(property.ReturnType) + " " + name + " { " + accessors + " }"));
+            var name = property.IsIndexer ? "this[" + string.Join(", ", property.Parameters.Select(parameter => FormatParameter(parameter))) + "]" : property.Name;
+            var accessors = new[]
+            {
+                FormatAccessor(property.Getter, property.Accessibility, "get;"),
+                FormatAccessor(property.Setter, property.Accessibility, property.Setter?.IsInitOnly == true ? "init;" : "set;"),
+            }.Where(accessor => accessor is not null);
+            var refReturn = property.ReturnType is ByReferenceType
+                ? property.ReturnTypeIsRefReadOnly ? "ref readonly " : "ref "
+                : "";
+            return string.Join(" ", modifiers.Append(refReturn + FormatType(property.ReturnType) + " " + name + " { " + string.Join(" ", accessors) + " }"));
         }
         if (member is IEvent @event)
             return string.Join(" ", modifiers.Append("event " + FormatType(@event.ReturnType) + " " + @event.Name));
         return member.Name;
     }
 
-    private static string FormatParameter(IParameter parameter)
+    private static string? FormatAccessor(IMethod? accessor, Accessibility propertyAccessibility, string declaration)
+    {
+        if (accessor is null)
+            return null;
+        var accessibility = accessor.Accessibility == propertyAccessibility
+            ? ""
+            : AccessibilityKeyword(accessor.Accessibility) + " ";
+        return accessibility + declaration;
+    }
+
+    private static bool HasRawExtensionAttribute(IMethod method)
+    {
+        if (method.MetadataToken.IsNil || method.ParentModule?.MetadataFile is not PEFile pe)
+            return false;
+        try
+        {
+            var md = pe.Metadata;
+            foreach (var handle in md.GetMethodDefinition((MethodDefinitionHandle)method.MetadataToken).GetCustomAttributes())
+            {
+                var attribute = md.GetCustomAttribute(handle);
+                var parent = attribute.Constructor.Kind switch
+                {
+                    HandleKind.MemberReference => md.GetMemberReference((MemberReferenceHandle)attribute.Constructor).Parent,
+                    HandleKind.MethodDefinition => md.GetMethodDefinition((MethodDefinitionHandle)attribute.Constructor).GetDeclaringType(),
+                    _ => default,
+                };
+                var name = parent.Kind switch
+                {
+                    HandleKind.TypeReference => md.GetString(md.GetTypeReference((TypeReferenceHandle)parent).Name),
+                    HandleKind.TypeDefinition => md.GetString(md.GetTypeDefinition((TypeDefinitionHandle)parent).Name),
+                    _ => null,
+                };
+                if (name == "ExtensionAttribute") return true;
+            }
+        }
+        catch (BadImageFormatException) { }
+        catch (InvalidOperationException) { }
+        return false;
+    }
+
+    private static string FormatParameter(IParameter parameter, bool isExtensionReceiver = false)
     {
         var prefix = parameter.ReferenceKind switch
         {
@@ -870,21 +1256,75 @@ public sealed class InstalledApiCatalog
             _ => "",
         };
         if (parameter.IsParams) prefix = "params ";
+        else if (isExtensionReceiver) prefix = "this ";
         var text = prefix + FormatType(parameter.Type) + " " + parameter.Name;
         if (parameter.IsOptional)
-            text += " = " + (parameter.HasConstantValueInSignature ? FormatConstant(parameter.GetConstantValue()) : "default");
+            text += " = " + (parameter.HasConstantValueInSignature
+                ? FormatOptionalConstant(parameter.Type, parameter.GetConstantValue())
+                : "default");
         return text;
+    }
+
+    private static string FormatOptionalConstant(IType type, object? value)
+    {
+        var definition = type.GetDefinition();
+        if (definition?.Kind == TypeKind.Enum)
+        {
+            var field = definition.Fields.FirstOrDefault(candidate => candidate.IsConst && Equals(candidate.GetConstantValue(), value));
+            if (field is not null)
+                return FormatType(type) + "." + field.Name;
+            return "(" + FormatType(type) + ")" + FormatConstant(value);
+        }
+        return FormatConstant(value);
     }
 
     private static string FormatConstant(object? value) => value switch
     {
         null => "null",
         bool boolean => boolean ? "true" : "false",
-        string text => "\"" + text.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\"",
-        char character => "'" + (character == '\'' ? "\\'" : character.ToString()) + "'",
+        string text => "\"" + EscapeCSharpLiteral(text, isChar: false) + "\"",
+        char character => "'" + EscapeCSharpLiteral(character.ToString(), isChar: true) + "'",
+        float number when float.IsNaN(number) => "float.NaN",
+        float number when float.IsPositiveInfinity(number) => "float.PositiveInfinity",
+        float number when float.IsNegativeInfinity(number) => "float.NegativeInfinity",
+        float number => number.ToString("R", CultureInfo.InvariantCulture) + "F",
+        double number when double.IsNaN(number) => "double.NaN",
+        double number when double.IsPositiveInfinity(number) => "double.PositiveInfinity",
+        double number when double.IsNegativeInfinity(number) => "double.NegativeInfinity",
+        double number => number.ToString("R", CultureInfo.InvariantCulture),
+        decimal number => number.ToString(CultureInfo.InvariantCulture) + "M",
+        uint number => number.ToString(CultureInfo.InvariantCulture) + "U",
+        long number => number.ToString(CultureInfo.InvariantCulture) + "L",
+        ulong number => number.ToString(CultureInfo.InvariantCulture) + "UL",
         IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
         _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? "default",
     };
+
+    private static string EscapeCSharpLiteral(string value, bool isChar)
+    {
+        var result = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            result.Append(character switch
+            {
+                '\\' => "\\\\",
+                '\0' => "\\0",
+                '\a' => "\\a",
+                '\b' => "\\b",
+                '\f' => "\\f",
+                '\n' => "\\n",
+                '\r' => "\\r",
+                '\t' => "\\t",
+                '\v' => "\\v",
+                '"' when !isChar => "\\\"",
+                '\'' when isChar => "\\'",
+                _ when char.IsControl(character) => "\\u" + ((int)character).ToString("x4", CultureInfo.InvariantCulture),
+                _ => character.ToString(),
+            });
+        }
+        return result.ToString();
+    }
+
 
     private static string FormatTypeName(string name)
     {
@@ -930,20 +1370,81 @@ public sealed class InstalledApiCatalog
         if (type is ByReferenceType byReference) return FormatType(byReference.ElementType);
         if (type is PointerType pointer) return FormatType(pointer.ElementType) + "*";
         if (type is ParameterizedType parameterized)
+            return FormatParameterizedType(parameterized);
+        if (type is ITypeDefinition definition)
+            return FormatGenericType(definition.FullTypeName.FullName, definition.TypeParameters);
+        return FormatTypeName(type.FullName);
+    }
+
+    private static string FormatParameterizedType(ParameterizedType type)
+    {
+        var definition = type.GenericType.GetDefinition();
+        if (definition is null)
+            return FormatGenericType(type.GenericType.FullName, type.TypeArguments);
+        var chain = new List<ITypeDefinition>();
+        for (var current = definition; current is not null; current = current.DeclaringType?.GetDefinition())
+            chain.Add(current);
+        chain.Reverse();
+        var result = new StringBuilder();
+        var argumentIndex = 0;
+        for (var chainIndex = 0; chainIndex < chain.Count; chainIndex++)
         {
-            var definition = parameterized.GetDefinition();
-            var name = FormatTypeName(definition?.FullTypeName.FullName ?? parameterized.GenericType.FullName);
-            return name + "<" + string.Join(", ", parameterized.TypeArguments.Select(FormatType)) + ">";
+            var segment = chain[chainIndex];
+            if (chainIndex == 0)
+                result.Append(FormatTypeName(segment.FullTypeName.FullName));
+            else
+            {
+                result.Append('.');
+                result.Append(FormatTypeName(segment.Name));
+            }
+            var inherited = segment.DeclaringType?.TypeParameterCount ?? 0;
+            var ownCount = Math.Max(0, segment.TypeParameters.Count - inherited);
+            if (ownCount == 0)
+                continue;
+            if (ownCount > type.TypeArguments.Count - argumentIndex)
+                return FormatGenericType(type.GenericType.FullName, type.TypeArguments);
+            result.Append('<');
+            for (var index = 0; index < ownCount; index++)
+            {
+                if (index > 0)
+                    result.Append(", ");
+                result.Append(FormatType(type.TypeArguments[argumentIndex++]));
+            }
+            result.Append('>');
         }
-        var typeDefinition = type.GetDefinition();
-        if (typeDefinition is not null)
+        return result.ToString();
+    }
+
+    private static string FormatGenericType(string fullName, IReadOnlyList<IType> typeArguments)
+    {
+        var result = new StringBuilder(fullName.Length);
+        var argumentIndex = 0;
+        foreach (var segment in fullName.Split('+'))
         {
-            var name = FormatTypeName(typeDefinition.FullTypeName.FullName);
-            if (typeDefinition.TypeParameters.Count > 0)
-                name += "<" + string.Join(", ", typeDefinition.TypeParameters.Select(p => p.Name)) + ">";
-            return name;
+            if (result.Length > 0)
+                result.Append('.');
+            var arityMarker = segment.LastIndexOf('`');
+            var arity = arityMarker >= 0 && int.TryParse(segment.AsSpan(arityMarker + 1),
+                NumberStyles.None, CultureInfo.InvariantCulture, out var parsedArity)
+                ? parsedArity
+                : 0;
+            result.Append(FormatTypeName(segment));
+            if (arity == 0)
+                continue;
+            if (arity > typeArguments.Count - argumentIndex)
+                return FormatTypeName(fullName) + "<" + string.Join(", ", typeArguments.Select(FormatType)) + ">";
+            result.Append('<');
+            for (var index = 0; index < arity; index++)
+            {
+                if (index > 0)
+                    result.Append(", ");
+                result.Append(FormatType(typeArguments[argumentIndex++]));
+            }
+            result.Append('>');
         }
-        return type.FullName;
+        return argumentIndex == typeArguments.Count
+            ? result.ToString()
+            : FormatTypeName(fullName) + "<" + string.Join(", ", typeArguments.Select(FormatType)) + ">";
     }
 
     private static string[] FormatConstraints(IReadOnlyList<ITypeParameter> parameters) => parameters
@@ -953,8 +1454,18 @@ public sealed class InstalledApiCatalog
             if (parameter.HasUnmanagedConstraint) constraints.Add("unmanaged");
             else if (parameter.HasValueTypeConstraint) constraints.Add("struct");
             else if (parameter.HasReferenceTypeConstraint) constraints.Add(parameter.NullabilityConstraint == Nullability.Nullable ? "class?" : "class");
-            constraints.AddRange(parameter.TypeConstraints.Select(c => FormatType(c.Type)));
-            if (parameter.HasDefaultConstructorConstraint) constraints.Add("new()");
+            foreach (var constraint in parameter.TypeConstraints)
+            {
+                var formatted = FormatType(constraint.Type);
+                if ((parameter.HasReferenceTypeConstraint && formatted is "object" or "System.Object") ||
+                    ((parameter.HasValueTypeConstraint || parameter.HasUnmanagedConstraint) &&
+                     formatted is "System.ValueType" or "ValueType"))
+                    continue;
+                constraints.Add(formatted);
+            }
+            if (parameter.HasDefaultConstructorConstraint &&
+                !parameter.HasValueTypeConstraint && !parameter.HasUnmanagedConstraint)
+                constraints.Add("new()");
             if (parameter.AllowsRefLikeType) constraints.Add("allows ref struct");
             return constraints.Count == 0 ? null : $"where {parameter.Name} : {string.Join(", ", constraints)}";
         })
@@ -983,6 +1494,11 @@ public sealed class InstalledApiCatalog
     }
 
     private static bool IsAssemblyReadFailure(Exception exception) => exception is IOException or UnauthorizedAccessException or BadImageFormatException or InvalidOperationException or ArgumentException;
+
+    private static string IndexOmissionMessage(AssemblyEntry entry, ApiAssemblyIndex index) =>
+        index.LimitReached
+            ? $"{entry.Origin}/{entry.RelativePath}: API index stopped at the {MaxResults} declaration safety limit; additional declarations were not indexed."
+            : $"{entry.Origin}/{entry.RelativePath}: API index omitted {index.OmittedPublicDeclarations} public declaration(s) without stable metadata tokens ({index.OmittedDeclarations} total tokenless declarations).";
 
     private static void AddDiagnostic(List<string> diagnostics, string message)
     {
@@ -1026,20 +1542,38 @@ public sealed class InstalledApiCatalog
 
     private static byte[] ReadEntryBytes(string root, string fullPath)
     {
-        var canonical = ResolveCanonicalPath(fullPath);
-        if (!IsUnderRoot(canonical, root))
-            throw new IOException("Resolved assembly path leaves its configured installation root.");
-        using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        if (stream.Length > MaxAssemblyBytes)
-            throw new IOException($"Assembly exceeds the {MaxAssemblyBytes} byte scan limit.");
-        var bytes = new byte[checked((int)stream.Length)];
-        stream.ReadExactly(bytes);
-        if (stream.ReadByte() != -1 || stream.Length != bytes.LongLength)
-            throw new AssemblyChangedException("Assembly changed while it was being read.");
-        var after = ResolveCanonicalPath(fullPath);
-        if (!IsUnderRoot(after, root) || !PathComparer.Equals(canonical, after))
-            throw new AssemblyChangedException("Assembly path changed while it was being read.");
-        return bytes;
+        Exception? lastFailure = null;
+        for (var attempt = 0; attempt < MaxAssemblyReadAttempts; attempt++)
+        {
+            try
+            {
+                var canonical = ResolveCanonicalPath(fullPath);
+                if (!IsUnderRoot(canonical, root))
+                    throw new IOException("Resolved assembly path leaves its configured installation root.");
+                using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read, FileShare.Read);
+                if (stream.Length > MaxAssemblyBytes)
+                    throw new AssemblyChangedException($"Installed assembly '{Path.GetFileName(fullPath)}' grew beyond the scan limit.");
+                var bytes = new byte[checked((int)stream.Length)];
+                stream.ReadExactly(bytes);
+                if (stream.ReadByte() != -1 || stream.Length != bytes.LongLength)
+                    throw new AssemblyChangedException("Assembly changed while it was being read.");
+                VerifyEntryPath(root, fullPath, canonical);
+                return bytes;
+            }
+            catch (IOException exception)
+            {
+                lastFailure = exception;
+                if (attempt + 1 < MaxAssemblyReadAttempts)
+                    Thread.Sleep(10 * (attempt + 1));
+            }
+            catch (UnauthorizedAccessException exception)
+            {
+                lastFailure = exception;
+                if (attempt + 1 < MaxAssemblyReadAttempts)
+                    Thread.Sleep(10 * (attempt + 1));
+            }
+        }
+        throw AssemblyChanged(fullPath, lastFailure);
     }
 
     private sealed class RootedAssemblyResolver : IAssemblyResolver, IDisposable
@@ -1101,9 +1635,14 @@ public sealed class InstalledApiCatalog
             }
             try
             {
-                var bytes = ReadEntryBytes(selected.Root, selected.FullPath);
-                if (!Convert.ToHexString(SHA256.HashData(bytes)).Equals(selected.ContentHash, StringComparison.Ordinal))
-                    throw new AssemblyChangedException($"Installed dependency '{selected.Origin}/{selected.RelativePath}' changed during the request.");
+                var bytes = selected.ScanBytes ?? ReadEntryBytes(selected.Root, selected.FullPath);
+                if (selected.ScanBytes is null)
+                {
+                    var contentHash = Convert.ToHexString(SHA256.HashData(bytes));
+                    ToolTiming.Count("api.scan.bytesHashed", bytes.LongLength);
+                    if (!contentHash.Equals(selected.ContentHash, StringComparison.Ordinal))
+                        throw new AssemblyChangedException($"Installed dependency '{selected.Origin}/{selected.RelativePath}' changed during the request; rerun api_assemblies and use current IDs.");
+                }
                 if (_openedBytes + bytes.LongLength > MaxDependencyBytes)
                 {
                     AddWarning($"Dependency byte limit ({MaxDependencyBytes}) reached; '{reference.Name}' was not opened.");
@@ -1150,11 +1689,67 @@ public sealed class InstalledApiCatalog
 
 
     private sealed record InstallRoot(string Origin, string Path);
-    private sealed record AssemblyEntry(string Id, string Name, string Version, string ModuleVersionId, string Origin, string Root, string RelativePath, string FullPath, string ContentHash);
-    private sealed record CatalogSnapshot(string Id, IReadOnlyList<AssemblyEntry> Assemblies, List<string> Diagnostics, bool CatalogTruncated);
-    private sealed record ApiHit(string assemblyId, string assemblyName, string origin, string relativePath, string symbolId,
+    private sealed record AssemblyEntry(string Id, string Name, string Version, string ModuleVersionId, string Origin,
+        string Root, string RelativePath, string FullPath, string ContentHash, byte[]? ScanBytes = null);
+    private sealed record CatalogSnapshot(string Id, IReadOnlyList<AssemblyEntry> Assemblies, List<string> Diagnostics,
+        bool CatalogTruncated, SnapshotBufferLifetime ScanBytesLifetime) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                ScanBytesLifetime.Release();
+        }
+
+        public CatalogSnapshot DetachScanBytesExcept(AssemblyEntry retained)
+        {
+            var assemblies = new AssemblyEntry[Assemblies.Count];
+            var found = false;
+            for (var index = 0; index < Assemblies.Count; index++)
+            {
+                var assembly = Assemblies[index];
+                if (assembly.Id.Equals(retained.Id, StringComparison.Ordinal))
+                {
+                    assemblies[index] = retained;
+                    found = true;
+                }
+                else
+                {
+                    assemblies[index] = assembly with { ScanBytes = null };
+                }
+            }
+            if (!found)
+                throw new InvalidOperationException("Assembly entry does not belong to this catalog snapshot.");
+            return new CatalogSnapshot(Id, assemblies, new List<string>(Diagnostics), CatalogTruncated,
+                ScanBytesLifetime.AddReference());
+        }
+    }
+    private sealed class SnapshotBufferLifetime(Action release)
+    {
+        private int _references = 1;
+
+        public SnapshotBufferLifetime AddReference()
+        {
+            while (true)
+            {
+                var references = Volatile.Read(ref _references);
+                if (references <= 0)
+                    throw new ObjectDisposedException(nameof(SnapshotBufferLifetime));
+                if (Interlocked.CompareExchange(ref _references, references + 1, references) == references)
+                    return this;
+            }
+        }
+
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _references) == 0)
+                release();
+        }
+    }
+    internal sealed record ApiHit(string assemblyId, string assemblyName, string origin, string relativePath, string symbolId,
         string kind, string qualifiedName, string? declaringType, string signature, string accessibility, bool isStatic,
-        List<string> warnings, bool isInherited = false);
+        string[] warnings, bool isInherited = false, ApiAttribute[]? attributes = null, bool attributesTruncated = false);
 
     private sealed class LoadedPe : IDisposable
     {
@@ -1165,7 +1760,12 @@ public sealed class InstalledApiCatalog
     }
     private sealed class AssemblyChangedException : IOException
     {
-        public AssemblyChangedException(string message) : base(message) { }
+        public AssemblyChangedException(string message, Exception? innerException = null) : base(message, innerException) { }
+    }
+
+    private sealed class AssemblyTooLargeException(long length) : IOException
+    {
+        public long Length { get; } = length;
     }
 
     private sealed class ResultLimitException : InvalidOperationException

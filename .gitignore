@@ -10,3 +10,4 @@ bridge.json
 launch.json
 *.local.json
 GameManagedDir.props
+/docs/performance-report.md

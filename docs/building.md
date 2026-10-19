@@ -95,6 +95,15 @@ $env:THUNDERROAD_MANAGED_DIR = $managed
 dotnet run --project src/ThunderRoadMcp.Bridge.SelfTest -c Release -p:GameManagedDir="$managed" -- "$bridgePackage/runtime"
 ```
 
+The self-test also compile-checks the bundled C# gameplay examples with the actual evaluator wrapper and installed reference set, without loading an evaluation assembly. To save an identity-bound evidence report separately:
+
+```powershell
+dotnet run --project src/ThunderRoadMcp.Bridge.SelfTest -c Release -- --validate-examples "$bridgePackage/runtime" "$packageOutput/example-validation.json"
+```
+
+Keep `THUNDERROAD_MANAGED_DIR` set as above. Evidence is `compile-checked`, not live-tested; the report binds code hashes, reference content hashes, and bridge/compiler MVIDs. Regenerate it after changing those inputs. MCP-operation examples are not C# and remain unverified by this command.
+
+
 The isolated evaluator check loads the bridge DLL from bytes, without a file-backed location, and verifies basic evaluation and `McpRuntime` resolution:
 
 ```powershell
@@ -114,3 +123,9 @@ The installer behavior check uses a real installed game's `Managed` directory. I
 ```
 
 Installer checks use isolated synthetic game trees and do not claim a live Unity run.
+
+## Discovery performance measurements
+
+Set `THUNDERROAD_MCP_DIAGNOSTICS=1` on a benchmark host to emit bounded request metrics to stderr. Normal MCP text/structured results omit detailed metrics. Diagnostics do not contain bridge secrets, snippets, or full source/catalog bodies.
+
+`scripts/benchmark_mcp.py --help` lists runner inputs; it captures cold, persisted, warm, and invalidation cases without changing the selected game's files. Keep generated cache/measurement directories and machine-specific reports local, isolated from normal user caches.

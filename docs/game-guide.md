@@ -55,8 +55,8 @@ Every `evaluate_csharp` call compiles a fresh assembly and runs its body synchro
 
 - `McpRuntime.Current.StartManagedCoroutine("key", Routine())` starts `Routine()` and records it under `key`.
 - `McpRuntime.Current.StopManagedCoroutine("key")` stops that coroutine.
-- `McpRuntime.Current.Set("key", value)`, `Get<T>("key")`, `TryGet<T>("key", out value)`, and `Remove("key")` store, read, and drop named values. Value types are supported: use `TryGet<int>` to distinguish a stored zero from a missing key or wrong type; `Get<T>` returns `default(T)` for those cases.
-- `game_runtime(action:"list")` lists managed keys, types, and bounded value summaries. `game_runtime(action:"inspect", key:"counter")` inspects one stored value without compiling C#; missing keys and stored nulls are distinct. Arbitrary managed objects remain opaque rather than being recursively serialized.
+- `McpRuntime.Current.Set("key", value)`, `Get<T>("key")`/`TryGet<T>("key", out value)` are reference-type retrieval APIs; `Get<T>` returns `default(T)` for a missing or mismatched key, and `TryGet<T>` reports whether a compatible value (including stored null) exists. Value types use the distinct `GetValue<T>`/`TryGetValue<T>` APIs, for example `TryGetValue<int>("counter", out count)` distinguishes stored zero from absence or mismatch.
+- `game_runtime(action:"list")` lists managed keys, types, and bounded summaries; `action:"inspect"` requires a key and returns a detached DTO without compiling C#. It preserves booleans, strings, numeric primitives, enums, common Unity vectors/quaternions/colors, and exact bounded one-dimensional arrays or `List<T>` of supported scalar/value elements. Collections include at most 16 elements. Large integers/decimal and non-finite floating-point values use labeled strings where JSON consumers could lose fidelity. Unity objects include a destroyed flag; arbitrary objects remain opaque. Inspection invokes no user getters or enumerators and runs on Unity's main thread. The complete result fits the 64 KiB UTF-8 bridge limit.
 - `game_runtime(action:"stop", key:"key")` stops one managed coroutine and returns `{action,key,stopped}`. `key` is required; omitting it is a validation error and stops nothing.
 - `game_runtime(action:"clear")` stops all managed coroutines and clears stored object references, returning `{action:"clear",cleared:true}`. Use it before reusing keys or after a level change.
 
@@ -65,6 +65,31 @@ Coroutines run on the main thread and are not threads; a blocking loop still sta
 Never call `StopAllCoroutines` on a game-owned manager such as `Player`, `LevelManager`, or a creature controller. It stops the game's own routines too. Manage only the coroutines you started through `McpRuntime` (or on your own GameObject).
 
 Named references are ordinary managed references: a scene load destroys the GameObject but not the C# reference. Unity's overloaded equality reports a destroyed object as `== null`, so re-check before use and `Remove` stale keys.
+
+Game event subscriptions need explicit ownership: keep the exact delegate in `McpRuntime`, remove any prior registration before repeating the setup, and unsubscribe before dropping the stored delegate. `game_runtime(action:"clear")` clears references but does not unsubscribe game or Unity events.
+
+```csharp
+var runtime = McpRuntime.Current;
+const string key = "scene-change-handler";
+var previous = runtime.Get<UnityEngine.Events.UnityAction<UnityEngine.SceneManagement.Scene, UnityEngine.SceneManagement.Scene>>(key);
+if (previous != null) UnityEngine.SceneManagement.SceneManager.activeSceneChanged -= previous;
+UnityEngine.Events.UnityAction<UnityEngine.SceneManagement.Scene, UnityEngine.SceneManagement.Scene> handler =
+    (oldScene, newScene) => UnityEngine.Debug.Log("Active scene changed to " + newScene.name);
+runtime.Set(key, handler);
+UnityEngine.SceneManagement.SceneManager.activeSceneChanged += handler;
+return new { subscribed = true, key };
+```
+
+Unsubscribe in a later eval:
+
+```csharp
+var runtime = McpRuntime.Current;
+const string key = "scene-change-handler";
+var handler = runtime.Get<UnityEngine.Events.UnityAction<UnityEngine.SceneManagement.Scene, UnityEngine.SceneManagement.Scene>>(key);
+if (handler != null) UnityEngine.SceneManagement.SceneManager.activeSceneChanged -= handler;
+runtime.Remove(key);
+return new { unsubscribed = handler != null };
+```
 
 ## Spawning items
 
@@ -80,16 +105,17 @@ game_spawn_item(itemId: "<ItemData id>", key: "demo-sword")
 - `disallowDespawn` defaults to `true` on the host and sets `Item.DisallowDespawn`; pass `false` to allow normal despawn. Keeping it true is useful for props you intend to inspect over time.
 - After a level load, the spawned object is destroyed. Remove the stale key and spawn again.
 
-Creatures do not have a dedicated tool yet. Discover the spawn API first: `api_search("Creature spawn")`, `api_type` for the candidate type, and decompile only when the implementation behavior matters. Then spawn through `evaluate_csharp` and keep the returned reference with `McpRuntime.Current.Set`. Do not guess creature, brain, or spawner members.
+For the tracked public PC 1.3.2 API, metadata identifies `Catalog.GetData<CreatureData>(id)` followed by `CreatureData.SpawnAsync(position, rotationY, parent, pooled, waypoints, callback)`; its implementation calls `ConfigCreature` before the callback, and the callback may not run when game content is inactive. This is `CreatureData.SpawnAsync`, not `Creature.SpawnAsync`. Use `api_lookup(query:"spawn a creature", includeExamples:true)` to re-resolve the selected installation and retrieve the bounded callback/late-result cleanup recipe; don't use raw prefab instantiation as a configured creature. Use `evaluate_csharp` only after the recipe is resolved and the game is ready.
 
 ## API workflow
 
-1. `api_lookup(query:"ThunderRoad.Item.Throw", kind:"method")` returns candidates and, for one unambiguous match, its signature and paged reconstructed source. Use returned exact IDs to select an overload or continue source pages.
-2. `api_search` and `api_type` browse declarations, base types, interfaces, constraints, and members; inherited members identify their actual declaring assembly.
-3. `api_decompile` remains available for an exact symbol. Catalog search/read results link their declared data types to API lookup; a catalog item ID is not itself a C# class name.
-4. For an existing game action, search `ConsoleCommands` first. Many actions already have a command, and reusing it is safer than reimplementing the logic.
+Choose the workflow by task:
 
-Discovery defaults to public members. `includeNonPublic` is for understanding implementation; a private member is not callable from normal mod or eval code. Pass returned IDs and `snapshotId` values through unchanged. If the installed files change, old IDs are rejected and the query must restart.
+- Existing game action: use its dedicated tool, such as `game_spawn_item`; search catalog data only if the required ID is unknown. Readiness checks are needed only before bridge-backed actions.
+- Custom script: one `api_lookup(query:"...")` call returns ranked signatures, bounded related declarations, relevant examples, and execution/cleanup context; then write a purposeful statement-body snippet and call `evaluate_csharp`.
+- Exact implementation question: use `api_lookup(mode:"symbol", query:"...")` or the lower-level `api_search`, `api_type`, and `api_decompile` tools. Do not fetch exhaustive inventory, inspect unrelated types, or read the guide twice by default.
+
+The API tools inspect installed files without executing them. Base catalog records are shipped data, not proof that an object exists in the mod-merged runtime. Snapshot IDs reject stale symbols after files change; loaded assembly MVID comparison is optional and separate from offline discovery.
 
 ## Logs
 

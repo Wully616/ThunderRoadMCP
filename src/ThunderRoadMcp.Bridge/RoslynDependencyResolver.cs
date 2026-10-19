@@ -31,9 +31,10 @@ namespace ThunderRoadMcp.Bridge
         private static string bridgeAssemblyPath;
         private static readonly HashSet<Assembly> OwnedAssemblies = new HashSet<Assembly>();
         private static string payloadDirectory;
-        private static readonly Dictionary<string, Assembly> PayloadAssemblies = new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
-        private static Func<string, string, CancellationToken, Func<object>> compileEntryPoint;
         private static Assembly compilerAssembly;
+        private static readonly Dictionary<string, Assembly> PayloadAssemblies = new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
+        private static Func<string, string, CancellationToken, Action<string, double>, Func<object>> compileEntryPoint;
+        private static Action<string, string, CancellationToken, Action<string, double>> validateEntryPoint;
         private static bool loadingCompiler;
         private static ResolveEventHandler resolveHandler;
 
@@ -63,10 +64,16 @@ namespace ThunderRoadMcp.Bridge
             }
         }
 
-        public static Func<object> Compile(string code, CancellationToken token)
+        public static Func<object> Compile(string code, CancellationToken token, Action<string, double> recordTiming)
         {
             LoadCompiler();
-            return compileEntryPoint(code, bridgeAssemblyPath, token);
+            return compileEntryPoint(code, bridgeAssemblyPath, token, recordTiming);
+        }
+
+        public static void Validate(string code, CancellationToken token, Action<string, double> recordTiming)
+        {
+            LoadCompiler();
+            validateEntryPoint(code, bridgeAssemblyPath, token, recordTiming);
         }
 
         private static Assembly LoadCompiler()
@@ -88,21 +95,26 @@ namespace ThunderRoadMcp.Bridge
                 if (!string.Equals(loaded.GetName().Name, CompilerAssemblyName, StringComparison.Ordinal))
                     throw new FileLoadException("Unexpected Roslyn compiler payload identity.", path);
                 Type evaluator = loaded.GetType(CompilerAssemblyName + ".CSharpEvaluator", true);
-                MethodInfo method = evaluator.GetMethod("Compile", BindingFlags.Public | BindingFlags.Static, null,
-                    new[] { typeof(string), typeof(string), typeof(CancellationToken) }, null);
-                if (method == null)
-                    throw new MissingMethodException(CompilerAssemblyName, "CSharpEvaluator.Compile");
-                var entryPoint = (Func<string, string, CancellationToken, Func<object>>)Delegate.CreateDelegate(
-                    typeof(Func<string, string, CancellationToken, Func<object>>), method);
-
+                Type[] timedArguments = { typeof(string), typeof(string), typeof(CancellationToken), typeof(Action<string, double>) };
+                MethodInfo compileMethod = evaluator.GetMethod("Compile", BindingFlags.Public | BindingFlags.Static, null, timedArguments, null);
+                MethodInfo validateMethod = evaluator.GetMethod("Validate", BindingFlags.Public | BindingFlags.Static, null, timedArguments, null);
+                if (compileMethod == null)
+                    throw new MissingMethodException(CompilerAssemblyName, "CSharpEvaluator.Compile(code, bridgeAssemblyPath, token, recordTiming)");
+                if (validateMethod == null)
+                    throw new MissingMethodException(CompilerAssemblyName, "CSharpEvaluator.Validate(code, bridgeAssemblyPath, token, recordTiming)");
+                var compile = (Func<string, string, CancellationToken, Action<string, double>, Func<object>>)Delegate.CreateDelegate(
+                    typeof(Func<string, string, CancellationToken, Action<string, double>, Func<object>>), compileMethod);
+                var validate = (Action<string, string, CancellationToken, Action<string, double>>)Delegate.CreateDelegate(
+                    typeof(Action<string, string, CancellationToken, Action<string, double>>), validateMethod);
                 lock (Gate)
                 {
                     if (compilerAssembly == null)
                     {
                         compilerAssembly = loaded;
-                        compileEntryPoint = entryPoint;
-                        OwnedAssemblies.Add(loaded);
+                        compileEntryPoint = compile;
+                        validateEntryPoint = validate;
                         PayloadAssemblies[CompilerAssemblyName] = loaded;
+                        OwnedAssemblies.Add(loaded);
                     }
                     loadingCompiler = false;
                     Monitor.PulseAll(Gate);

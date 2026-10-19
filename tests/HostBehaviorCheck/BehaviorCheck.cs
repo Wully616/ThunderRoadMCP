@@ -5,8 +5,17 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Reflection.Metadata;
+using System.Threading.Channels;
 using System.Reflection.PortableExecutable;
 
+if (args.Length == 3 && args[0] == "--catalog-cache-child")
+{
+    Environment.SetEnvironmentVariable("THUNDERROAD_MCP_LAUNCH_CONFIG", Path.GetFullPath(args[1]));
+    Environment.SetEnvironmentVariable("THUNDERROAD_MCP_CACHE_DIR", Path.GetFullPath(args[2]));
+    Environment.SetEnvironmentVariable("THUNDERROAD_MCP_DIAGNOSTICS", "1");
+    Console.WriteLine(await new BaseCatalogDataCatalog().SearchAsync(null, null, null, 0, 1, null, CancellationToken.None));
+    return;
+}
 if (args.Length != 1)
     throw new ArgumentException("Pass the built ThunderRoadMcp.Host.dll path.");
 var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -14,7 +23,8 @@ listener.Start();
 var port = ((IPEndPoint)listener.LocalEndpoint).Port;
 using var cancellation = new CancellationTokenSource();
 var directory = Path.Combine(Path.GetTempPath(), "ThunderRoadMcp-check-" + Guid.NewGuid().ToString("N"));
-Directory.CreateDirectory(directory);
+var apiCacheDirectory = Path.Combine(directory, "api-cache");
+Directory.CreateDirectory(apiCacheDirectory);
 var logDirectory = Path.Combine(directory, "logs");
 Directory.CreateDirectory(logDirectory);
 await File.WriteAllTextAsync(Path.Combine(logDirectory, "Player.log"), "first\ncafé\nlast\n");
@@ -167,6 +177,7 @@ var delayNextLevelRequest = 0;
 var reloadAlreadyCurrentNext = 0;
 var sameLevelReloadPhase = 0;
 var oldBridgeStatus = false;
+var oldBridgeRuntime = false;
 var loadedAssemblyFixture = new[]
 {
     new
@@ -203,8 +214,36 @@ start.Environment["THUNDERROAD_MCP_CONFIG"] = configPath;
 start.Environment["THUNDERROAD_MCP_LOG_DIR"] = logDirectory;
 start.Environment["THUNDERROAD_MCP_LAUNCH_CONFIG"] = launchConfigPath;
 start.Environment["THUNDERROAD_MCP_FIXTURE_SENTINEL"] = fixtureSentinelPath;
+start.Environment["THUNDERROAD_MCP_CACHE_DIR"] = apiCacheDirectory;
+start.Environment["THUNDERROAD_MCP_DIAGNOSTICS"] = "1";
 using var host = Process.Start(start) ?? throw new InvalidOperationException("Host process did not start.");
+var apiDiagnosticLines = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
+{
+    SingleReader = true,
+    SingleWriter = false,
+});
+host.ErrorDataReceived += (_, eventArgs) =>
+{
+    if (eventArgs.Data is { } line)
+        apiDiagnosticLines.Writer.TryWrite(line);
+};
 host.BeginErrorReadLine();
+async Task<JsonDocument> NextApiDiagnosticsAsync()
+{
+    while (true)
+    {
+        var line = await apiDiagnosticLines.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            var document = JsonDocument.Parse(line);
+            if (document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("counts", out _))
+                return document;
+            document.Dispose();
+        }
+        catch (JsonException) { }
+    }
+}
 var writer = host.StandardInput;
 var reader = host.StandardOutput;
 var requestId = 0;
@@ -235,35 +274,33 @@ try
     var serverInfo = initResult.GetProperty("serverInfo");
     Assert(serverInfo.GetProperty("name").GetString() == "ThunderRoadMcp",
         "initialize identifies the host implementation");
-    await NotifyAsync("notifications/initialized", new { });
+    await ApiReuseCheck.RunAsync(ApiToolJsonAsync, Assert, new ApiReuseContext(
+        Path.GetFullPath(args[0]), configPath, launchConfigPath, logDirectory, apiCacheDirectory,
+        executablePath, managedDirectory, apiGameSharedPath, apiModSharedPath, apiGameBasePath,
+        missingDependencyPath, changedFixturePath, fixtureOutputDirectory, directory, NextApiDiagnosticsAsync));
     await CheckApiToolsAsync();
     await CheckCatalogToolsAsync();
-    using (var apiTiming = await ToolAsync("api_assemblies", new { offset = 0, limit = 1 }))
+    await ApiSignatureCheck.RunAsync(ApiToolJsonAsync, Assert);
+    await CatalogReuseCheck.RunAsync();
+    using (var apiResultDocument = await ToolAsync("api_assemblies", new { offset = 0, limit = 1 }))
     {
-        var apiResult = apiTiming.RootElement.GetProperty("result");
-        var timings = apiResult.GetProperty("_meta").GetProperty("timings");
-        Assert(timings.GetProperty("hostTotalMs").GetDouble() >= 0 &&
-               apiResult.GetProperty("content").GetArrayLength() == 2 &&
-               apiResult.GetProperty("content")[0].GetProperty("text").GetString() == apiResult.GetProperty("structuredContent").GetRawText() &&
-               apiResult.GetProperty("content")[1].GetProperty("text").GetString()!.StartsWith("Server timings (ms): ", StringComparison.Ordinal),
-            "offline API calls expose host timings without changing their domain text or structured result");
+        var result = apiResultDocument.RootElement.GetProperty("result");
+        var hasTimings = result.TryGetProperty("_meta", out var metadata) &&
+            metadata.TryGetProperty("timings", out _);
+        Assert(!hasTimings && result.GetProperty("content").GetArrayLength() == 1 &&
+               result.GetProperty("content")[0].GetProperty("text").GetString() == result.GetProperty("structuredContent").GetRawText(),
+            "offline API responses keep structured JSON and one domain text without detailed timing blocks");
     }
-    using (var bridgeTiming = await ToolAsync("game_status", new { }))
+    using (var bridgeStatus = await ToolAsync("game_status", new { }))
     {
-        var result = bridgeTiming.RootElement.GetProperty("result");
-        var timings = result.GetProperty("_meta").GetProperty("timings");
+        var result = bridgeStatus.RootElement.GetProperty("result");
+        var hasTimings = result.TryGetProperty("_meta", out var metadata) &&
+            metadata.TryGetProperty("timings", out _);
         using var domainText = JsonDocument.Parse(result.GetProperty("content")[0].GetProperty("text").GetString()!);
-        Assert(timings.GetProperty("hostTotalMs").GetDouble() >= 0 &&
-               timings.GetProperty("bridgeRoundTripMs").GetDouble() >= 0 &&
-               timings.GetProperty("bridgeRequestTotalMs").GetDouble() == 1.25 &&
-               !timings.TryGetProperty("compilerQueueWaitMs", out _) &&
-               !timings.TryGetProperty("serializationMs", out _) &&
-               !timings.TryGetProperty("invocationMs", out _) &&
-               !timings.TryGetProperty("unknownStageMs", out _) &&
+        Assert(!hasTimings && result.GetProperty("content").GetArrayLength() == 1 &&
                result.GetProperty("structuredContent").GetProperty("currentLevel").GetString() ==
-               domainText.RootElement.GetProperty("currentLevel").GetString() &&
-               result.GetProperty("content").GetArrayLength() == 2,
-            "bridge timings stay in _meta while host and domain result remain available");
+               domainText.RootElement.GetProperty("currentLevel").GetString(),
+            "bridge responses keep the domain result without detailed timing blocks");
     }
     using (var loadedStatus = await ApiToolJsonAsync("game_status", new { }))
     {
@@ -404,6 +441,17 @@ try
     using (var clearedRuntime = await ApiToolJsonAsync("game_runtime", new { action = "clear" }))
         Assert(clearedRuntime.RootElement.GetProperty("cleared").GetBoolean(),
             "game_runtime clears bridge-owned state");
+    using (var inspectedRuntime = await ApiToolJsonAsync("game_runtime", new { action = "inspect", key = "stored" }))
+        Assert(inspectedRuntime.RootElement.GetProperty("found").GetBoolean() &&
+               inspectedRuntime.RootElement.GetProperty("value").GetProperty("kind").GetString() == "integer",
+            "game_runtime inspect forwards a bounded bridge DTO");
+    oldBridgeRuntime = true;
+    var legacyInspect = await ToolAsync("game_runtime", new { action = "inspect", key = "stored" });
+    Assert(IsError(legacyInspect) &&
+           ErrorText(legacyInspect).Contains("does not support runtime inspection", StringComparison.Ordinal) &&
+           ErrorText(legacyInspect).Contains("restart", StringComparison.OrdinalIgnoreCase),
+        "legacy bridge inspect errors become actionable bridge upgrade guidance");
+    oldBridgeRuntime = false;
     Assert(IsError(await ToolAsync("game_runtime", new { action = "stop" })), "game_runtime stop requires a key");
     Assert(IsError(await ToolAsync("game_runtime", new { action = "bogus" })), "game_runtime validates the action");
 
@@ -595,7 +643,10 @@ finally
     cancellation.Cancel();
     listener.Stop();
     await server;
-    Directory.Delete(directory, recursive: true);
+    if (Environment.GetEnvironmentVariable("THUNDERROAD_MCP_KEEP_CHECK_DIR") == "1")
+        Console.WriteLine("Kept check directory: " + directory);
+    else
+        Directory.Delete(directory, recursive: true);
 }
 
 async Task WriteConfigAsync(string token) =>
@@ -641,12 +692,6 @@ async Task<JsonDocument> CallAsync(string method, object parameters)
     await writer.FlushAsync();
     var line = await reader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
     return JsonDocument.Parse(line ?? throw new EndOfStreamException("Host closed MCP stdout."));
-}
-
-async Task NotifyAsync(string method, object parameters)
-{
-    await writer.WriteLineAsync(JsonSerializer.Serialize(new { jsonrpc = "2.0", method, @params = parameters }));
-    await writer.FlushAsync();
 }
 
 Task<JsonDocument> ToolAsync(string name, object arguments) =>
@@ -822,7 +867,7 @@ async Task CheckApiToolsAsync()
         "overloads have distinct symbol IDs");
     Assert(overloads.Select(hit => hit.GetProperty("signature").GetString()).Distinct().Count() == 2,
         "overload signatures are distinct");
-    using var ambiguousLookup = await ApiToolJsonAsync("api_lookup", new { query = "overload", assemblyId = modAssemblyId, kind = "method" });
+    using var ambiguousLookup = await ApiToolJsonAsync("api_lookup", new { query = "overload", mode = "symbol", assemblyId = modAssemblyId, kind = "method" });
     var ambiguousRoot = ambiguousLookup.RootElement;
     var candidateIds = ambiguousRoot.GetProperty("candidates").EnumerateArray()
         .Select(candidate => candidate.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
@@ -833,9 +878,41 @@ async Task CheckApiToolsAsync()
                candidate.GetProperty("signature").GetString() is { Length: > 0 }) &&
            !ambiguousRoot.TryGetProperty("source", out _),
         "ambiguous lookup returns exact overload candidates without choosing one");
+    using var taskLookup = await ApiToolJsonAsync("api_lookup", new
+    {
+        query = "overload",
+        assemblyId = modAssemblyId,
+        kind = "method",
+        maxResults = 1,
+        includeExamples = false,
+    });
+    var taskLookupRoot = taskLookup.RootElement;
+    var firstTaskResult = taskLookupRoot.GetProperty("results")[0];
+    var firstTaskId = firstTaskResult.GetProperty("symbolId").GetString()!;
+    var taskContinuation = taskLookupRoot.GetProperty("continuation").GetString()!;
+    Assert(taskLookupRoot.GetProperty("mode").GetString() == "task" &&
+           taskLookupRoot.GetProperty("hasMore").GetBoolean() &&
+           taskLookupRoot.GetProperty("results").GetArrayLength() == 1 &&
+           taskLookupRoot.GetProperty("logicalChars").GetInt32() <= 16000 &&
+           !taskLookupRoot.TryGetProperty("source", out _),
+        "default api_lookup ranks metadata without eager source and respects its logical response budget");
+    using var nextTaskLookup = await ApiToolJsonAsync("api_lookup", new
+    {
+        query = "overload",
+        assemblyId = modAssemblyId,
+        kind = "method",
+        maxResults = 1,
+        includeExamples = false,
+        continuation = taskContinuation,
+    });
+    Assert(nextTaskLookup.RootElement.GetProperty("offset").GetInt32() == 1 &&
+           nextTaskLookup.RootElement.GetProperty("results")[0].GetProperty("symbolId").GetString() != firstTaskId &&
+           nextTaskLookup.RootElement.GetProperty("snapshotId").GetString() == taskLookupRoot.GetProperty("snapshotId").GetString(),
+        "task lookup continuation is stable and bound to the installed API snapshot");
     const string exactQualifiedQuery = "Fixture.Shared.ExactLookupSurface.Resolve";
     using var exactQualifiedLookup = await ApiToolJsonAsync("api_lookup", new
     {
+        mode = "symbol",
         query = exactQualifiedQuery,
         assemblyId = gameAssemblyId,
         kind = "method",
@@ -849,7 +926,7 @@ async Task CheckApiToolsAsync()
            exactQualifiedSource.Contains("Resolve()", StringComparison.Ordinal) &&
            !exactQualifiedSource.Contains("ResolveHelper", StringComparison.Ordinal),
         "fully qualified api_lookup prefers exact names over longer substring matches");
-    using var boundedLookup = await ApiToolJsonAsync("api_lookup", new { query = "Page", assemblyId = gameAssemblyId, kind = "method" });
+    using var boundedLookup = await ApiToolJsonAsync("api_lookup", new { query = "Page", mode = "symbol", assemblyId = gameAssemblyId, kind = "method" });
     var boundedRoot = boundedLookup.RootElement;
     var nextSearch = boundedRoot.GetProperty("nextSearch");
     var nextSearchArguments = nextSearch.GetProperty("arguments");
@@ -1004,6 +1081,7 @@ async Task CheckApiToolsAsync()
     File.Delete(renamedModPath);
     Assert(!File.Exists(renamedModPath), "browsed assembly can be renamed and deleted without a file lock");
     Assert(!File.Exists(fixtureSentinelPath), "fixture static initializer remains unexecuted after all API calls");
+    File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Shared.dll"), apiGameSharedPath, overwrite: true);
 }
 async Task CheckCatalogToolsAsync()
 {
@@ -1027,12 +1105,16 @@ async Task CheckCatalogToolsAsync()
         query = typeHandoff.GetProperty("query").GetString(),
         kind = typeHandoff.GetProperty("kind").GetString(),
     });
-    var linkedApiMatch = linkedApiType.RootElement.GetProperty("match");
+    var linkedApiMatch = linkedApiType.RootElement.GetProperty("results")[0];
+    var linkedAssemblyId = linkedApiMatch.GetProperty("assemblyId").GetString()!;
+    var linkedSymbolId = linkedApiMatch.GetProperty("symbolId").GetString()!;
     Assert(linkedApiMatch.GetProperty("qualifiedName").GetString() == "Fixture.Base.BaseSurface" &&
-           linkedApiMatch.GetProperty("assemblyId").GetString() is { Length: > 0 } &&
-           linkedApiMatch.GetProperty("symbolId").GetString() is { Length: > 0 } &&
-           linkedApiType.RootElement.GetProperty("source").GetProperty("source").GetString()!.Contains("BaseSurface", StringComparison.Ordinal),
-        "catalog $type handoff resolves to an actionable API type identity and source");
+           linkedAssemblyId.Length > 0 && linkedSymbolId.Length > 0 &&
+           linkedApiMatch.GetProperty("relevance").GetProperty("confidence").GetString() is "supported" or "low",
+        "catalog $type handoff resolves to a ranked, actionable API type identity");
+    using var linkedApiSource = await ApiToolJsonAsync("api_lookup", new { assemblyId = linkedAssemblyId, symbolId = linkedSymbolId });
+    Assert(linkedApiSource.RootElement.GetProperty("source").GetProperty("source").GetString()!.Contains("BaseSurface", StringComparison.Ordinal),
+        "exact catalog API identity retrieves paged source in symbol mode");
     using var nestedGenericRecordSearch = await ApiToolJsonAsync("catalog_search", new { id = "NestedGenericRecord" });
     var nestedGenericRecord = nestedGenericRecordSearch.RootElement.GetProperty("results")[0];
     var nestedGenericFullType = nestedGenericRecord.GetProperty("fullType").GetString()!;
@@ -1176,6 +1258,18 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
         var sameLevelReload = method == "load_level" && Interlocked.Exchange(ref reloadAlreadyCurrentNext, 0) != 0;
         if (sameLevelReload)
             Interlocked.Exchange(ref sameLevelReloadPhase, 1);
+        if (method == "runtime" && oldBridgeRuntime &&
+            parameters.GetProperty("action").GetString() == "inspect")
+        {
+            var legacyError = JsonSerializer.Serialize(new
+            {
+                id,
+                success = false,
+                error = "runtime.action must be list, stop, or clear.\n   at Stack.Trace",
+            }) + "\n";
+            await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(legacyError), token);
+            return;
+        }
         if (method is "load_level" or "spawn_item" or "runtime")
         {
             object routedResult = method switch
@@ -1214,6 +1308,14 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                         action = "stop",
                         key = parameters.TryGetProperty("key", out var stopKey) ? stopKey.GetString() : null,
                         stopped = parameters.TryGetProperty("key", out var stoppedKey) && stoppedKey.GetString() == "demo",
+                    },
+                    "inspect" => new
+                    {
+                        action = "inspect",
+                        key = parameters.GetProperty("key").GetString(),
+                        found = true,
+                        type = "System.Int32",
+                        value = new { kind = "integer", value = 42 },
                     },
                     _ => new { action = "clear", cleared = true },
                 },

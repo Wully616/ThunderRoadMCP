@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -32,22 +33,64 @@ namespace ThunderRoadMcp.Compiler
 
         public static Func<object> Compile(string code, string bridgeAssemblyPath, CancellationToken token)
         {
+            return Compile(code, bridgeAssemblyPath, token, null);
+        }
+
+        public static Func<object> Compile(string code, string bridgeAssemblyPath, CancellationToken token,
+            Action<string, double> recordTiming)
+        {
+            CSharpCompilation compilation = CreateCompilation(code, bridgeAssemblyPath, token, recordTiming);
+            using (MemoryStream image = Emit(compilation, token, recordTiming))
+            {
+                token.ThrowIfCancellationRequested();
+                Assembly assembly = Measure("assemblyLoadMs", recordTiming, () => Assembly.Load(image.ToArray()));
+                MethodInfo method = assembly.GetType("__ThunderRoadMcpEvaluation", true).GetMethod("Run", BindingFlags.Public | BindingFlags.Static);
+                return (Func<object>)Delegate.CreateDelegate(typeof(Func<object>), method);
+            }
+        }
+
+        /// <summary>Compile the evaluator wrapper and emit it without loading or executing its assembly.</summary>
+        public static void Validate(string code, string bridgeAssemblyPath, CancellationToken token)
+        {
+            Validate(code, bridgeAssemblyPath, token, null);
+        }
+
+        public static void Validate(string code, string bridgeAssemblyPath, CancellationToken token,
+            Action<string, double> recordTiming)
+        {
+            CSharpCompilation compilation = CreateCompilation(code, bridgeAssemblyPath, token, recordTiming);
+            using (Emit(compilation, token, recordTiming)) { }
+        }
+
+        private static CSharpCompilation CreateCompilation(string code, string bridgeAssemblyPath, CancellationToken token,
+            Action<string, double> recordTiming)
+        {
             token.ThrowIfCancellationRequested();
             if (string.IsNullOrWhiteSpace(bridgeAssemblyPath) || !File.Exists(bridgeAssemblyPath))
                 throw new FileNotFoundException("Bridge assembly not found.", bridgeAssemblyPath);
             string fullBridgeAssemblyPath = Path.GetFullPath(bridgeAssemblyPath);
-            string source = "using System; using System.Linq; using System.Collections.Generic; using UnityEngine; using ThunderRoad; using ThunderRoadMcp.Bridge; " +
-                "public static class __ThunderRoadMcpEvaluation { public static object Run() {\n#line 1 \"evaluation.cs\"\n" + code + "\n#line default\n} }";
-            SyntaxTree syntax = CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.Latest), cancellationToken: token);
-            var compilation = CSharpCompilation.Create(
+            const string prefix = "using System; using System.Linq; using System.Collections.Generic; using UnityEngine; using ThunderRoad; using ThunderRoadMcp.Bridge; " +
+                "public static class __ThunderRoadMcpEvaluation { public static object Run() {\n#line 1 \"evaluation.cs\"\n";
+            const string suffix = "\n#line default\n} }";
+            string source = prefix + code + suffix;
+            SyntaxTree syntax = Measure("parseMs", recordTiming,
+                () => CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.Latest), cancellationToken: token));
+            IReadOnlyList<MetadataReference> references = Measure("referenceInitializationMs", recordTiming,
+                () => References.GetOrAdd(fullBridgeAssemblyPath,
+                    path => new Lazy<IReadOnlyList<MetadataReference>>(() => CreateReferences(path))).Value);
+            return CSharpCompilation.Create(
                 "ThunderRoadMcpEvaluation_" + Guid.NewGuid().ToString("N"),
                 new[] { syntax },
-                References.GetOrAdd(fullBridgeAssemblyPath,
-                    path => new Lazy<IReadOnlyList<MetadataReference>>(() => CreateReferences(path))).Value,
+                references,
                 new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: OptimizationLevel.Release));
-            using (var image = new MemoryStream())
+        }
+
+        private static MemoryStream Emit(CSharpCompilation compilation, CancellationToken token, Action<string, double> recordTiming)
+        {
+            var image = new MemoryStream();
+            try
             {
-                EmitResult emitted = compilation.Emit(image, cancellationToken: token);
+                EmitResult emitted = Measure("emitMs", recordTiming, () => compilation.Emit(image, cancellationToken: token));
                 if (!emitted.Success)
                 {
                     string diagnostics = string.Join(Environment.NewLine,
@@ -55,10 +98,21 @@ namespace ThunderRoadMcp.Compiler
                     throw new InvalidOperationException("C# compilation failed:" + Environment.NewLine + diagnostics);
                 }
                 token.ThrowIfCancellationRequested();
-                Assembly assembly = Assembly.Load(image.ToArray());
-                MethodInfo method = assembly.GetType("__ThunderRoadMcpEvaluation", true).GetMethod("Run", BindingFlags.Public | BindingFlags.Static);
-                return (Func<object>)Delegate.CreateDelegate(typeof(Func<object>), method);
+                return image;
             }
+            catch
+            {
+                image.Dispose();
+                throw;
+            }
+        }
+
+        private static T Measure<T>(string name, Action<string, double> recordTiming, Func<T> operation)
+        {
+            if (recordTiming == null) return operation();
+            Stopwatch elapsed = Stopwatch.StartNew();
+            try { return operation(); }
+            finally { recordTiming(name, elapsed.Elapsed.TotalMilliseconds); }
         }
 
         private static IReadOnlyList<MetadataReference> CreateReferences(string bridgeAssemblyPath)

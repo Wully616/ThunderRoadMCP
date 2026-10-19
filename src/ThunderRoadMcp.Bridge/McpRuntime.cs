@@ -121,7 +121,15 @@ namespace ThunderRoadMcp.Bridge
             values[key] = value;
         }
 
-        public bool TryGet<T>(string key, out T value)
+        public bool TryGet<T>(string key, out T value) where T : class
+        {
+            bool found = TryGetValue(key, out T stored);
+            value = stored;
+            return found;
+        }
+
+        /// <summary>Retrieve a value type or reference type without converting stored values.</summary>
+        public bool TryGetValue<T>(string key, out T value)
         {
             EnsureMainThread();
             ValidateKey(key);
@@ -142,9 +150,14 @@ namespace ThunderRoadMcp.Bridge
             return false;
         }
 
-        public T Get<T>(string key)
+        public T Get<T>(string key) where T : class
         {
             return TryGet(key, out T value) ? value : default(T);
+        }
+
+        public T GetValue<T>(string key)
+        {
+            return TryGetValue(key, out T value) ? value : default(T);
         }
 
         internal object Inspect(string key)
@@ -161,9 +174,192 @@ namespace ThunderRoadMcp.Bridge
                 found,
                 type,
                 typeTruncated,
-                value = found ? DescribeValue(value, MaxInspectionTextLength) : null
+                value = found ? DescribeValue(value, MaxInspectionTextLength, true) : null
             };
         }
+        private const int MaxCollectionElements = 16;
+        private const int MaxCollectionElementTextLength = 64;
+        private const long MaxJsonSafeInteger = 9007199254740991L;
+
+        private static object DescribeValue(object value, int maxStringLength, bool includeCollections)
+        {
+            if (ReferenceEquals(value, null))
+                return new { kind = "null" };
+
+            Type type = value.GetType();
+            if (type == typeof(string))
+            {
+                string text = BoundedText((string)value, maxStringLength, out bool truncated);
+                return new { kind = "scalar", value = text, truncated };
+            }
+            if (type == typeof(bool))
+                return new { kind = "boolean", value = (bool)value };
+            if (type == typeof(char))
+                return new { kind = "character", value = ((char)value).ToString() };
+            if (IsInteger(type))
+                return DescribeInteger(value, type);
+            if (type == typeof(float))
+                return DescribeFloatingPoint((float)value);
+            if (type == typeof(double))
+                return DescribeFloatingPoint((double)value);
+            if (type == typeof(decimal))
+                return new { kind = "decimal", value = ((decimal)value).ToString(System.Globalization.CultureInfo.InvariantCulture), representation = "decimalString" };
+            if (type.IsEnum)
+                return new
+                {
+                    kind = "enum",
+                    name = Enum.GetName(type, value) ?? value.ToString(),
+                    numericValue = EnumNumericString(value, type),
+                    representation = "decimalString"
+                };
+
+            if (value is Vector2 vector2)
+                return new { kind = "unityValue", value = new { x = SafeFloat(vector2.x), y = SafeFloat(vector2.y) }, nonFiniteComponentsAreStrings = true };
+            if (value is Vector3 vector3)
+                return new { kind = "unityValue", value = new { x = SafeFloat(vector3.x), y = SafeFloat(vector3.y), z = SafeFloat(vector3.z) }, nonFiniteComponentsAreStrings = true };
+            if (value is Vector4 vector4)
+                return new { kind = "unityValue", value = new { x = SafeFloat(vector4.x), y = SafeFloat(vector4.y), z = SafeFloat(vector4.z), w = SafeFloat(vector4.w) }, nonFiniteComponentsAreStrings = true };
+            if (value is Quaternion quaternion)
+                return new { kind = "unityValue", value = new { x = SafeFloat(quaternion.x), y = SafeFloat(quaternion.y), z = SafeFloat(quaternion.z), w = SafeFloat(quaternion.w) }, nonFiniteComponentsAreStrings = true };
+            if (value is Color color)
+                return new { kind = "unityValue", value = new { r = SafeFloat(color.r), g = SafeFloat(color.g), b = SafeFloat(color.b), a = SafeFloat(color.a) }, nonFiniteComponentsAreStrings = true };
+
+            UnityEngine.Object unityObject = value as UnityEngine.Object;
+            if (!ReferenceEquals(unityObject, null))
+            {
+                bool destroyed = unityObject == null;
+                bool nameTruncated = false;
+                string name = destroyed ? null : BoundedText(unityObject.name, maxStringLength, out nameTruncated);
+                int? instanceId = destroyed ? (int?)null : unityObject.GetInstanceID();
+                return new { kind = "unityObject", name, instanceId, destroyed, nameTruncated };
+            }
+
+            if (includeCollections && TryDescribeCollection(value, maxStringLength, out object collection))
+                return collection;
+            return new { kind = "opaque" };
+        }
+
+        private static bool IsInteger(Type type)
+        {
+            return type == typeof(byte) || type == typeof(sbyte) || type == typeof(short) || type == typeof(ushort) ||
+                type == typeof(int) || type == typeof(uint) || type == typeof(long) || type == typeof(ulong);
+        }
+
+        private static object DescribeInteger(object value, Type type)
+        {
+            if (type == typeof(long))
+            {
+                long number = (long)value;
+                if (number < -MaxJsonSafeInteger || number > MaxJsonSafeInteger)
+                    return new { kind = "integer", value = number.ToString(System.Globalization.CultureInfo.InvariantCulture), representation = "decimalString" };
+            }
+            else if (type == typeof(ulong))
+            {
+                ulong number = (ulong)value;
+                if (number > (ulong)MaxJsonSafeInteger)
+                    return new { kind = "integer", value = number.ToString(System.Globalization.CultureInfo.InvariantCulture), representation = "decimalString" };
+            }
+            return new { kind = "integer", value };
+        }
+
+        private static object DescribeFloatingPoint(float value)
+        {
+            if (float.IsNaN(value)) return new { kind = "number", value = "NaN", representation = "string" };
+            if (float.IsPositiveInfinity(value)) return new { kind = "number", value = "+Infinity", representation = "string" };
+            if (float.IsNegativeInfinity(value)) return new { kind = "number", value = "-Infinity", representation = "string" };
+            return new { kind = "number", value };
+        }
+
+        private static object DescribeFloatingPoint(double value)
+        {
+            if (double.IsNaN(value)) return new { kind = "number", value = "NaN", representation = "string" };
+            if (double.IsPositiveInfinity(value)) return new { kind = "number", value = "+Infinity", representation = "string" };
+            if (double.IsNegativeInfinity(value)) return new { kind = "number", value = "-Infinity", representation = "string" };
+            return new { kind = "number", value };
+        }
+
+        private static object SafeFloat(float value)
+        {
+            if (float.IsNaN(value)) return "NaN";
+            if (float.IsPositiveInfinity(value)) return "+Infinity";
+            if (float.IsNegativeInfinity(value)) return "-Infinity";
+            return value;
+        }
+
+        private static string EnumNumericString(object value, Type enumType)
+        {
+            Type underlying = Enum.GetUnderlyingType(enumType);
+            if (underlying == typeof(ulong) || underlying == typeof(uint) || underlying == typeof(ushort) || underlying == typeof(byte))
+                return Convert.ToUInt64(value, System.Globalization.CultureInfo.InvariantCulture).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private static bool TryDescribeCollection(object value, int maxStringLength, out object description)
+        {
+            Type type = value.GetType();
+            Type elementType;
+            Array array = null;
+            IList list = null;
+            int count;
+            if (type.IsArray && type.GetArrayRank() == 1)
+            {
+                array = (Array)value;
+                elementType = type.GetElementType();
+                if (type != elementType.MakeArrayType())
+                {
+                    description = null;
+                    return false;
+                }
+                count = array.Length;
+            }
+            else if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))
+            {
+                elementType = type.GetGenericArguments()[0];
+                list = (IList)value;
+                count = ((ICollection)list).Count;
+            }
+            else
+            {
+                description = null;
+                return false;
+            }
+
+            if (!IsSafeCollectionElement(elementType))
+            {
+                description = null;
+                return false;
+            }
+
+            int included = Math.Min(count, MaxCollectionElements);
+            var elements = new List<object>(included);
+            int elementTextLength = Math.Min(maxStringLength, MaxCollectionElementTextLength);
+            for (int index = 0; index < included; index++)
+            {
+                object element = array != null ? array.GetValue(index) : list[index];
+                elements.Add(DescribeValue(element, elementTextLength, false));
+            }
+            bool typeTruncated = false;
+            string elementTypeName = BoundedText(elementType.FullName, MaxTypeNameLength, out typeTruncated);
+            description = new
+            {
+                kind = "collection",
+                elementType = elementTypeName,
+                elementTypeTruncated = typeTruncated,
+                count,
+                elements,
+                truncated = included < count
+            };
+            return true;
+        }
+
+        private static bool IsSafeCollectionElement(Type type)
+        {
+            return type == typeof(string) || type == typeof(bool) || type == typeof(char) || IsInteger(type) ||
+                type == typeof(float) || type == typeof(double) || type == typeof(decimal) || type.IsEnum ||
+                type == typeof(Vector2) || type == typeof(Vector3) || type == typeof(Vector4) ||
+                type == typeof(Quaternion) || type == typeof(Color);
+        }
+
 
         public bool Remove(string key)
         {
@@ -214,7 +410,7 @@ namespace ThunderRoadMcp.Bridge
                     int size = EstimateListEntryLength(key, type);
                     if (size <= remaining)
                     {
-                        describedObjects.Add(new { key, type, typeTruncated, value = DescribeValue(value, MaxListTextLength) });
+                        describedObjects.Add(new { key, type, typeTruncated, value = DescribeValue(value, MaxListTextLength, false) });
                         remaining -= size;
                     }
                     else
@@ -265,49 +461,12 @@ namespace ThunderRoadMcp.Bridge
         private static string BoundedText(string value, int maxLength, out bool truncated)
         {
             truncated = value.Length > maxLength;
-            return truncated
-                ? value.Substring(0, maxLength - TruncationMarker.Length) + TruncationMarker
-                : value;
+            if (!truncated) return value;
+            int length = maxLength - TruncationMarker.Length;
+            if (length > 0 && char.IsHighSurrogate(value[length - 1])) length--;
+            return value.Substring(0, length) + TruncationMarker;
         }
 
-        private static object DescribeValue(object value, int maxStringLength)
-        {
-            if (ReferenceEquals(value, null))
-                return new { kind = "null" };
-
-            Type type = value.GetType();
-            if (type == typeof(string))
-            {
-                string text = BoundedText((string)value, maxStringLength, out bool truncated);
-                return new { kind = "scalar", value = text, truncated };
-            }
-            if ((type.IsPrimitive && type != typeof(IntPtr) && type != typeof(UIntPtr)) ||
-                type == typeof(decimal) || type.IsEnum)
-                return new { kind = "scalar", value, truncated = false };
-
-            if (value is Vector2 vector2)
-                return new { kind = "unityValue", value = new { x = vector2.x, y = vector2.y } };
-            if (value is Vector3 vector3)
-                return new { kind = "unityValue", value = new { x = vector3.x, y = vector3.y, z = vector3.z } };
-            if (value is Vector4 vector4)
-                return new { kind = "unityValue", value = new { x = vector4.x, y = vector4.y, z = vector4.z, w = vector4.w } };
-            if (value is Quaternion quaternion)
-                return new { kind = "unityValue", value = new { x = quaternion.x, y = quaternion.y, z = quaternion.z, w = quaternion.w } };
-            if (value is Color color)
-                return new { kind = "unityValue", value = new { r = color.r, g = color.g, b = color.b, a = color.a } };
-
-            UnityEngine.Object unityObject = value as UnityEngine.Object;
-            if (!ReferenceEquals(unityObject, null))
-            {
-                bool destroyed = unityObject == null;
-                bool nameTruncated = false;
-                string name = destroyed ? null : BoundedText(unityObject.name, maxStringLength, out nameTruncated);
-                int? instanceId = destroyed ? (int?)null : unityObject.GetInstanceID();
-                return new { kind = "unityObject", name, instanceId, destroyed, nameTruncated };
-            }
-
-            return new { kind = "opaque" };
-        }
 
 
 

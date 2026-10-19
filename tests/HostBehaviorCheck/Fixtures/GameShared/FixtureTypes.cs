@@ -14,6 +14,7 @@ public class ExactLookupSurface
 {
     public int Resolve() => 1;
     public int ResolveHelper() => 2;
+    private int PrivateIndexFallbackMarker() => 7;
 }
 
 public class PagedSurface

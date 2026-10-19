@@ -92,7 +92,7 @@ namespace ThunderRoadMcp.Bridge
                     return;
                 }
 
-                timings = new BridgeRequestTimings();
+                timings = BridgeRequestTimings.Create(request.diagnostics);
                 object result = await requestHandler.DispatchAsync(request, shutdown.Token, timings).ConfigureAwait(false);
                 timings.Complete();
                 await WriteSuccess(stream, request.id, result, timings.Snapshot(), client).ConfigureAwait(false);
@@ -161,6 +161,11 @@ namespace ThunderRoadMcp.Bridge
             if (jsonResult != null)
             {
                 await WriteRawSuccess(stream, id, jsonResult.Json, timings, client).ConfigureAwait(false);
+                return;
+            }
+            if (timings == null)
+            {
+                await WriteResponse(stream, id, new { id, success = true, result }, client).ConfigureAwait(false);
                 return;
             }
             await WriteResponse(stream, id, new { id, success = true, result, timings }, client, timings).ConfigureAwait(false);
@@ -317,21 +322,40 @@ namespace ThunderRoadMcp.Bridge
     }
     internal sealed class BridgeRequestTimings
     {
-        private readonly object gate = new object();
-        private readonly Stopwatch elapsed = Stopwatch.StartNew();
-        private readonly Dictionary<string, double> timings = new Dictionary<string, double>(StringComparer.Ordinal);
+        public static bool DiagnosticsEnabled { get; } =
+            string.Equals(Environment.GetEnvironmentVariable("THUNDERROAD_MCP_DIAGNOSTICS"), "1", StringComparison.Ordinal);
+        private static readonly BridgeRequestTimings Disabled = new BridgeRequestTimings(false);
+        private static readonly IDisposable Noop = new NoopMeasurement();
+        private readonly bool enabled;
+        private readonly object gate;
+        private readonly Stopwatch elapsed;
+        private readonly Dictionary<string, double> timings;
         private bool completed;
 
-        public IDisposable Measure(string name) => new TimingMeasurement(this, name);
+        private BridgeRequestTimings(bool enabled)
+        {
+            this.enabled = enabled;
+            if (!enabled) return;
+            gate = new object();
+            elapsed = Stopwatch.StartNew();
+            timings = new Dictionary<string, double>(StringComparer.Ordinal);
+        }
+
+        public bool IsEnabled => enabled;
+        public static BridgeRequestTimings Create(bool requested) => requested || DiagnosticsEnabled ? new BridgeRequestTimings(true) : Disabled;
+        internal static BridgeRequestTimings CreateForSelfTest() => new BridgeRequestTimings(true);
+        public IDisposable Measure(string name) => enabled ? (IDisposable)new TimingMeasurement(this, name) : Noop;
 
         public void Add(string name, double milliseconds)
         {
+            if (!enabled) return;
             lock (gate)
                 timings[name] = timings.TryGetValue(name, out double current) ? current + milliseconds : milliseconds;
         }
 
         public void Complete()
         {
+            if (!enabled) return;
             lock (gate)
             {
                 if (completed) return;
@@ -342,8 +366,14 @@ namespace ThunderRoadMcp.Bridge
 
         public Dictionary<string, double> Snapshot()
         {
+            if (!enabled) return null;
             lock (gate)
                 return new Dictionary<string, double>(timings, StringComparer.Ordinal);
+        }
+
+        private sealed class NoopMeasurement : IDisposable
+        {
+            public void Dispose() { }
         }
 
         private sealed class TimingMeasurement : IDisposable

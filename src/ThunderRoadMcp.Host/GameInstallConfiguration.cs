@@ -28,6 +28,7 @@ internal static class GameInstallConfiguration
 
     public static async Task<LaunchOptions> ReadLaunchOptionsAsync(CancellationToken cancellationToken)
     {
+        using var timing = ToolTiming.Measure("installationResolutionMs");
         var configuredPath = Environment.GetEnvironmentVariable(LaunchConfigEnvironmentVariable);
         var configPath = configuredPath ?? Path.Combine(ConfigDirectory, "launch.json");
         if (configuredPath is not null || File.Exists(configPath))

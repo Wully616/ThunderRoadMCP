@@ -133,16 +133,34 @@ public static class GameTools
         [Description("Action: list, inspect, stop, or clear.")] string action,
         [Description("Runtime value key for inspect or managed coroutine key for stop.")] string? key = null,
         CancellationToken cancellationToken = default) =>
-        ToolInvocation.Run(() =>
+        ToolInvocation.Run(async () =>
         {
             var normalized = action?.Trim().ToLowerInvariant() ?? "";
-            return normalized switch
+            try
             {
-                "list" or "clear" => bridgeClient.RequestAsync("runtime", new { action = normalized }, cancellationToken),
-                "inspect" or "stop" => bridgeClient.RequestAsync("runtime", new { action = normalized, key = RequireText(key ?? "", nameof(key), 128) }, cancellationToken),
-                _ => throw new ArgumentException("action must be list, inspect, stop, or clear."),
-            };
+                return await (normalized switch
+                {
+                    "list" or "clear" => bridgeClient.RequestAsync("runtime", new { action = normalized }, cancellationToken),
+                    "inspect" or "stop" => bridgeClient.RequestAsync("runtime", new { action = normalized, key = RequireText(key ?? "", nameof(key), 128) }, cancellationToken),
+                    _ => throw new ArgumentException("action must be list, inspect, stop, or clear."),
+                });
+            }
+            catch (InvalidOperationException exception) when (normalized == "inspect" &&
+                IsLegacyRuntimeActionError(exception.Message))
+            {
+                throw new InvalidOperationException("The installed bridge does not support runtime inspection. Redeploy the updated ThunderRoadMcp bridge and restart the game; list, stop, and clear remain available.", exception);
+            }
         });
+
+    private static bool IsLegacyRuntimeActionError(string error)
+    {
+        const string legacy = "runtime.action must be list, stop, or clear.";
+        var firstLine = error.AsSpan();
+        var newline = firstLine.IndexOfAny('\r', '\n');
+        if (newline >= 0) firstLine = firstLine[..newline];
+        return firstLine.SequenceEqual(legacy) ||
+            firstLine.SequenceEqual("System.IO.InvalidDataException: " + legacy);
+    }
 
     private static string RequireText(string value, string name, int maxLength)
     {

@@ -59,7 +59,7 @@ $evaluator = $bridge.GetType('ThunderRoadMcp.Bridge.CSharpEvaluator', $true)
 $configureArgs = [Array]::CreateInstance([object], 1)
 $configureArgs.SetValue([string]$runtimePath, 0)
 $evaluator.GetMethod('Configure', $flags).Invoke($null, $configureArgs) | Out-Null
-$compile = $evaluator.GetMethod('Compile', $flags)
+$compile = $evaluator.GetMethod('Compile', $flags, $null, [Type[]]@([string], [Threading.CancellationToken]), $null)
 
 $basicArgs = [Array]::CreateInstance([object], 2)
 $basicArgs.SetValue('return 1;', 0)

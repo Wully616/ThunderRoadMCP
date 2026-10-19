@@ -1,6 +1,6 @@
 # ThunderRoadMcp
 
-A local MCP server and in-game bridge for Blade & Sorcery **PC Mono/JIT**. It lets a coding agent inspect game logs and installed assemblies, browse catalog data, check or launch the game, install the bridge, and, when the bridge is enabled, compile and execute C# inside the game process.
+A local MCP server and in-game bridge for Blade & Sorcery **PC Mono/JIT**. It lets a coding agent inspect game logs and installed assemblies, get ranked signatures and bounded related context from one `api_lookup`, browse catalog data, check or launch the game, install the bridge, and, when the bridge is enabled, compile and execute C# inside the game process.
 
 It does not use Harmony, private-method patching, mod replacement, hot reload, or state-preserving reload.
 
