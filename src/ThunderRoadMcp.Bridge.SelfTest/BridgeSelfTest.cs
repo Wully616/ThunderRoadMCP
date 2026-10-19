@@ -1,8 +1,10 @@
 using System;
 using System.IO;
 using System.Reflection;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.Threading;
+using System.Runtime.Serialization;
 using Newtonsoft.Json.Linq;
 using ThunderRoadMcp.Bridge;
 
@@ -33,6 +35,8 @@ internal static class BridgeSelfTest
         Assert(runtimeProbe == "none", "eval compiles against the bridge runtime host");
 
         VerifyStatusAndAssemblyIdentity(thunderRoad, managed);
+        VerifyRuntimeValues();
+        VerifyRequestTimings();
 
         try
         {
@@ -76,7 +80,230 @@ internal static class BridgeSelfTest
             MainThreadQueue.Drain();
             Assert(!executed && queued.IsCanceled, "canceled queued work is skipped");
         }
-        Console.WriteLine("PASS: live status shape, loaded assembly MVID, arithmetic, metadata source precedence, game API metadata, runtime host reference, newest bridge log page, mapped diagnostic, runtime exception, DTO serialization, pending Task rejection, and canceled queue. CLR " + Environment.Version);
+        Console.WriteLine("PASS: live status shape, loaded assembly MVID, arithmetic, metadata source precedence, game API metadata, runtime host reference, generic runtime retrieval and inspection, bounded runtime list, successful and failed bridge timing stages, newest bridge log page, mapped diagnostic, runtime exception, DTO serialization, pending Task rejection, and canceled queue. CLR " + Environment.Version);
+    }
+
+    private static void VerifyRuntimeValues()
+    {
+        McpRuntime runtime = CreateRuntimeForSelfTest();
+        runtime.Set("counter", 0);
+        Assert(runtime.TryGet<int>("counter", out int counter) && counter == 0 && runtime.Get<int>("counter") == 0,
+            "typed runtime retrieval preserves stored zero");
+        Assert(!runtime.TryGet<string>("counter", out string mismatch) && mismatch == null,
+            "runtime type mismatch returns default");
+        Assert(!runtime.TryGet<int>("missing", out int missing) && missing == 0 && runtime.Get<int>("missing") == 0,
+            "missing runtime values return default and TryGet reports absence");
+        runtime.Set("null", null);
+        Assert(runtime.TryGet<string>("null", out string storedNull) && storedNull == null,
+            "TryGet reports a stored null as present for reference types");
+        Assert(runtime.Get<int>("null") == 0, "runtime type mismatch returns default value type");
+
+        JObject zero = JObject.Parse(BridgeRequestHandler.SerializeResult(runtime.Inspect("counter")));
+        Assert((bool)zero["found"] && (string)zero["type"] == "System.Int32" &&
+            (string)zero["value"]["kind"] == "scalar" && (int)zero["value"]["value"] == 0,
+            "runtime inspection returns typed scalar value");
+        JObject absent = JObject.Parse(BridgeRequestHandler.SerializeResult(runtime.Inspect("missing")));
+        JObject nullValue = JObject.Parse(BridgeRequestHandler.SerializeResult(runtime.Inspect("null")));
+        Assert(!(bool)absent["found"] && absent["value"].Type == JTokenType.Null &&
+            (bool)nullValue["found"] && (string)nullValue["value"]["kind"] == "null",
+            "runtime inspection distinguishes missing from stored null");
+
+        runtime.Set("text", new string('x', 1024));
+        JObject bounded = JObject.Parse(BridgeRequestHandler.SerializeResult(runtime.Inspect("text")));
+        string inspectedText = (string)bounded["value"]["value"];
+        Assert((bool)bounded["value"]["truncated"] && inspectedText.Length <= 256 &&
+            inspectedText.EndsWith("[truncated]", StringComparison.Ordinal),
+            "runtime inspection bounds strings and reports truncation");
+        runtime.Set("opaque", new object());
+        JObject opaque = JObject.Parse(BridgeRequestHandler.SerializeResult(runtime.Inspect("opaque")));
+        Assert((string)opaque["type"] == "System.Object" && (string)opaque["value"]["kind"] == "opaque" &&
+            opaque["value"]["value"] == null,
+            "unknown runtime objects expose type metadata only");
+
+        McpRuntime fullRuntime = CreateRuntimeForSelfTest();
+        for (int index = 0; index < McpRuntime.MaxEntries; index++)
+        {
+            string prefix = index.ToString("D3");
+            string key = prefix + new string('k', McpRuntime.MaxKeyLength - prefix.Length);
+            fullRuntime.Set(key, new string('v', 1024));
+        }
+        string listed = BridgeRequestHandler.SerializeResult(fullRuntime.Describe());
+        JObject list = JObject.Parse(listed);
+        JObject first = (JObject)((JArray)list["objects"])[0];
+        string preview = (string)first["value"]["value"];
+        Assert((int)list["objectCount"] == McpRuntime.MaxEntries &&
+            ((JArray)list["objects"]).Count == McpRuntime.MaxEntries &&
+            (string)first["value"]["kind"] == "scalar" && (bool)first["value"]["truncated"] && preview.Length <= 32 &&
+            listed.Length < BridgeRequestHandler.MaxLineBytes - 512,
+            "runtime list has bounded value previews and stays within the response bound at maximum entries, keys, and strings");
+        McpRuntime pathologicalRuntime = CreateRuntimeForSelfTest();
+        FieldInfo coroutineField = typeof(McpRuntime).GetField("coroutines", BindingFlags.Instance | BindingFlags.NonPublic);
+        System.Collections.IDictionary coroutineEntries = (System.Collections.IDictionary)coroutineField.GetValue(pathologicalRuntime);
+        Type coroutineEntryType = coroutineField.FieldType.GetGenericArguments()[1];
+        for (int index = 0; index < McpRuntime.MaxEntries; index++)
+        {
+            string key = index.ToString("D3") + new string('\0', McpRuntime.MaxKeyLength - 3);
+            pathologicalRuntime.Set(key, new string('\0', 1024));
+            coroutineEntries.Add(key, FormatterServices.GetUninitializedObject(coroutineEntryType));
+        }
+        string pathologicalJson = BridgeRequestHandler.SerializeResult(pathologicalRuntime.Describe());
+        JObject pathologicalList = JObject.Parse(pathologicalJson);
+        Assert((int)pathologicalList["coroutineCount"] == McpRuntime.MaxEntries &&
+            (int)pathologicalList["objectCount"] == McpRuntime.MaxEntries &&
+            (bool)pathologicalList["coroutinesTruncated"] && (bool)pathologicalList["objectsTruncated"] &&
+            ((JArray)pathologicalList["coroutines"]).Count < McpRuntime.MaxEntries &&
+            ((JArray)pathologicalList["objects"]).Count < McpRuntime.MaxEntries &&
+            pathologicalJson.Length < BridgeRequestHandler.MaxLineBytes - 512,
+            "runtime list truncates pathological escaped keys and value previews with truthful totals");
+    }
+
+    private static McpRuntime CreateRuntimeForSelfTest()
+    {
+        var runtime = (McpRuntime)FormatterServices.GetUninitializedObject(typeof(McpRuntime));
+        typeof(McpRuntime).GetField("values", BindingFlags.Instance | BindingFlags.NonPublic)
+            .SetValue(runtime, new Dictionary<string, object>(StringComparer.Ordinal));
+        FieldInfo coroutines = typeof(McpRuntime).GetField("coroutines", BindingFlags.Instance | BindingFlags.NonPublic);
+        coroutines.SetValue(runtime, Activator.CreateInstance(coroutines.FieldType));
+        typeof(McpRuntime).GetField("mainThreadId", BindingFlags.Instance | BindingFlags.NonPublic)
+            .SetValue(runtime, Thread.CurrentThread.ManagedThreadId);
+        return runtime;
+    }
+    private static void VerifyRequestTimings()
+    {
+        var handler = new BridgeRequestHandler(new BridgeConfig());
+        var successfulTimings = new BridgeRequestTimings();
+        var response = (BridgeJsonResult)DispatchAndDrain(handler, new BridgeRequest
+        {
+            method = "evaluate",
+            parameters = JObject.FromObject(new { code = "return 6 * 7;", timeoutMs = 30000 })
+        }, successfulTimings);
+        successfulTimings.Complete();
+        Assert(response.Json == "42", "timed bridge evaluation result");
+        var success = successfulTimings.Snapshot();
+        foreach (string name in new[]
+        {
+            "compilerQueueWaitMs", "compilationMs", "mainThreadQueueWaitMs",
+            "invocationMs", "serializationMs", "bridgeRequestTotalMs"
+        })
+            Assert(success.ContainsKey(name) && success[name] >= 0, "successful evaluation reports " + name);
+
+        var failedTimings = new BridgeRequestTimings();
+        try
+        {
+            DispatchAndDrain(handler, new BridgeRequest
+            {
+                method = "evaluate",
+                parameters = JObject.FromObject(new
+                {
+                    code = "throw new InvalidOperationException(\"timed failure\"); return null;",
+                    timeoutMs = 30000
+                })
+            }, failedTimings);
+            throw new Exception("Expected the timed evaluation failure.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Assert(ex.Message == "timed failure", "timed evaluation failure propagation");
+        }
+        finally
+        {
+            failedTimings.Complete();
+        }
+        var failure = failedTimings.Snapshot();
+        Assert(failure.ContainsKey("compilationMs") && failure.ContainsKey("invocationMs") &&
+            failure.ContainsKey("bridgeRequestTotalMs"),
+            "failed evaluation retains elapsed timing stages");
+        var compilationTimings = new BridgeRequestTimings();
+        try
+        {
+            handler.DispatchAsync(new BridgeRequest
+            {
+                method = "evaluate",
+                parameters = JObject.FromObject(new { code = "return missingTimingSymbol;", timeoutMs = 30000 })
+            }, CancellationToken.None, compilationTimings).GetAwaiter().GetResult();
+            throw new Exception("Expected the timed compilation failure.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Assert(ex.Message.Contains("CS0103"), "timed compilation failure propagation");
+        }
+        finally
+        {
+            compilationTimings.Complete();
+        }
+        var compilationFailure = compilationTimings.Snapshot();
+        Assert(compilationFailure.ContainsKey("compilerQueueWaitMs") &&
+            compilationFailure.ContainsKey("compilationMs") &&
+            compilationFailure.ContainsKey("bridgeRequestTotalMs") &&
+            !compilationFailure.ContainsKey("invocationMs"),
+            "compilation failure reports only elapsed stages");
+
+        VerifyCanceledQueueWait(handler);
+        VerifyRawTimingEnvelopeBounds();
+    }
+
+    private static void VerifyCanceledQueueWait(BridgeRequestHandler handler)
+    {
+        var timings = new BridgeRequestTimings();
+        using (var cancellation = new CancellationTokenSource())
+        {
+            Task<object> dispatch = handler.DispatchAsync(new BridgeRequest
+            {
+                method = "evaluate",
+                parameters = JObject.FromObject(new { code = "return 6 * 7;", timeoutMs = 30000 })
+            }, cancellation.Token, timings);
+            object gate = typeof(MainThreadQueue).GetField("Gate", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+            object queue = typeof(MainThreadQueue).GetField("Queue", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+            var count = queue.GetType().GetProperty("Count");
+            Assert(SpinWait.SpinUntil(() =>
+            {
+                lock (gate) return (int)count.GetValue(queue) > 0;
+            }, TimeSpan.FromSeconds(30)), "evaluation reaches the main-thread queue");
+
+            cancellation.Cancel();
+            try
+            {
+                dispatch.GetAwaiter().GetResult();
+                throw new Exception("Expected queued evaluation cancellation.");
+            }
+            catch (OperationCanceledException) { }
+            MainThreadQueue.Drain();
+        }
+        timings.Complete();
+        Assert(timings.Snapshot().ContainsKey("mainThreadQueueWaitMs"),
+            "canceled queued evaluation reports elapsed queue wait");
+    }
+
+    private static void VerifyRawTimingEnvelopeBounds()
+    {
+        var timings = new Dictionary<string, double> { ["bridgeRequestTotalMs"] = 0.5 };
+        string nearLimitJson = "{\"value\":\"" + new string('a', 64562) + new string('é', 450) + "\"}";
+        byte[] fallbackBytes = BridgeServer.BuildRawSuccessResponse("x", nearLimitJson, timings);
+        Assert(fallbackBytes.Length <= BridgeRequestHandler.MaxLineBytes, "timing fallback stays within bridge response limit");
+        JObject fallback = JObject.Parse(System.Text.Encoding.UTF8.GetString(fallbackBytes));
+        Assert((bool)fallback["success"] &&
+            fallback["timings"] == null &&
+            (string)fallback["result"]["value"] == new string('a', 64562) + new string('é', 450),
+            "oversized optional timing envelope preserves raw result");
+
+        string oversizedJson = "{\"value\":\"" + new string('x', 65530) + "\"}";
+        byte[] errorBytes = BridgeServer.BuildRawSuccessResponse("x", oversizedJson, timings);
+        JObject error = JObject.Parse(System.Text.Encoding.UTF8.GetString(errorBytes));
+        Assert(errorBytes.Length <= BridgeRequestHandler.MaxLineBytes &&
+            !(bool)error["success"] &&
+            (string)error["error"] == "Response exceeds 64 KiB.",
+            "oversized raw result returns a bounded error");
+    }
+
+    private static object DispatchAndDrain(BridgeRequestHandler handler, BridgeRequest request, BridgeRequestTimings timings)
+    {
+        Task<object> dispatch = handler.DispatchAsync(request, CancellationToken.None, timings);
+        while (!dispatch.IsCompleted)
+        {
+            MainThreadQueue.Drain();
+            if (!dispatch.IsCompleted) Thread.Sleep(1);
+        }
+        return dispatch.GetAwaiter().GetResult();
     }
     private static void VerifyLogPagination()
     {

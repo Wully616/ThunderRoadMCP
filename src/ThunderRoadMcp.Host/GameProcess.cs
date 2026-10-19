@@ -70,24 +70,29 @@ public sealed class GameProcess
         }
     }
 
-    public async Task<string> WaitForReadyAsync(string? level, int timeoutMs, CancellationToken cancellationToken)
+    public Task<string> WaitForReadyAsync(string? level, int timeoutMs, CancellationToken cancellationToken) =>
+        WaitForReadyAsync(level, timeoutMs, Stopwatch.StartNew(), cancellationToken, CancellationToken.None);
+
+    internal async Task<string> WaitForReadyAsync(string? level, int timeoutMs, Stopwatch stopwatch,
+        CancellationToken cancellationToken, CancellationToken deadlineToken = default, bool requireTransition = false)
     {
         if (timeoutMs is < 1 or > 300_000)
             throw new ArgumentOutOfRangeException(nameof(timeoutMs), "timeoutMs must be between 1 and 300000.");
-        if (level is not null && (string.IsNullOrWhiteSpace(level) || level.Length > 128))
-            throw new ArgumentException("level must be a non-empty string of at most 128 characters.", nameof(level));
+        if (level is not null && (string.IsNullOrWhiteSpace(level) || level.Length > 256))
+            throw new ArgumentException("level must be a non-empty string of at most 256 characters.", nameof(level));
+        ArgumentNullException.ThrowIfNull(stopwatch);
 
         var timeout = TimeSpan.FromMilliseconds(timeoutMs);
-        var stopwatch = Stopwatch.StartNew();
         JsonElement lastStatus = default;
         var hasStatus = false;
+        var transitionObserved = !requireTransition;
         var ready = false;
         while (true)
         {
             var remaining = timeout - stopwatch.Elapsed;
             if (remaining <= TimeSpan.Zero)
                 break;
-            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadlineToken);
             attempt.CancelAfter(remaining);
             string statusJson;
             try
@@ -101,14 +106,24 @@ public sealed class GameProcess
             using var document = JsonDocument.Parse(statusJson);
             lastStatus = document.RootElement.Clone();
             hasStatus = true;
-            ready = IsReady(lastStatus, level);
+            var statusReady = IsReady(lastStatus, level);
+            if (!statusReady)
+                transitionObserved = true;
+            ready = statusReady && transitionObserved;
             if (ready)
                 break;
             remaining = timeout - stopwatch.Elapsed;
             if (remaining <= TimeSpan.Zero)
                 break;
             var delay = remaining < TimeSpan.FromMilliseconds(500) ? remaining : TimeSpan.FromMilliseconds(500);
-            await Task.Delay(delay, cancellationToken);
+            try
+            {
+                await Task.Delay(delay, attempt.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
         }
         return JsonSerializer.Serialize(new
         {
@@ -119,6 +134,7 @@ public sealed class GameProcess
             status = hasStatus ? (object)lastStatus : null,
         });
     }
+
 
     private static bool IsReady(JsonElement status, string? level)
     {

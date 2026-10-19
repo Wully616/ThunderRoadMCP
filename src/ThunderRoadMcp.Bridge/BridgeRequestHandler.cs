@@ -62,7 +62,7 @@ namespace ThunderRoadMcp.Bridge
             }
             return output.ToString();
         }
-        internal async Task<object> DispatchAsync(BridgeRequest request, CancellationToken token)
+        internal async Task<object> DispatchAsync(BridgeRequest request, CancellationToken token, BridgeRequestTimings timings)
         {
             JObject args = request.parameters ?? new JObject();
             switch (request.method)
@@ -81,7 +81,7 @@ namespace ThunderRoadMcp.Bridge
                         throw new InvalidDataException("evaluate.code must be non-empty and at most 64 KiB UTF-8.");
                     long timeout = GetInteger(args, "timeoutMs", 10000);
                     if (timeout < 1 || timeout > 30000) throw new InvalidDataException("evaluate.timeoutMs must be between 1 and 30000.");
-                    return new BridgeJsonResult(await Evaluate(code, TimeSpan.FromMilliseconds(timeout), token).ConfigureAwait(false));
+                    return new BridgeJsonResult(await Evaluate(code, TimeSpan.FromMilliseconds(timeout), token, timings).ConfigureAwait(false));
                 case "runtime":
                     return await RuntimeAsync(args, token).ConfigureAwait(false);
                 case "load_level":
@@ -103,6 +103,10 @@ namespace ThunderRoadMcp.Bridge
                 case "list":
                     return new BridgeJsonResult(await AwaitWithCancellation(
                         MainThreadQueue.Enqueue(() => SerializeResult(Runtime().Describe()), token), token).ConfigureAwait(false));
+                case "inspect":
+                    string inspectKey = GetRequiredString(args, "key", McpRuntime.MaxKeyLength);
+                    return new BridgeJsonResult(await AwaitWithCancellation(
+                        MainThreadQueue.Enqueue(() => SerializeResult(Runtime().Inspect(inspectKey)), token), token).ConfigureAwait(false));
                 case "stop":
                     string key = GetRequiredString(args, "key", McpRuntime.MaxKeyLength);
                     return new BridgeJsonResult(await AwaitWithCancellation(
@@ -120,7 +124,7 @@ namespace ThunderRoadMcp.Bridge
                             return SerializeResult(new { action, cleared = true });
                         }, token), token).ConfigureAwait(false));
                 default:
-                    throw new InvalidDataException("runtime.action must be list, stop, or clear.");
+                    throw new InvalidDataException("runtime.action must be list, inspect, stop, or clear.");
             }
         }
 
@@ -377,19 +381,24 @@ namespace ThunderRoadMcp.Bridge
             return directory == null ? null : directory.FullName;
         }
 
-        private async Task<string> Evaluate(string code, TimeSpan timeout, CancellationToken shutdownToken)
+        private async Task<string> Evaluate(string code, TimeSpan timeout, CancellationToken shutdownToken, BridgeRequestTimings timings)
         {
             using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken))
             {
                 deadline.CancelAfter(timeout);
                 CancellationToken token = deadline.Token;
-                await compiler.WaitAsync(token).ConfigureAwait(false);
+                using (timings.Measure("compilerQueueWaitMs"))
+                    await compiler.WaitAsync(token).ConfigureAwait(false);
                 Task<Func<object>> compile = null;
                 bool releaseDeferred = false;
                 Func<object> evaluation;
                 try
                 {
-                    compile = Task.Run(() => CSharpEvaluator.Compile(code, token), token);
+                    compile = Task.Run(() =>
+                    {
+                        using (timings.Measure("compilationMs"))
+                            return CSharpEvaluator.Compile(code, token);
+                    }, token);
                     try { evaluation = await AwaitWithCancellation(compile, token).ConfigureAwait(false); }
                     catch
                     {
@@ -410,8 +419,31 @@ namespace ThunderRoadMcp.Bridge
                     if (!releaseDeferred) compiler.Release();
                 }
 
-                Task<string> execution = MainThreadQueue.Enqueue(() => SerializeResult(evaluation()), token);
-                return await AwaitWithCancellation(execution, token).ConfigureAwait(false);
+                var queueWait = Stopwatch.StartNew();
+                var queueWaitRecorded = 0;
+                void RecordQueueWait()
+                {
+                    if (Interlocked.Exchange(ref queueWaitRecorded, 1) == 0)
+                        timings.Add("mainThreadQueueWaitMs", queueWait.Elapsed.TotalMilliseconds);
+                }
+
+                Task<string> execution = MainThreadQueue.Enqueue(() =>
+                {
+                    RecordQueueWait();
+                    object value;
+                    using (timings.Measure("invocationMs"))
+                        value = evaluation();
+                    using (timings.Measure("serializationMs"))
+                        return SerializeResult(value);
+                }, token);
+                try
+                {
+                    return await AwaitWithCancellation(execution, token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    RecordQueueWait();
+                }
             }
         }
 

@@ -18,7 +18,7 @@ public static class ApiDiscoveryTools
         ToolInvocation.Run(() => catalog.AssembliesAsync(name, origin, offset, limit, snapshotId, cancellationToken));
 
     [McpServerTool(Name = "api_search", Title = "Search installed game APIs", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-    [Description("Search installed type and member names; public results are the default. Start with kind=type to discover declarations, then use returned assemblyId and symbolId with api_type or api_decompile. Carry snapshotId and nextOffset for remaining pages. This reads metadata and does not execute game code.")]
+    [Description("Search installed type and member names; public results are the default. Use api_lookup to combine an unambiguous search hit with paged source; otherwise use the returned assemblyId and symbolId with api_type or api_decompile. Carry snapshotId and nextOffset for remaining pages. This reads metadata and does not execute game code.")]
     public static Task<CallToolResult> ApiSearch(InstalledApiCatalog catalog,
         [Description("Case-insensitive type, member, or qualified-name search text.")] string query,
         [Description("Restrict search to an assemblyId returned by api_assemblies.")] string? assemblyId = null,
@@ -42,6 +42,19 @@ public static class ApiDiscoveryTools
         [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(() => catalog.TypeAsync(assemblyId, typeSymbolId, includeInherited, includeNonPublic, offset, limit, snapshotId, cancellationToken));
+    [McpServerTool(Name = "api_lookup", Title = "Find and read an installed API", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
+    [Description("Search for one installed type or member and return its exact signature and paged reconstructed source. Fully qualified exact-name matches take precedence over longer substring matches; same-name overloads remain ambiguous. Select a candidate using its assemblyId and symbolId. For more than 20 candidates, continue with the returned nextSearch api_search handoff. For source continuation, pass the exact pair with snapshotId and next startLine. Alternatively provide exact assemblyId and symbolId directly. This reads metadata and does not execute game code.")]
+    public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog,
+        [Description("Search text. Use this mode instead of symbolId; public declarations are the default.")] string? query = null,
+        [Description("Optional assemblyId restriction from api_assemblies or a previous lookup.")] string? assemblyId = null,
+        [Description("Exact symbolId returned by api_search, api_lookup, or api_type. Requires assemblyId and no query.")] string? symbolId = null,
+        [Description("Optional search kind, such as type, method, field, or property.")] string? kind = null,
+        [Description("One-based first source line.")] int startLine = 1,
+        [Description("Number of source lines to return.")] int lineCount = 200,
+        [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
+        CancellationToken cancellationToken = default) =>
+        ToolInvocation.Run(() => catalog.LookupAsync(query, assemblyId, symbolId, kind, startLine, lineCount, snapshotId, cancellationToken));
+
 
     [McpServerTool(Name = "api_decompile", Title = "Read reconstructed API source", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
     [Description("Reconstruct C# for a catalogued type or exact member symbolId, including a selected overload. Output is bounded and paged reconstructed source, not original source, and installed code is never executed. Carry snapshotId and nextLine to continue.")]

@@ -77,6 +77,26 @@ public sealed class InstalledApiCatalog
         var kindFilter = ParseKind(kind);
         var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
+        var (ordered, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, includeNonPublic, cancellationToken);
+        if (offset > ordered.Length)
+            throw new ArgumentOutOfRangeException(nameof(offset), $"offset {offset} exceeds the result count {ordered.Length}.");
+        var page = ordered.Skip(offset).Take(limit).ToArray();
+        var hasMore = offset + page.Length < ordered.Length;
+        return SerializeResponse(new
+        {
+            results = page,
+            total = ordered.Length,
+            offset,
+            limit,
+            hasMore,
+            nextOffset = hasMore ? offset + page.Length : (int?)null,
+            snapshotId = snapshot.Id,
+            diagnostics,
+        });
+    }
+    private async Task<(ApiHit[] Hits, List<string> Diagnostics)> SearchHitsAsync(CatalogSnapshot snapshot, string query,
+        string? assemblyId, string? kindFilter, bool includeNonPublic, CancellationToken cancellationToken)
+    {
         var entries = SelectAssemblies(snapshot, assemblyId);
         var hits = new List<ApiHit>();
         var diagnostics = new List<string>(snapshot.Diagnostics);
@@ -101,8 +121,8 @@ public sealed class InstalledApiCatalog
                         Matches(query, type.Name, typeName))
                     {
                         AddHit(hits, CreateHit(entry, type, typeKind, typeName,
-                            type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName), FormatTypeDeclaration(type),
-                            type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type)));
+                            type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName),
+                            FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type)));
                     }
 
                     if (kindFilter is not null && kindFilter is not "member" && kindFilter is not "constructor" &&
@@ -121,8 +141,9 @@ public sealed class InstalledApiCatalog
                             continue;
                         var actualEntry = FindEntry(snapshot, member.ParentModule?.MetadataFile?.FileName) ?? entry;
                         AddHit(hits, CreateHit(actualEntry, member.MemberDefinition, memberKind, qualifiedName,
-                            member.DeclaringTypeDefinition is null ? null : FormatTypeName(member.DeclaringTypeDefinition.FullTypeName.FullName), FormatMemberSignature(member),
-                            member.EffectiveAccessibility(), member.IsStatic, ObsoleteWarnings(member.MemberDefinition)));
+                            member.DeclaringTypeDefinition is null ? null : FormatTypeName(member.DeclaringTypeDefinition.FullTypeName.FullName),
+                            FormatMemberSignature(member), member.EffectiveAccessibility(), member.IsStatic,
+                            ObsoleteWarnings(member.MemberDefinition)));
                     }
                 }
                 AddWarnings(diagnostics, resolver.Warnings.Select(w => $"{entry.Origin}/{entry.RelativePath}: {w}"));
@@ -135,30 +156,15 @@ public sealed class InstalledApiCatalog
                 AddDiagnostic(diagnostics, $"Could not inspect {entry.Origin}/{entry.RelativePath}: {exception.Message}");
             }
         }
-        if (hits.Count > MaxResults)
-            throw new InvalidOperationException($"Search produced more than {MaxResults} hits; narrow the query with assemblyId or kind.");
         var ordered = hits.OrderBy(h => h.assemblyName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(h => h.origin, StringComparer.Ordinal)
             .ThenBy(h => h.relativePath, StringComparer.OrdinalIgnoreCase)
             .ThenBy(h => h.qualifiedName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(h => h.symbolId, StringComparer.Ordinal)
             .ToArray();
-        if (offset > ordered.Length)
-            throw new ArgumentOutOfRangeException(nameof(offset), $"offset {offset} exceeds the result count {ordered.Length}.");
-        var page = ordered.Skip(offset).Take(limit).ToArray();
-        var hasMore = offset + page.Length < ordered.Length;
-        return SerializeResponse(new
-        {
-            results = page,
-            total = ordered.Length,
-            offset,
-            limit,
-            hasMore,
-            nextOffset = hasMore ? offset + page.Length : (int?)null,
-            snapshotId = snapshot.Id,
-            diagnostics,
-        });
+        return (ordered, diagnostics);
     }
+
 
     public async Task<string> TypeAsync(string assemblyId, string typeSymbolId, bool includeInherited, bool includeNonPublic,
         int offset, int limit, string? snapshotId, CancellationToken cancellationToken)
@@ -232,12 +238,30 @@ public sealed class InstalledApiCatalog
         var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
         var entry = SelectAssembly(snapshot, assemblyId);
+        var (_, source) = await DecompileSnapshotAsync(snapshot, entry, symbolId, startLine, lineCount, includeHit: false, cancellationToken);
+        return SerializeResponse(source);
+    }
+
+    private async Task<(ApiHit? Hit, object Source)> DecompileSnapshotAsync(CatalogSnapshot snapshot, AssemblyEntry entry,
+        string symbolId, int startLine, int lineCount, bool includeHit, CancellationToken cancellationToken)
+    {
         using var main = await LoadPeAsync(entry, cancellationToken);
         using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
         var settings = CreateDecompilerSettings();
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, settings);
-        var entity = FindEntity(typeSystem.MainModule, entry, symbolId)
+        var entity = FindEntity(typeSystem.MainModule, entry, symbolId, cancellationToken)
             ?? throw new InvalidOperationException("symbolId is invalid, stale, or does not identify a type/member in assemblyId.");
+        var hit = includeHit ? CreateExactHit(snapshot, entry, entity) : null;
+        var source = BuildDecompiledSource(snapshot, entry, symbolId, entity, typeSystem, resolver, settings,
+            startLine, lineCount, cancellationToken);
+        return (hit, source);
+    }
+
+    private static object BuildDecompiledSource(CatalogSnapshot snapshot, AssemblyEntry entry, string symbolId,
+        IEntity entity, DecompilerTypeSystem typeSystem, RootedAssemblyResolver resolver, DecompilerSettings settings,
+        int startLine, int lineCount, CancellationToken cancellationToken)
+    {
+        using var timing = ToolTiming.Measure("decompileMs");
         var warnings = ObsoleteWarnings(entity).ToList();
         string source;
         if (entity is IMethod method && !method.HasBody)
@@ -282,7 +306,7 @@ public sealed class InstalledApiCatalog
         var hasMore = first + page.Length < totalLines;
         AddWarnings(warnings, resolver.Warnings);
         AddWarnings(snapshot.Diagnostics, resolver.Warnings.Select(w => $"{entry.Origin}/{entry.RelativePath}: {w}"));
-        return SerializeResponse(new
+        return new
         {
             assemblyId = entry.Id,
             assemblyName = entry.Name,
@@ -302,8 +326,102 @@ public sealed class InstalledApiCatalog
             snapshotId = snapshot.Id,
             warnings,
             diagnostics = snapshot.Diagnostics,
+        };
+    }
+    public async Task<string> LookupAsync(string? query, string? assemblyId, string? symbolId, string? kind,
+        int startLine, int lineCount, string? snapshotId, CancellationToken cancellationToken)
+    {
+        using var timing = ToolTiming.Measure("apiLookupMs");
+        if (startLine < 1)
+            throw new ArgumentOutOfRangeException(nameof(startLine), "startLine must be at least 1.");
+        if (lineCount is < 1 or > 500)
+            throw new ArgumentOutOfRangeException(nameof(lineCount), "lineCount must be between 1 and 500.");
+        if (query is not null && symbolId is not null)
+            throw new ArgumentException("Provide either query or the exact assemblyId and symbolId pair, not both.");
+        if (query is null && (string.IsNullOrWhiteSpace(assemblyId) || string.IsNullOrWhiteSpace(symbolId)))
+            throw new ArgumentException("Provide a query or both exact assemblyId and symbolId values.");
+        if (query is null && kind is not null)
+            throw new ArgumentException("kind is only valid with query mode.", nameof(kind));
+
+        string? kindFilter = null;
+        if (query is not null)
+        {
+            if (string.IsNullOrWhiteSpace(query) || query.Length > 128)
+                throw new ArgumentException("query must contain 1 to 128 characters.", nameof(query));
+            kindFilter = ParseKind(kind);
+        }
+
+        var snapshot = await ScanAsync(cancellationToken);
+        CheckSnapshot(snapshot, snapshotId);
+        if (query is not null)
+        {
+            var (searchHits, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, false, cancellationToken);
+            var exactHitCount = 0;
+            foreach (var hit in searchHits)
+                if (hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase))
+                    exactHitCount++;
+            var hits = searchHits;
+            if (exactHitCount > 0 && exactHitCount < searchHits.Length)
+            {
+                hits = new ApiHit[exactHitCount];
+                var exactHitIndex = 0;
+                foreach (var hit in searchHits)
+                    if (hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase))
+                        hits[exactHitIndex++] = hit;
+            }
+            if (hits.Length != 1)
+            {
+                var candidates = hits.Take(20).ToArray();
+                var hasMore = hits.Length > candidates.Length;
+                return SerializeResponse(new
+                {
+                    query,
+                    found = hits.Length > 0,
+                    ambiguous = hits.Length > 1,
+                    candidates,
+                    total = hits.Length,
+                    candidateLimit = 20,
+                    hasMore,
+                    nextSearch = hasMore
+                        ? new
+                        {
+                            tool = "api_search",
+                            arguments = new
+                            {
+                                query,
+                                assemblyId,
+                                kind = kindFilter,
+                                includeNonPublic = false,
+                                offset = 20,
+                                limit = 20,
+                                snapshotId = snapshot.Id,
+                            },
+                        }
+                        : null,
+                    snapshotId = snapshot.Id,
+                    diagnostics,
+                });
+            }
+
+            var match = hits[0];
+            var entry = SelectAssembly(snapshot, match.assemblyId);
+            var (_, source) = await DecompileSnapshotAsync(snapshot, entry, match.symbolId, startLine, lineCount, includeHit: false, cancellationToken);
+            return SerializeResponse(new { query, found = true, ambiguous = false, match, source, snapshotId = snapshot.Id, diagnostics });
+        }
+
+        var exactEntry = SelectAssembly(snapshot, assemblyId!);
+        var (exactMatch, exactSource) = await DecompileSnapshotAsync(
+            snapshot, exactEntry, symbolId!, startLine, lineCount, includeHit: true, cancellationToken);
+        return SerializeResponse(new
+        {
+            found = true,
+            ambiguous = false,
+            match = exactMatch!,
+            source = exactSource,
+            snapshotId = snapshot.Id,
         });
     }
+
 
     private static string SerializeResponse(object value)
     {
@@ -321,6 +439,7 @@ public sealed class InstalledApiCatalog
 
     private async Task<CatalogSnapshot> ScanAsync(CancellationToken cancellationToken)
     {
+        using var timing = ToolTiming.Measure("apiScanMs");
         var options = await GameInstallConfiguration.ReadLaunchOptionsAsync(cancellationToken);
         var roots = new[]
         {
@@ -538,7 +657,7 @@ public sealed class InstalledApiCatalog
     private static void CheckSnapshot(CatalogSnapshot snapshot, string? expected)
     {
         if (expected is not null && !expected.Equals(snapshot.Id, StringComparison.Ordinal))
-            throw new InvalidOperationException("snapshotId is stale; installed files changed since the previous page; restart the query.");
+            throw new InvalidOperationException("snapshotId is stale; installed files changed since the previous page; restart the search without snapshotId, then use the current assemblyId and symbolId returned by the search.");
     }
 
     private static AssemblyEntry[] SelectAssemblies(CatalogSnapshot snapshot, string? assemblyId)
@@ -554,20 +673,23 @@ public sealed class InstalledApiCatalog
     private static ITypeDefinition? FindType(MetadataModule module, AssemblyEntry entry, string symbolId) =>
         module.TypeDefinitions.FirstOrDefault(type => !type.MetadataToken.IsNil && SymbolId(entry.Id, type.MetadataToken).Equals(symbolId, StringComparison.Ordinal));
 
-    private static IEntity? FindEntity(MetadataModule module, AssemblyEntry entry, string symbolId)
+    private static IEntity? FindEntity(MetadataModule module, AssemblyEntry entry, string symbolId, CancellationToken cancellationToken)
     {
         foreach (var type in module.TypeDefinitions)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!type.MetadataToken.IsNil && SymbolId(entry.Id, type.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
                 return type;
             foreach (var member in DeclaredSearchMembers(type, includeConstructors: true))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!member.MetadataToken.IsNil && SymbolId(entry.Id, member.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
                     return member;
             }
         }
         return null;
     }
+
 
     private static IEnumerable<IMember> DeclaredSearchMembers(ITypeDefinition type) => DeclaredSearchMembers(type, includeConstructors: false);
 
@@ -602,6 +724,26 @@ public sealed class InstalledApiCatalog
         return CreateHit(actualEntry, definition, MemberKind(definition), qualifiedName, declaringType,
             FormatMemberSignature(member), member.EffectiveAccessibility(), member.IsStatic,
             ObsoleteWarnings(definition), inherited);
+    }
+
+    private static ApiHit CreateExactHit(CatalogSnapshot snapshot, AssemblyEntry entry, IEntity entity)
+    {
+        if (entity is ITypeDefinition type)
+            return CreateHit(entry, type, TypeKindName(type.Kind), FormatTypeName(type.FullTypeName.FullName),
+                type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName),
+                FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type));
+        if (entity is IMember member)
+        {
+            var definition = member.MemberDefinition;
+            var actualEntry = FindEntry(snapshot, member.ParentModule?.MetadataFile?.FileName) ?? entry;
+            var declaringType = definition.DeclaringTypeDefinition is null
+                ? null
+                : FormatTypeName(definition.DeclaringTypeDefinition.FullTypeName.FullName);
+            return CreateHit(actualEntry, definition, MemberKind(member), $"{declaringType}.{definition.Name}",
+                declaringType, FormatMemberSignature(member), member.EffectiveAccessibility(), member.IsStatic,
+                ObsoleteWarnings(definition));
+        }
+        throw new InvalidOperationException("symbolId does not identify a supported type or member.");
     }
 
     private static ApiHit CreateHit(AssemblyEntry entry, IEntity entity, string kind, string qualifiedName, string? declaringType,

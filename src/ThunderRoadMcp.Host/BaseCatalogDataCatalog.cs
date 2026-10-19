@@ -109,6 +109,7 @@ public sealed class BaseCatalogDataCatalog
                 id = record.Id,
                 catalogType = record.Type,
                 fullType = record.FullType,
+                apiLookup = ApiLookup(record.FullType),
                 name = record.Name,
                 memberPath = record.MemberPath,
                 size = record.Size,
@@ -135,6 +136,7 @@ public sealed class BaseCatalogDataCatalog
             throw new ArgumentOutOfRangeException(nameof(startLine), "startLine must be at least 1.");
         if (lineCount is < 1 or > MaxLineCount)
             throw new ArgumentOutOfRangeException(nameof(lineCount), $"lineCount must be between 1 and {MaxLineCount}.");
+        using var timing = ToolTiming.Measure("catalogReadMs");
 
         var opened = await OpenArchiveAsync(cancellationToken);
         await using var stream = opened.Stream;
@@ -167,6 +169,7 @@ public sealed class BaseCatalogDataCatalog
             id = metadata.Id,
             catalogType = metadata.Type,
             fullType = metadata.FullType,
+            apiLookup = ApiLookup(metadata.FullType),
             name = metadata.Name,
             memberPath = member.Entry.FullName,
             size = member.Entry.Length,
@@ -262,6 +265,19 @@ public sealed class BaseCatalogDataCatalog
         var separator = type.LastIndexOf('.');
         return separator >= 0 ? type[(separator + 1)..] : type;
     }
+    private static object? ApiLookup(string? fullType)
+    {
+        if (string.IsNullOrWhiteSpace(fullType))
+            return null;
+        var separator = fullType.IndexOf(',');
+        var query = (separator < 0 ? fullType : fullType[..separator]).Trim();
+        if (query.Length is 0 or > 128 || query.Contains('`') || query.Contains('[') || query.Contains(']') ||
+            query.Contains('<') || query.Contains('>'))
+            return null;
+        query = query.Replace('+', '.');
+        return new { query, kind = "type" };
+    }
+
 
     private static bool MatchesType(string requested, string? fullType, string? simpleType) =>
         string.Equals(requested, simpleType, StringComparison.OrdinalIgnoreCase) ||

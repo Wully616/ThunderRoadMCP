@@ -11,11 +11,22 @@ public sealed class BridgeClient
     private static readonly string BridgeConfigPath = Environment.GetEnvironmentVariable("THUNDERROAD_MCP_CONFIG")
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ThunderRoadMcp", "bridge.json");
     private static readonly JsonSerializerOptions ConfigJsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private const double MaxBridgeTimingMs = 60_000;
+    private static readonly HashSet<string> BridgeTimingNames = new(StringComparer.Ordinal)
+    {
+        "bridgeRequestTotalMs",
+        "compilerQueueWaitMs",
+        "compilationMs",
+        "mainThreadQueueWaitMs",
+        "invocationMs",
+        "serializationMs",
+    };
 
     public async Task<string> RequestAsync(string method, object parameters, CancellationToken cancellationToken)
     {
         try
         {
+            using var timing = ToolTiming.Measure("bridgeRoundTripMs");
             return await RequestCoreAsync(method, parameters, cancellationToken);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
@@ -69,6 +80,13 @@ public sealed class BridgeClient
         var root = document.RootElement;
         if (root.GetProperty("id").GetString() != id)
             throw new IOException("Bridge response ID did not match the request.");
+        if (root.TryGetProperty("timings", out var timings) && timings.ValueKind == JsonValueKind.Object)
+            foreach (var timing in timings.EnumerateObject())
+                if (BridgeTimingNames.Contains(timing.Name) &&
+                    timing.Value.ValueKind == JsonValueKind.Number &&
+                    timing.Value.TryGetDouble(out var milliseconds) &&
+                    double.IsFinite(milliseconds) && milliseconds is >= 0 and <= MaxBridgeTimingMs)
+                    ToolTiming.Add(timing.Name, milliseconds);
         if (!root.GetProperty("success").GetBoolean())
             throw new InvalidOperationException(root.GetProperty("error").GetString() ?? "Bridge request failed.");
         return root.GetProperty("result").GetRawText();

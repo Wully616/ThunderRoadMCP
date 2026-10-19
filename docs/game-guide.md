@@ -31,13 +31,13 @@ The host uses the installation selected by `launch.json` (or `THUNDERROAD_MCP_LA
 
 ## Loading a level
 
-`game_load_level(levelId, mode)` asks the game to load a level.
+`game_load_level(levelId, mode)` asks the game to load a level. Add `waitUntilReady:true` and an optional `timeoutMs` to wait in the same call; the waited result includes completion/timeout state and `elapsedMs` from before the load request through the readiness check. This is observed server-side elapsed time, not a frame-accurate engine loading duration.
 
 - `levelId` is a catalog `LevelData` id such as `Arena` or `Home`; browse with `catalog_search(catalogType="LevelData")`. The catalogue also contains the level's supported modes.
 - `mode` is the game-mode id, for example `Sandbox`.
 - Example: `game_load_level("Arena","Sandbox")`.
 
-Loading is a game-side transition, not an instantaneous scene swap. The call returns a snapshot taken **before** it invokes `LevelManager.LoadLevel`: `levelId`, `mode`, `currentLevelBefore`, `levelStateBefore`, and `sceneReadyBefore`. There is no post-load level in the result. Poll `game_status` (or `game_wait_ready` with the target level) until `currentLevel` matches and `sceneReady` is true.
+Loading is a game-side transition, not an instantaneous scene swap. By default the call returns a snapshot taken **before** it invokes `LevelManager.LoadLevel`: `levelId`, `mode`, `currentLevelBefore`, `levelStateBefore`, and `sceneReadyBefore`. These fields remain pre-load state even with `waitUntilReady:true`; inspect the completion and final status fields for the outcome. Without the optional wait, poll `game_status` (or `game_wait_ready` with the target level) until `currentLevel` matches and `sceneReady` is true.
 
 `LevelManager.GetCurrentLevel()` reports **lowercase** ids, so `currentLevelBefore` and the later `game_status.currentLevel` must not be compared case-sensitively with the id you passed. After the load, compare the status value:
 
@@ -47,14 +47,16 @@ string.Equals(status.currentLevel, "Arena", StringComparison.OrdinalIgnoreCase)
 
 `currentLevelBefore` describes the level that was active when the request was made. Treat it as a pre-load hint, not as confirmation that the new level loaded.
 
+With `waitUntilReady:true`, check `requestAcknowledged` as well as `completed`/`timedOut`. If the total deadline expires before acknowledgement, no pre-request snapshot can be reported and the bridge may still have received the request; inspect status before retrying. Reloading an already-ready target requires an observed unready or different-level state before readiness counts as completion. A transition missed between polls can therefore produce a conservative timeout.
+
 ## Managed runtime
 
 Every `evaluate_csharp` call compiles a fresh assembly and runs its body synchronously. Local variables and the generated eval type disappear with the call, so they are not durable storage. A coroutine started on a game-owned or otherwise persistent object can outlive the call, but its lifetime then depends on that owner; `McpRuntime.Current` is the supported owner for coroutines and named references that later eval calls must reach. `McpRuntime` is in `ThunderRoadMcp.Bridge`, and the evaluator imports that namespace, so snippets use `McpRuntime.Current` directly.
 
 - `McpRuntime.Current.StartManagedCoroutine("key", Routine())` starts `Routine()` and records it under `key`.
 - `McpRuntime.Current.StopManagedCoroutine("key")` stops that coroutine.
-- `McpRuntime.Current.Set("key", value)`, `Get<T>("key")`, and `Remove("key")` store, read, and drop named references.
-- `game_runtime(action:"list")` returns `{coroutines:[{key,type}],objects:[{key,type}],coroutineCount,objectCount}`.
+- `McpRuntime.Current.Set("key", value)`, `Get<T>("key")`, `TryGet<T>("key", out value)`, and `Remove("key")` store, read, and drop named values. Value types are supported: use `TryGet<int>` to distinguish a stored zero from a missing key or wrong type; `Get<T>` returns `default(T)` for those cases.
+- `game_runtime(action:"list")` lists managed keys, types, and bounded value summaries. `game_runtime(action:"inspect", key:"counter")` inspects one stored value without compiling C#; missing keys and stored nulls are distinct. Arbitrary managed objects remain opaque rather than being recursively serialized.
 - `game_runtime(action:"stop", key:"key")` stops one managed coroutine and returns `{action,key,stopped}`. `key` is required; omitting it is a validation error and stops nothing.
 - `game_runtime(action:"clear")` stops all managed coroutines and clears stored object references, returning `{action:"clear",cleared:true}`. Use it before reusing keys or after a level change.
 
@@ -82,9 +84,9 @@ Creatures do not have a dedicated tool yet. Discover the spawn API first: `api_s
 
 ## API workflow
 
-1. `api_search` finds types and members by name, including qualified names.
-2. `api_type` shows the declaration, base types, interfaces, constraints, and members; follow inherited members to their actual declaring assembly.
-3. `api_decompile` shows reconstructed C#. Use it only when behavior matters; signatures usually come from `api_type`.
+1. `api_lookup(query:"ThunderRoad.Item.Throw", kind:"method")` returns candidates and, for one unambiguous match, its signature and paged reconstructed source. Use returned exact IDs to select an overload or continue source pages.
+2. `api_search` and `api_type` browse declarations, base types, interfaces, constraints, and members; inherited members identify their actual declaring assembly.
+3. `api_decompile` remains available for an exact symbol. Catalog search/read results link their declared data types to API lookup; a catalog item ID is not itself a C# class name.
 4. For an existing game action, search `ConsoleCommands` first. Many actions already have a command, and reusing it is safer than reimplementing the logic.
 
 Discovery defaults to public members. `includeNonPublic` is for understanding implementation; a private member is not callable from normal mod or eval code. Pass returned IDs and `snapshotId` values through unchanged. If the installed files change, old IDs are rejected and the query must restart.
@@ -136,7 +138,7 @@ Blade & Sorcery uses Unity **2021.3.38f1** with Mono/JIT. Verify signatures agai
    var origin = item.transform.position;
    McpRuntime.Current.StartManagedCoroutine("orbit-demo", Orbit());
 
-   IEnumerator Orbit()
+   System.Collections.IEnumerator Orbit()
    {
        var angle = 0f;
        while (item != null)
@@ -159,6 +161,81 @@ Blade & Sorcery uses Unity **2021.3.38f1** with Mono/JIT. Verify signatures agai
    ```
 
 The loop ends by itself when the item is destroyed (for example after a level load), and `StopManagedCoroutine` stops it sooner. The example drives the transform directly, so it forces the body kinematic first; for a physics-driven prop, move the body with forces or `MovePosition` in `FixedUpdate` instead.
+
+### Common action recipe: spawn, activate, throw, replace, clean up
+
+**Target:** public PC 1.3.2 / Unity 2021.3. The signatures below were inspected in the installed `ThunderRoad.dll` (MVID `7c3f68b0-6dd9-431c-b97d-3ea4fdbc55ec`); the C# bodies can be compiled without a live scene. Scene behavior still needs a live game check. For another build, confirm `Item.physicBody`, `PhysicBody.velocity`, `Item.Throw`, and `Item.Despawn` with `api_lookup` before using this recipe. Activation here means enabling the GameObject, not triggering an item's spell or custom use action.
+
+1. **Spawn** a fresh, unheld prop away from the player. Select an actual `ItemData` id first:
+
+   ```text
+   catalog_search(catalogType:"ItemData", query:"sword")
+   game_spawn_item(itemId:"<returned id>", key:"action-demo")
+   ```
+
+2. **Activate** the tracked prop and enable its physics:
+
+   ```csharp
+   var item = McpRuntime.Current.Get<Item>("action-demo");
+   if (item == null) return new { error = "spawn action-demo first" };
+   if (item.physicBody == null) return new { error = "item has no physics body" };
+   item.gameObject.SetActive(true);
+   item.physicBody.isKinematic = false;
+   return new { activated = true };
+   ```
+
+3. **Throw** that unheld prop along its forward axis, after checking the path is clear:
+
+   ```csharp
+   var item = McpRuntime.Current.Get<Item>("action-demo");
+   if (item == null) return new { error = "spawn action-demo first" };
+   if (item.physicBody == null) return new { error = "item has no physics body" };
+   item.gameObject.SetActive(true);
+   item.physicBody.isKinematic = false;
+   item.physicBody.velocity = item.transform.forward * 6f;
+   item.Throw();
+   return new { thrown = true, speedMetersPerSecond = 6f };
+   ```
+
+   `Item.Throw()` marks the item as thrown and configures flight/collision handling; it does **not** impart the initial velocity. This example supplies velocity explicitly. Do not use it on an item held by a player or NPC.
+
+4. **Replace** without losing the original if spawning fails. Spawn the replacement under a different key first:
+
+   ```text
+   game_spawn_item(itemId:"<replacement ItemData id>", key:"action-replacement")
+   ```
+
+   Once that succeeds, transfer the stable key and despawn the old item:
+
+   ```csharp
+   var runtime = McpRuntime.Current;
+   var replacement = runtime.Get<Item>("action-replacement");
+   if (replacement == null) return new { error = "spawn action-replacement first" };
+   var previous = runtime.Get<Item>("action-demo");
+   if (previous != null && previous != replacement) previous.Despawn();
+   runtime.Set("action-demo", replacement);
+   runtime.Remove("action-replacement");
+   return new { replaced = true };
+   ```
+
+   The new item keeps its spawn position. Supply explicit `x`/`y`/`z` to the spawn tool when a particular replacement position is needed.
+
+5. **Clean up** only this recipe's objects and routines:
+
+   ```csharp
+   var runtime = McpRuntime.Current;
+   foreach (var key in new[] { "action-demo", "action-replacement" })
+   {
+       runtime.StopManagedCoroutine(key);
+       var item = runtime.Get<Item>(key);
+       if (item != null) item.Despawn();
+       runtime.Remove(key);
+   }
+   return new { cleaned = true };
+   ```
+
+   `game_runtime(action:"clear")` drops references and stops managed coroutines; it does not despawn objects. Use `Item.Despawn()` for spawned items instead of destroying their GameObjects directly.
+
 
 ## Troubleshooting
 

@@ -1,4 +1,7 @@
 using System.ComponentModel;
+using System.Diagnostics;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
@@ -37,16 +40,70 @@ public static class GameTools
         ToolInvocation.Run(() => gameProcess.WaitForReadyAsync(level, timeoutMs, cancellationToken));
 
     [McpServerTool(Name = "game_load_level", Title = "Load a Blade & Sorcery level", Destructive = true, OpenWorld = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
-    [Description("Requires a ready bridge. Do not use to fulfill a requested level before initial startup/readiness; pass the target as game_launch's startup -level argument instead. Requests a level load from a catalog LevelData id and game mode id. Returns the pre-request level state; loading is asynchronous, so poll game_status or game_wait_ready afterwards.")]
-    public static Task<CallToolResult> GameLoadLevel(BridgeClient bridgeClient,
+    [Description("Requires a ready bridge. Do not use for initial startup; use game_launch's -level argument. By default returns the pre-request state immediately. waitUntilReady=true applies a bounded total deadline from before the load request through readiness; an unacknowledged timeout omits pre-request state.")]
+    public static Task<CallToolResult> GameLoadLevel(GameProcess gameProcess, BridgeClient bridgeClient,
         [Description("Catalog LevelData id, for example Arena or Home.")] string levelId,
         [Description("Game mode id, for example Sandbox.")] string mode,
+        [Description("Wait for the requested level to become ready after the load request.")] bool waitUntilReady = false,
+        [Description("Total time from before the load request through readiness, from 1 to 300000 milliseconds.")] int timeoutMs = 60000,
         CancellationToken cancellationToken = default) =>
-        ToolInvocation.Run(() => bridgeClient.RequestAsync("load_level", new
+        ToolInvocation.Run(async () =>
         {
-            levelId = RequireText(levelId, nameof(levelId), 256),
-            mode = RequireText(mode, nameof(mode), 256),
-        }, cancellationToken));
+            var id = RequireText(levelId, nameof(levelId), 256);
+            var gameMode = RequireText(mode, nameof(mode), 256);
+            if (!waitUntilReady)
+                return await bridgeClient.RequestAsync("load_level", new { levelId = id, mode = gameMode }, cancellationToken);
+            if (timeoutMs is < 1 or > 300_000)
+                throw new ArgumentOutOfRangeException(nameof(timeoutMs), "timeoutMs must be between 1 and 300000.");
+
+            var elapsed = Stopwatch.StartNew();
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(timeoutMs);
+            string loadResult;
+            try
+            {
+                loadResult = await bridgeClient.RequestAsync("load_level", new { levelId = id, mode = gameMode }, deadline.Token);
+            }
+            catch (Exception exception) when (
+                (exception is OperationCanceledException or TimeoutException) &&
+                !cancellationToken.IsCancellationRequested)
+            {
+                return JsonSerializer.Serialize(new
+                {
+                    levelId = id,
+                    mode = gameMode,
+                    requestAcknowledged = false,
+                    completed = false,
+                    timedOut = true,
+                    elapsedMs = elapsed.ElapsedMilliseconds,
+                });
+            }
+
+            bool requireTransition;
+            using (var loadDocument = JsonDocument.Parse(loadResult))
+            {
+                var loadRoot = loadDocument.RootElement;
+                requireTransition = loadRoot.TryGetProperty("currentLevelBefore", out var before) &&
+                    before.ValueKind == JsonValueKind.String &&
+                    string.Equals(before.GetString(), id, StringComparison.OrdinalIgnoreCase) &&
+                    loadRoot.TryGetProperty("sceneReadyBefore", out var sceneReadyBefore) &&
+                    sceneReadyBefore.ValueKind == JsonValueKind.True;
+            }
+
+            var readiness = await gameProcess.WaitForReadyAsync(
+                id, timeoutMs, elapsed, cancellationToken, deadline.Token, requireTransition);
+            using var readinessDocument = JsonDocument.Parse(readiness);
+            var readinessRoot = readinessDocument.RootElement;
+            var result = JsonNode.Parse(loadResult)!.AsObject();
+            result["requestAcknowledged"] = true;
+            result["completed"] = readinessRoot.GetProperty("ready").GetBoolean();
+            result["timedOut"] = readinessRoot.GetProperty("timedOut").GetBoolean();
+            result["elapsedMs"] = readinessRoot.GetProperty("elapsedMs").GetInt64();
+            result["status"] = readinessRoot.GetProperty("status").ValueKind == JsonValueKind.Null
+                ? null
+                : JsonNode.Parse(readinessRoot.GetProperty("status").GetRawText());
+            return result.ToJsonString();
+        });
 
     [McpServerTool(Name = "game_spawn_item", Title = "Spawn a catalog item", OpenWorld = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
     [Description("Resolve an ItemData catalog id, spawn it in front of the player or at explicit world coordinates, and store the Item under a runtime key retrievable with McpRuntime.Current.Get<Item>(key). Returns key, itemId, actual position, instanceId, and name.")]
@@ -71,10 +128,10 @@ public static class GameTools
         });
 
     [McpServerTool(Name = "game_runtime", Title = "Manage bridge-owned runtime state", Destructive = true, OpenWorld = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
-    [Description("List or stop bridge-owned coroutines and named references, or clear them. stop requires key; clear stops all managed coroutines and clears stored objects. Game-owned coroutines are never touched.")]
+    [Description("List bridge-owned coroutines and safe value summaries, inspect one stored runtime value without traversing it, stop one managed coroutine, or clear all bridge-owned runtime state. inspect and stop require key; list reports full counts and truncation flags when the 64 KiB response budget omits entries. clear stops all managed coroutines and clears stored objects. Game-owned coroutines are never touched.")]
     public static Task<CallToolResult> GameRuntime(BridgeClient bridgeClient,
-        [Description("Action: list, stop, or clear.")] string action,
-        [Description("Managed coroutine key; required for stop.")] string? key = null,
+        [Description("Action: list, inspect, stop, or clear.")] string action,
+        [Description("Runtime value key for inspect or managed coroutine key for stop.")] string? key = null,
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(() =>
         {
@@ -82,8 +139,8 @@ public static class GameTools
             return normalized switch
             {
                 "list" or "clear" => bridgeClient.RequestAsync("runtime", new { action = normalized }, cancellationToken),
-                "stop" => bridgeClient.RequestAsync("runtime", new { action = normalized, key = RequireText(key ?? "", nameof(key), 128) }, cancellationToken),
-                _ => throw new ArgumentException("action must be list, stop, or clear."),
+                "inspect" or "stop" => bridgeClient.RequestAsync("runtime", new { action = normalized, key = RequireText(key ?? "", nameof(key), 128) }, cancellationToken),
+                _ => throw new ArgumentException("action must be list, inspect, stop, or clear."),
             };
         });
 

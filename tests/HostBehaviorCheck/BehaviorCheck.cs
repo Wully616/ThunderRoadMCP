@@ -53,9 +53,24 @@ var itemJson = """
   "name": "Prismatic Crystal Core"
 }
 """;
+var apiTypeJson = """
+{
+  "$type": "Fixture.Base.BaseSurface, Fixture.Base",
+  "id": "BaseSurfaceRecord",
+  "name": "Fixture Base Surface"
+}
+""";
+var nestedGenericJson = JsonSerializer.Serialize(new Dictionary<string, string>
+{
+    ["$type"] = typeof(Dictionary<string, int>.KeyCollection).AssemblyQualifiedName!,
+    ["id"] = "NestedGenericRecord",
+    ["name"] = "Nested generic type"
+});
 WritePackage(catalogArchivePath,
     ("Levels/Level_Arena.json", levelJson),
     ("Items/Item_CrystalBlank.json", itemJson),
+    ("Types/BaseSurface.json", apiTypeJson),
+    ("Types/NestedGeneric.json", nestedGenericJson),
     ("Broken/Invalid.json", "{"));
 var catalogArchiveBytes = await File.ReadAllBytesAsync(catalogArchivePath);
 
@@ -148,6 +163,9 @@ WritePackage(duplicatePackagePath,
     ("manifest.json", "{\"Name\":\"ThunderRoadMcp\"}"),
     ("runtime/ThunderRoadMcp.Compiler.dll.payload", "compiler"));
 var bridgeRequests = 0;
+var delayNextLevelRequest = 0;
+var reloadAlreadyCurrentNext = 0;
+var sameLevelReloadPhase = 0;
 var oldBridgeStatus = false;
 var loadedAssemblyFixture = new[]
 {
@@ -220,6 +238,33 @@ try
     await NotifyAsync("notifications/initialized", new { });
     await CheckApiToolsAsync();
     await CheckCatalogToolsAsync();
+    using (var apiTiming = await ToolAsync("api_assemblies", new { offset = 0, limit = 1 }))
+    {
+        var apiResult = apiTiming.RootElement.GetProperty("result");
+        var timings = apiResult.GetProperty("_meta").GetProperty("timings");
+        Assert(timings.GetProperty("hostTotalMs").GetDouble() >= 0 &&
+               apiResult.GetProperty("content").GetArrayLength() == 2 &&
+               apiResult.GetProperty("content")[0].GetProperty("text").GetString() == apiResult.GetProperty("structuredContent").GetRawText() &&
+               apiResult.GetProperty("content")[1].GetProperty("text").GetString()!.StartsWith("Server timings (ms): ", StringComparison.Ordinal),
+            "offline API calls expose host timings without changing their domain text or structured result");
+    }
+    using (var bridgeTiming = await ToolAsync("game_status", new { }))
+    {
+        var result = bridgeTiming.RootElement.GetProperty("result");
+        var timings = result.GetProperty("_meta").GetProperty("timings");
+        using var domainText = JsonDocument.Parse(result.GetProperty("content")[0].GetProperty("text").GetString()!);
+        Assert(timings.GetProperty("hostTotalMs").GetDouble() >= 0 &&
+               timings.GetProperty("bridgeRoundTripMs").GetDouble() >= 0 &&
+               timings.GetProperty("bridgeRequestTotalMs").GetDouble() == 1.25 &&
+               !timings.TryGetProperty("compilerQueueWaitMs", out _) &&
+               !timings.TryGetProperty("serializationMs", out _) &&
+               !timings.TryGetProperty("invocationMs", out _) &&
+               !timings.TryGetProperty("unknownStageMs", out _) &&
+               result.GetProperty("structuredContent").GetProperty("currentLevel").GetString() ==
+               domainText.RootElement.GetProperty("currentLevel").GetString() &&
+               result.GetProperty("content").GetArrayLength() == 2,
+            "bridge timings stay in _meta while host and domain result remain available");
+    }
     using (var loadedStatus = await ApiToolJsonAsync("game_status", new { }))
     {
         var status = loadedStatus.RootElement;
@@ -285,6 +330,51 @@ try
                levelRoot.GetProperty("currentLevelBefore").GetString() == "Home",
             "game_load_level routes the requested level and mode through the bridge");
     }
+    Interlocked.Exchange(ref delayNextLevelRequest, 1);
+    using (var waitedLevel = await ApiToolJsonAsync("game_load_level", new { levelId = "Arena", mode = "Sandbox", waitUntilReady = true, timeoutMs = 2000 }))
+    {
+        var waitedRoot = waitedLevel.RootElement;
+        Assert(waitedRoot.GetProperty("levelId").GetString() == "Arena" &&
+               waitedRoot.GetProperty("mode").GetString() == "Sandbox" &&
+               waitedRoot.GetProperty("currentLevelBefore").GetString() == "Home" &&
+               waitedRoot.GetProperty("levelStateBefore").GetString() == "Loaded" &&
+               waitedRoot.GetProperty("sceneReadyBefore").GetBoolean() &&
+               waitedRoot.GetProperty("requestAcknowledged").GetBoolean() &&
+               waitedRoot.GetProperty("completed").GetBoolean() &&
+               !waitedRoot.GetProperty("timedOut").GetBoolean() &&
+               waitedRoot.GetProperty("elapsedMs").GetInt64() >= 90,
+            "game_load_level waits for readiness and measures elapsed time from before the delayed load request");
+    }
+    using (var timedOutLevel = await ApiToolJsonAsync("game_load_level", new { levelId = "Missing", mode = "Sandbox", waitUntilReady = true, timeoutMs = 100 }))
+        Assert(timedOutLevel.RootElement.GetProperty("requestAcknowledged").GetBoolean() &&
+               timedOutLevel.RootElement.GetProperty("currentLevelBefore").GetString() == "Home" &&
+               !timedOutLevel.RootElement.GetProperty("completed").GetBoolean() &&
+               timedOutLevel.RootElement.GetProperty("timedOut").GetBoolean() &&
+               timedOutLevel.RootElement.GetProperty("elapsedMs").GetInt64() >= 100,
+            "game_load_level reports an acknowledged readiness timeout with its pre-request snapshot");
+    Interlocked.Exchange(ref delayNextLevelRequest, 1);
+    using (var unacknowledgedLevel = await ApiToolJsonAsync("game_load_level", new { levelId = "Arena", mode = "Sandbox", waitUntilReady = true, timeoutMs = 40 }))
+    {
+        var unacknowledgedRoot = unacknowledgedLevel.RootElement;
+        Assert(!unacknowledgedRoot.GetProperty("requestAcknowledged").GetBoolean() &&
+               !unacknowledgedRoot.GetProperty("completed").GetBoolean() &&
+               unacknowledgedRoot.GetProperty("timedOut").GetBoolean() &&
+               unacknowledgedRoot.GetProperty("elapsedMs").GetInt64() >= 30 &&
+               !unacknowledgedRoot.TryGetProperty("currentLevelBefore", out _) &&
+               !unacknowledgedRoot.TryGetProperty("levelStateBefore", out _) &&
+               !unacknowledgedRoot.TryGetProperty("sceneReadyBefore", out _),
+            "game_load_level reports a total-deadline timeout before acknowledgement without inventing a snapshot");
+    }
+    await Task.Delay(120);
+    Interlocked.Exchange(ref reloadAlreadyCurrentNext, 1);
+    using (var sameLevelReload = await ApiToolJsonAsync("game_load_level", new { levelId = "Arena", mode = "Sandbox", waitUntilReady = true, timeoutMs = 3000 }))
+        Assert(sameLevelReload.RootElement.GetProperty("currentLevelBefore").GetString() == "Arena" &&
+               sameLevelReload.RootElement.GetProperty("requestAcknowledged").GetBoolean() &&
+               sameLevelReload.RootElement.GetProperty("completed").GetBoolean() &&
+               sameLevelReload.RootElement.GetProperty("elapsedMs").GetInt64() >= 850,
+            "same-level reload waits for an observed transition before treating the pre-request ready state as completion");
+    Assert(IsError(await ToolAsync("game_load_level", new { levelId = "Arena", mode = "Sandbox", waitUntilReady = true, timeoutMs = 0 })),
+        "game_load_level validates the optional readiness timeout before requesting a load");
     Assert(IsError(await ToolAsync("game_load_level", new { levelId = "", mode = "Sandbox" })), "game_load_level validates the level id");
 
     using (var spawnedItem = await ApiToolJsonAsync("game_spawn_item", new { itemId = "CrystalBlank", key = "test-item", disallowDespawn = false }))
@@ -578,7 +668,7 @@ async Task CheckApiToolsAsync()
     using var list = await CallAsync("tools/list", new { });
     var toolNames = list.RootElement.GetProperty("result").GetProperty("tools")
         .EnumerateArray().Select(tool => tool.GetProperty("name").GetString() ?? "").ToHashSet(StringComparer.Ordinal);
-    foreach (var toolName in new[] { "game_installations", "game_status", "game_guide", "game_launch", "game_wait_ready", "game_load_level", "game_spawn_item", "game_runtime", "game_install_mod", "game_stop", "game_restart", "game_logs", "evaluate_csharp", "api_assemblies", "api_search", "api_type", "api_decompile", "catalog_search", "catalog_read" })
+    foreach (var toolName in new[] { "game_installations", "game_status", "game_guide", "game_launch", "game_wait_ready", "game_load_level", "game_spawn_item", "game_runtime", "game_install_mod", "game_stop", "game_restart", "game_logs", "evaluate_csharp", "api_assemblies", "api_search", "api_type", "api_decompile", "api_lookup", "catalog_search", "catalog_read" })
         Assert(toolNames.Contains(toolName), $"{toolName} is exposed through tools/list");
     var toolDefinitions = list.RootElement.GetProperty("result").GetProperty("tools").EnumerateArray()
         .ToDictionary(tool => tool.GetProperty("name").GetString()!, tool => tool, StringComparer.Ordinal);
@@ -591,6 +681,7 @@ async Task CheckApiToolsAsync()
         "tools/list exposes accurate read-only and eval risk hints");
     Assert(IsReadOnlyTool(toolDefinitions["game_wait_ready"]) && IsReadOnlyTool(toolDefinitions["game_guide"]),
         "game_wait_ready and game_guide are read-only");
+    Assert(IsReadOnlyTool(toolDefinitions["api_lookup"]), "api_lookup is read-only");
     Assert(!IsReadOnlyTool(toolDefinitions["game_load_level"]) &&
            !IsReadOnlyTool(toolDefinitions["game_spawn_item"]) &&
            !IsReadOnlyTool(toolDefinitions["game_runtime"]),
@@ -731,16 +822,65 @@ async Task CheckApiToolsAsync()
         "overloads have distinct symbol IDs");
     Assert(overloads.Select(hit => hit.GetProperty("signature").GetString()).Distinct().Count() == 2,
         "overload signatures are distinct");
+    using var ambiguousLookup = await ApiToolJsonAsync("api_lookup", new { query = "overload", assemblyId = modAssemblyId, kind = "method" });
+    var ambiguousRoot = ambiguousLookup.RootElement;
+    var candidateIds = ambiguousRoot.GetProperty("candidates").EnumerateArray()
+        .Select(candidate => candidate.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
+    Assert(ambiguousRoot.GetProperty("ambiguous").GetBoolean() &&
+           ambiguousRoot.GetProperty("total").GetInt32() == 2 &&
+           candidateIds.SetEquals(overloads.Select(hit => hit.GetProperty("symbolId").GetString()!)) &&
+           ambiguousRoot.GetProperty("candidates").EnumerateArray().All(candidate =>
+               candidate.GetProperty("signature").GetString() is { Length: > 0 }) &&
+           !ambiguousRoot.TryGetProperty("source", out _),
+        "ambiguous lookup returns exact overload candidates without choosing one");
+    const string exactQualifiedQuery = "Fixture.Shared.ExactLookupSurface.Resolve";
+    using var exactQualifiedLookup = await ApiToolJsonAsync("api_lookup", new
+    {
+        query = exactQualifiedQuery,
+        assemblyId = gameAssemblyId,
+        kind = "method",
+    });
+    var exactQualifiedRoot = exactQualifiedLookup.RootElement;
+    var exactQualifiedMatch = exactQualifiedRoot.GetProperty("match");
+    var exactQualifiedSource = exactQualifiedRoot.GetProperty("source").GetProperty("source").GetString()!;
+    Assert(!exactQualifiedRoot.GetProperty("ambiguous").GetBoolean() &&
+           exactQualifiedMatch.GetProperty("qualifiedName").GetString() == exactQualifiedQuery &&
+           exactQualifiedMatch.GetProperty("signature").GetString()!.Contains("Resolve(", StringComparison.Ordinal) &&
+           exactQualifiedSource.Contains("Resolve()", StringComparison.Ordinal) &&
+           !exactQualifiedSource.Contains("ResolveHelper", StringComparison.Ordinal),
+        "fully qualified api_lookup prefers exact names over longer substring matches");
+    using var boundedLookup = await ApiToolJsonAsync("api_lookup", new { query = "Page", assemblyId = gameAssemblyId, kind = "method" });
+    var boundedRoot = boundedLookup.RootElement;
+    var nextSearch = boundedRoot.GetProperty("nextSearch");
+    var nextSearchArguments = nextSearch.GetProperty("arguments");
+    var firstCandidateIds = boundedRoot.GetProperty("candidates").EnumerateArray()
+        .Select(candidate => candidate.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
+    Assert(boundedRoot.GetProperty("total").GetInt32() == 21 &&
+           boundedRoot.GetProperty("candidates").GetArrayLength() == 20 &&
+           boundedRoot.GetProperty("hasMore").GetBoolean() &&
+           nextSearch.GetProperty("tool").GetString() == "api_search" &&
+           nextSearchArguments.GetProperty("offset").GetInt32() == 20 &&
+           nextSearchArguments.GetProperty("assemblyId").GetString() == gameAssemblyId &&
+           nextSearchArguments.GetProperty("kind").GetString() == "method" &&
+           nextSearchArguments.GetProperty("snapshotId").GetString() == boundedRoot.GetProperty("snapshotId").GetString(),
+        "bounded ambiguous lookup provides an actionable api_search continuation");
+    using var remainingSearch = await ApiToolJsonAsync("api_search", nextSearchArguments);
+    Assert(remainingSearch.RootElement.GetProperty("offset").GetInt32() == 20 &&
+           remainingSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
+           !firstCandidateIds.Contains(remainingSearch.RootElement.GetProperty("results")[0].GetProperty("symbolId").GetString()!),
+        "nextSearch retrieves candidates omitted from bounded lookup results");
     foreach (var overload in overloads)
     {
         var symbolId = overload.GetProperty("symbolId").GetString()!;
-        using var memberSource = await ApiToolJsonAsync("api_decompile", new { assemblyId = modAssemblyId, symbolId, startLine = 1, lineCount = 20 });
-        var source = memberSource.RootElement.GetProperty("source").GetString()!;
+        using var memberLookup = await ApiToolJsonAsync("api_lookup", new { assemblyId = modAssemblyId, symbolId, startLine = 1, lineCount = 20 });
+        var match = memberLookup.RootElement.GetProperty("match");
+        var source = memberLookup.RootElement.GetProperty("source").GetProperty("source").GetString()!;
         var signature = overload.GetProperty("signature").GetString()!;
         var expectedParameter = signature.Contains("String", StringComparison.OrdinalIgnoreCase) ? "Overload(string" : "Overload(int";
         var otherParameter = expectedParameter == "Overload(int" ? "Overload(string" : "Overload(int";
-        Assert(source.Contains(expectedParameter, StringComparison.Ordinal) && !source.Contains(otherParameter, StringComparison.Ordinal),
-            "member decompilation targets exactly the selected overload");
+        Assert(match.GetProperty("signature").GetString() == signature &&
+               source.Contains(expectedParameter, StringComparison.Ordinal) && !source.Contains(otherParameter, StringComparison.Ordinal),
+            "exact api_lookup returns the selected overload's signature and source");
     }
 
     using var derivedSearch = await ApiToolJsonAsync("api_search", new { query = "DerivedSurface", kind = "type", assemblyId = modAssemblyId });
@@ -804,6 +944,29 @@ async Task CheckApiToolsAsync()
     using var preChangeAssemblyPage = await ApiToolJsonAsync("api_assemblies", new { offset = 0, limit = 1 });
     var staleSnapshotId = preChangeAssemblyPage.RootElement.GetProperty("snapshotId").GetString()!;
     var staleSnapshotNextOffset = preChangeAssemblyPage.RootElement.GetProperty("nextOffset").GetInt32();
+    using var preChangeLookupPage = await ApiToolJsonAsync("api_lookup", new
+    {
+        assemblyId = gameAssemblyId,
+        symbolId = sharedTypeId,
+        startLine = 1,
+        lineCount = 1,
+    });
+    var lookupSourcePage = preChangeLookupPage.RootElement.GetProperty("source");
+    var staleLookupSnapshotId = lookupSourcePage.GetProperty("snapshotId").GetString()!;
+    var staleLookupNextLine = lookupSourcePage.GetProperty("nextLine").GetInt32();
+    Assert(lookupSourcePage.GetProperty("hasMore").GetBoolean(), "exact api_lookup source exposes a continuation line");
+    using var nextLookupPage = await ApiToolJsonAsync("api_lookup", new
+    {
+        assemblyId = gameAssemblyId,
+        symbolId = sharedTypeId,
+        startLine = staleLookupNextLine,
+        lineCount = 1,
+        snapshotId = staleLookupSnapshotId,
+    });
+    var nextLookupSource = nextLookupPage.RootElement.GetProperty("source");
+    Assert(nextLookupSource.GetProperty("startLine").GetInt32() == staleLookupNextLine &&
+           nextLookupSource.GetProperty("source").GetString() != lookupSourcePage.GetProperty("source").GetString(),
+        "exact api_lookup continues reconstructed source with the returned snapshot and next line");
     File.Copy(changedAssemblyPath, apiGameSharedPath, overwrite: true);
     using var refreshedAssemblies = await ApiToolJsonAsync("api_assemblies", new { name = "Fixture.Shared", origin = "game", limit = 50 });
     var refreshedAssemblyId = refreshedAssemblies.RootElement.GetProperty("assemblies")[0].GetProperty("assemblyId").GetString()!;
@@ -813,6 +976,17 @@ async Task CheckApiToolsAsync()
            (ErrorText(staleAssemblyPage).Contains("stale", StringComparison.OrdinalIgnoreCase) ||
             ErrorText(staleAssemblyPage).Contains("snapshot", StringComparison.OrdinalIgnoreCase)),
         "changed assembly invalidates the prior page snapshot with an explicit stale-page error");
+    using var staleLookupContinuation = await ToolAsync("api_lookup", new
+    {
+        assemblyId = gameAssemblyId,
+        symbolId = sharedTypeId,
+        startLine = staleLookupNextLine,
+        lineCount = 1,
+        snapshotId = staleLookupSnapshotId,
+    });
+    Assert(IsError(staleLookupContinuation) &&
+           ErrorText(staleLookupContinuation).Contains("restart the search without snapshotId", StringComparison.Ordinal),
+        "stale lookup continuation is rejected with an actionable fresh-search path");
     var oldGameSharedSymbolId = sharedHits.Single(hit => hit.GetProperty("assemblyId").GetString() == gameAssemblyId)
         .GetProperty("symbolId").GetString()!;
     using var staleAssemblySearch = await ToolAsync("api_search", new { query = "SharedSurface", assemblyId = gameAssemblyId });
@@ -841,6 +1015,31 @@ async Task CheckCatalogToolsAsync()
            record.GetProperty("catalogType").GetString() == "LevelData" &&
            record.GetProperty("memberPath").GetString() == "Levels/Level_Arena.json",
         "catalog search finds a LevelData record by text nested inside its JSON");
+    var apiLookup = record.GetProperty("apiLookup");
+    Assert(apiLookup.GetProperty("query").GetString() == "ThunderRoad.LevelData" &&
+           apiLookup.GetProperty("kind").GetString() == "type",
+        "catalog search links from the actual $type to an api_lookup type query");
+    using var linkedCatalogType = await ApiToolJsonAsync("catalog_search", new { id = "BaseSurfaceRecord" });
+    var linkedRecord = linkedCatalogType.RootElement.GetProperty("results")[0];
+    var typeHandoff = linkedRecord.GetProperty("apiLookup");
+    using var linkedApiType = await ApiToolJsonAsync("api_lookup", new
+    {
+        query = typeHandoff.GetProperty("query").GetString(),
+        kind = typeHandoff.GetProperty("kind").GetString(),
+    });
+    var linkedApiMatch = linkedApiType.RootElement.GetProperty("match");
+    Assert(linkedApiMatch.GetProperty("qualifiedName").GetString() == "Fixture.Base.BaseSurface" &&
+           linkedApiMatch.GetProperty("assemblyId").GetString() is { Length: > 0 } &&
+           linkedApiMatch.GetProperty("symbolId").GetString() is { Length: > 0 } &&
+           linkedApiType.RootElement.GetProperty("source").GetProperty("source").GetString()!.Contains("BaseSurface", StringComparison.Ordinal),
+        "catalog $type handoff resolves to an actionable API type identity and source");
+    using var nestedGenericRecordSearch = await ApiToolJsonAsync("catalog_search", new { id = "NestedGenericRecord" });
+    var nestedGenericRecord = nestedGenericRecordSearch.RootElement.GetProperty("results")[0];
+    var nestedGenericFullType = nestedGenericRecord.GetProperty("fullType").GetString()!;
+    Assert(nestedGenericFullType.Contains('+') &&
+           nestedGenericFullType.Contains('[') &&
+           nestedGenericRecord.GetProperty("apiLookup").ValueKind == JsonValueKind.Null,
+        "unsupported nested generic CLR $type does not emit a malformed api_lookup query");
     var entryId = record.GetProperty("entryId").GetString()!;
     var snapshotId = root.GetProperty("snapshotId").GetString()!;
     using var repeatedSearch = await ApiToolJsonAsync("catalog_search", new { catalogType = "LevelData", query = "Survival" });
@@ -854,6 +1053,8 @@ async Task CheckCatalogToolsAsync()
 
     using var firstPage = await ApiToolJsonAsync("catalog_read", new { entryId, snapshotId, startLine = 1, lineCount = 3 });
     var firstPageRoot = firstPage.RootElement;
+    Assert(firstPageRoot.GetProperty("apiLookup").GetProperty("query").GetString() == "ThunderRoad.LevelData",
+        "catalog read retains the actual $type api_lookup handoff");
     Assert(firstPageRoot.GetProperty("hasMore").GetBoolean(), "catalog JSON can be paged");
     var nextLine = firstPageRoot.GetProperty("nextLine").GetInt32();
     using var lastPage = await ApiToolJsonAsync("catalog_read", new { entryId, snapshotId, startLine = nextLine, lineCount = 100 });
@@ -930,6 +1131,25 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                     loadedAssemblyCount = 1,
                     loadedAssembliesTruncated = false,
                 };
+            else if (!includeAssemblies && Volatile.Read(ref sameLevelReloadPhase) > 0)
+            {
+                var phase = Interlocked.CompareExchange(ref sameLevelReloadPhase, 0, 0);
+                if (phase == 1)
+                {
+                    statusResult = new { processId = 123, bridgeReady = true, currentLevel = "Arena", levelState = "Loaded", sceneReady = true };
+                    Interlocked.CompareExchange(ref sameLevelReloadPhase, 2, 1);
+                }
+                else if (phase == 2)
+                {
+                    statusResult = new { processId = 123, bridgeReady = true, currentLevel = "Home", levelState = "Loading", sceneReady = false };
+                    Interlocked.CompareExchange(ref sameLevelReloadPhase, 3, 2);
+                }
+                else
+                {
+                    statusResult = new { processId = 123, bridgeReady = true, currentLevel = "Arena", levelState = "Loaded", sceneReady = true };
+                    Interlocked.CompareExchange(ref sameLevelReloadPhase, 0, phase);
+                }
+            }
             else if (includeAssemblies)
                 statusResult = new
                 {
@@ -944,10 +1164,18 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                 };
             else
                 statusResult = new { processId = 123, bridgeReady = true, currentLevel = "Arena", levelState = "Loaded", sceneReady = true };
-            var statusResponse = JsonSerializer.Serialize(new { id, success = true, result = statusResult }) + "\n";
+            var statusResponse = "{\"id\":" + JsonSerializer.Serialize(id) +
+                ",\"success\":true,\"result\":" + JsonSerializer.Serialize(statusResult) +
+                ",\"timings\":{\"bridgeRequestTotalMs\":1.25,\"compilerQueueWaitMs\":-1,\"serializationMs\":60001,\"invocationMs\":1e1000,\"unknownStageMs\":3}}\n";
             await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(statusResponse), token);
             return;
         }
+        var delayedLoadResponse = method == "load_level" && Interlocked.Exchange(ref delayNextLevelRequest, 0) != 0;
+        if (delayedLoadResponse)
+            await Task.Delay(120, token);
+        var sameLevelReload = method == "load_level" && Interlocked.Exchange(ref reloadAlreadyCurrentNext, 0) != 0;
+        if (sameLevelReload)
+            Interlocked.Exchange(ref sameLevelReloadPhase, 1);
         if (method is "load_level" or "spawn_item" or "runtime")
         {
             object routedResult = method switch
@@ -956,7 +1184,7 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                 {
                     levelId = parameters.GetProperty("levelId").GetString(),
                     mode = parameters.GetProperty("mode").GetString(),
-                    currentLevelBefore = "Home",
+                    currentLevelBefore = sameLevelReload ? "Arena" : "Home",
                     levelStateBefore = "Loaded",
                     sceneReadyBefore = true,
                 },
@@ -991,7 +1219,15 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                 },
             };
             var routedResponse = JsonSerializer.Serialize(new { id, success = true, result = routedResult }) + "\n";
-            await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(routedResponse), token);
+            try
+            {
+                await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(routedResponse), token);
+            }
+            catch (Exception exception) when (
+                delayedLoadResponse &&
+                (exception is IOException or ObjectDisposedException or SocketException))
+            {
+            }
             return;
         }
         var since = parameters.GetProperty("since").GetInt64();

@@ -121,22 +121,48 @@ namespace ThunderRoadMcp.Bridge
             values[key] = value;
         }
 
-        public bool TryGet<T>(string key, out T value) where T : class
+        public bool TryGet<T>(string key, out T value)
         {
             EnsureMainThread();
             ValidateKey(key);
-            if (values.TryGetValue(key, out object stored) && stored is T typed)
+            if (values.TryGetValue(key, out object stored))
             {
-                value = typed;
-                return true;
+                if (stored is T typed)
+                {
+                    value = typed;
+                    return true;
+                }
+                if (stored == null && ReferenceEquals(default(T), null))
+                {
+                    value = default(T);
+                    return true;
+                }
             }
-            value = null;
+            value = default(T);
             return false;
         }
 
-        public T Get<T>(string key) where T : class
+        public T Get<T>(string key)
         {
-            return TryGet(key, out T value) ? value : null;
+            return TryGet(key, out T value) ? value : default(T);
+        }
+
+        internal object Inspect(string key)
+        {
+            EnsureMainThread();
+            ValidateKey(key);
+            bool found = values.TryGetValue(key, out object value);
+            bool typeTruncated = false;
+            string type = found && value != null ? BoundedText(value.GetType().FullName, MaxInspectionTextLength, out typeTruncated) : null;
+            return new
+            {
+                action = "inspect",
+                key,
+                found,
+                type,
+                typeTruncated,
+                value = found ? DescribeValue(value, MaxInspectionTextLength) : null
+            };
         }
 
         public bool Remove(string key)
@@ -146,7 +172,7 @@ namespace ThunderRoadMcp.Bridge
             return values.Remove(key);
         }
 
-        /// <summary>Keys and runtime types only, so the result stays JSON-serializable.</summary>
+        /// <summary>Keys, runtime types, and safe bounded value summaries.</summary>
         public object Describe()
         {
             EnsureMainThread();
@@ -156,22 +182,134 @@ namespace ThunderRoadMcp.Bridge
             objectKeys.Sort(StringComparer.Ordinal);
 
             var describedCoroutines = new List<object>(coroutineKeys.Count);
-            foreach (string key in coroutineKeys)
-                describedCoroutines.Add(new { key, type = typeof(Coroutine).FullName });
             var describedObjects = new List<object>(objectKeys.Count);
-            foreach (string key in objectKeys)
+            // Reserve space for the root object, counts, flags, and array delimiters.
+            int remaining = BridgeRequestHandler.MaxLineBytes - 512 - 1024;
+            bool coroutinesTruncated = false;
+            bool objectsTruncated = false;
+            string coroutineType = typeof(Coroutine).FullName;
+            int maxEntries = Math.Max(coroutineKeys.Count, objectKeys.Count);
+            for (int index = 0; index < maxEntries; index++)
             {
-                object value = values[key];
-                describedObjects.Add(new { key, type = value == null ? null : value.GetType().FullName });
+                if (index < coroutineKeys.Count)
+                {
+                    string key = coroutineKeys[index];
+                    int size = EstimateListEntryLength(key, coroutineType);
+                    if (size <= remaining)
+                    {
+                        describedCoroutines.Add(new { key, type = coroutineType });
+                        remaining -= size;
+                    }
+                    else
+                    {
+                        coroutinesTruncated = true;
+                    }
+                }
+                if (index < objectKeys.Count)
+                {
+                    string key = objectKeys[index];
+                    object value = values[key];
+                    bool typeTruncated = false;
+                    string type = value == null ? null : BoundedText(value.GetType().FullName, MaxTypeNameLength, out typeTruncated);
+                    int size = EstimateListEntryLength(key, type);
+                    if (size <= remaining)
+                    {
+                        describedObjects.Add(new { key, type, typeTruncated, value = DescribeValue(value, MaxListTextLength) });
+                        remaining -= size;
+                    }
+                    else
+                    {
+                        objectsTruncated = true;
+                    }
+                }
             }
             return new
             {
                 coroutines = describedCoroutines,
                 objects = describedObjects,
-                coroutineCount = describedCoroutines.Count,
-                objectCount = describedObjects.Count,
+                coroutineCount = coroutineKeys.Count,
+                objectCount = objectKeys.Count,
+                coroutinesTruncated,
+                objectsTruncated,
             };
         }
+
+        private static int EstimateListEntryLength(string key, string type)
+        {
+            // Conservative JSON overhead; raise it if adding summary fields or widening previews.
+            return 352 + JsonStringLength(key) + JsonStringLength(type);
+        }
+
+        private static int JsonStringLength(string value)
+        {
+            if (value == null) return 4;
+            int length = 2;
+            foreach (char character in value)
+            {
+                if (character == '"' || character == '\\' || character == '\b' || character == '\t' ||
+                    character == '\n' || character == '\f' || character == '\r')
+                    length += 2;
+                else if (character < ' ' || character > '~')
+                    length += 6;
+                else
+                    length++;
+            }
+            return length;
+        }
+
+        private const int MaxInspectionTextLength = 256;
+        private const int MaxListTextLength = 32;
+        private const int MaxTypeNameLength = 128;
+        private const string TruncationMarker = "…[truncated]";
+
+        private static string BoundedText(string value, int maxLength, out bool truncated)
+        {
+            truncated = value.Length > maxLength;
+            return truncated
+                ? value.Substring(0, maxLength - TruncationMarker.Length) + TruncationMarker
+                : value;
+        }
+
+        private static object DescribeValue(object value, int maxStringLength)
+        {
+            if (ReferenceEquals(value, null))
+                return new { kind = "null" };
+
+            Type type = value.GetType();
+            if (type == typeof(string))
+            {
+                string text = BoundedText((string)value, maxStringLength, out bool truncated);
+                return new { kind = "scalar", value = text, truncated };
+            }
+            if ((type.IsPrimitive && type != typeof(IntPtr) && type != typeof(UIntPtr)) ||
+                type == typeof(decimal) || type.IsEnum)
+                return new { kind = "scalar", value, truncated = false };
+
+            if (value is Vector2 vector2)
+                return new { kind = "unityValue", value = new { x = vector2.x, y = vector2.y } };
+            if (value is Vector3 vector3)
+                return new { kind = "unityValue", value = new { x = vector3.x, y = vector3.y, z = vector3.z } };
+            if (value is Vector4 vector4)
+                return new { kind = "unityValue", value = new { x = vector4.x, y = vector4.y, z = vector4.z, w = vector4.w } };
+            if (value is Quaternion quaternion)
+                return new { kind = "unityValue", value = new { x = quaternion.x, y = quaternion.y, z = quaternion.z, w = quaternion.w } };
+            if (value is Color color)
+                return new { kind = "unityValue", value = new { r = color.r, g = color.g, b = color.b, a = color.a } };
+
+            UnityEngine.Object unityObject = value as UnityEngine.Object;
+            if (!ReferenceEquals(unityObject, null))
+            {
+                bool destroyed = unityObject == null;
+                bool nameTruncated = false;
+                string name = destroyed ? null : BoundedText(unityObject.name, maxStringLength, out nameTruncated);
+                int? instanceId = destroyed ? (int?)null : unityObject.GetInstanceID();
+                return new { kind = "unityObject", name, instanceId, destroyed, nameTruncated };
+            }
+
+            return new { kind = "opaque" };
+        }
+
+
 
         /// <summary>Stop only coroutines and references owned by this bridge runtime.</summary>
         public void Clear()
