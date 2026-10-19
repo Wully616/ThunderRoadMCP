@@ -27,7 +27,7 @@ Release installs need only the .NET 10 runtime. They use the prebuilt host and, 
 
 When the game is found, the installer also enables the bridge by creating `%LOCALAPPDATA%\ThunderRoadMcp\bridge.json`: an enabled loopback config with a freshly generated private 32-byte token. The token is never printed. Pass `-NoBridgeConfig` to install the bridge mod but create no config, leaving the bridge disabled; pass `-SkipBridge` for a host-only install. An existing `bridge.json` is never overwritten, enabled, or disabled. See [Security](#security) and [bridge configuration](docs/usage.md#bridge-configuration).
 
-Source checkout: run the same command from the repository root. It requires the .NET 10 SDK and builds the host and, when the game is found, the bridge. Game selection, custom paths, update, uninstall, and troubleshooting are in [Installation](docs/installation.md).
+Source checkout: run the same command from the repository root. It requires the .NET 10 SDK and builds the host and, when the game is found, the bridge. To replace an existing installation, use `.\scripts\upgrade.ps1`; see [Installation](docs/installation.md#update) for source/release commands, options, and safeguards. Game selection, custom paths, uninstall, and troubleshooting are also documented there.
 
 ### Connect an agent
 

@@ -5,7 +5,8 @@ param(
     [string]$DotnetPath,
     [switch]$SkipBridge,
     [switch]$NoBridgeConfig,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$Upgrade
 )
 
 $ErrorActionPreference = 'Stop'
@@ -149,6 +150,43 @@ function Remove-OwnedFile($Configuration) {
     }
 }
 
+function Test-PathWithin([string]$Path, [string]$Parent) {
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/') + '\'
+    $fullParent = [IO.Path]::GetFullPath($Parent).TrimEnd('\', '/') + '\'
+    return $fullPath.StartsWith($fullParent, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-DirectoryReparsePoint([string]$Path) {
+    $current = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($Path))
+    while ($current) {
+        if ($current.Exists -and ($current.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $true }
+        $current = $current.Parent
+    }
+    return $false
+}
+
+function Assert-UpgradeProcessesStopped([string]$HostDirectory, [string]$GamePath) {
+    $hostExe = Join-Path $HostDirectory 'ThunderRoadMcp.Host.exe'
+    $hostDll = Join-Path $HostDirectory 'ThunderRoadMcp.Host.dll'
+    $gameName = [IO.Path]::GetFileNameWithoutExtension($GamePath)
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    foreach ($process in $processes) {
+        $name = [string]$process.Name
+        $command = [string]$process.CommandLine
+        $path = [string]$process.ExecutablePath
+        $isHost = ($name -ieq 'ThunderRoadMcp.Host.exe' -and $path -and
+            [string]::Equals([IO.Path]::GetFullPath($path), [IO.Path]::GetFullPath($hostExe), [StringComparison]::OrdinalIgnoreCase)) -or
+            ($name -ieq 'dotnet.exe' -and $command -and
+            $command.IndexOf($hostDll, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+        $isGame = $name -ieq ($gameName + '.exe') -and $path -and
+            [string]::Equals([IO.Path]::GetFullPath($path), [IO.Path]::GetFullPath($GamePath), [StringComparison]::OrdinalIgnoreCase)
+        if ($isHost -or $isGame) {
+            $label = if ($isHost) { 'MCP host' } else { 'selected game' }
+            Stop-Install "Stop or disconnect the $label process before upgrading. Detected PID $($process.ProcessId); no process was terminated."
+        }
+    }
+}
+
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $hostProject = Join-Path $sourceRoot 'src\ThunderRoadMcp.Host\ThunderRoadMcp.Host.csproj'
 $packageScript = Join-Path $PSScriptRoot 'package-bridge.ps1'
@@ -252,7 +290,24 @@ if ($prebuiltHost) {
 }
 
 $installDirectory = [IO.Path]::GetFullPath($InstallDirectory)
-if (Test-Path -LiteralPath $installDirectory) {
+if ($Upgrade) {
+    if (-not (Test-Path -LiteralPath $installDirectory -PathType Container) -or
+        (Test-DirectoryReparsePoint $installDirectory) -or
+        (Test-PathWithin $installDirectory $sourceRoot) -or
+        (Test-PathWithin $sourceRoot $installDirectory)) {
+        Stop-Install "Upgrade requires an existing, non-reparse host directory separate from the source checkout: $installDirectory"
+    }
+    foreach ($requiredHostFile in @('ThunderRoadMcp.Host.exe', 'ThunderRoadMcp.Host.dll')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $installDirectory $requiredHostFile) -PathType Leaf)) {
+            Stop-Install "Not a ThunderRoadMcp host installation; missing $requiredHostFile in $installDirectory"
+        }
+    }
+    foreach ($requiredHostFile in @('ThunderRoadMcp.Host.deps.json', 'ThunderRoadMcp.Host.runtimeconfig.json')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $installDirectory $requiredHostFile) -PathType Leaf)) {
+            Stop-Install "Not a recognized ThunderRoadMcp host installation; missing $requiredHostFile in $installDirectory"
+        }
+    }
+} elseif (Test-Path -LiteralPath $installDirectory) {
     Stop-Install "Host install directory already exists; refusing to overwrite it: $installDirectory`nChoose a new -InstallDirectory or move/remove this directory yourself after preserving anything you need."
 }
 
@@ -307,6 +362,8 @@ $hostInventory = $null
 $modInventory = $null
 $modDirectory = $null
 $bridgeReady = $false
+$stagedModOnVolume = $null
+$bridgeStagingRoot = $null
 $bridgeZipPath = $null
 $stagedConfigs = New-Object 'System.Collections.Generic.List[object]'
 $createdDirectories = New-Object 'System.Collections.Generic.List[string]'
@@ -356,6 +413,7 @@ try {
     if ($SkipBridge) {
         Write-Host 'Skipping the bridge; installing the MCP host only.'
     } elseif ($installations.Count -eq 0 -and -not $selectedPath -and -not $launchOptions) {
+        if ($Upgrade) { Stop-Install "Upgrade could not find a game matching the installed bridge. Supply -GameExecutablePath for the same game, or use -SkipBridge for a host-only upgrade." }
         Write-Warning "No Blade & Sorcery installation was detected. Installing the MCP host only; no bridge mod or bridge config will be created. Install the game (or pass -GameExecutablePath) and rerun with a new -InstallDirectory to add the bridge."
     } else {
         if (-not $selectedPath) {
@@ -405,9 +463,34 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $managedDirectory 'ThunderRoad.dll') -PathType Leaf)) {
             Stop-Install "Game Managed assemblies are missing or invalid: $managedDirectory. Install/repair the game before building the bridge."
         }
+        $streamingAssetsDirectory = Split-Path -Parent $modsDirectory
+        if ($Upgrade -and ((Test-PathWithin $modsDirectory $sourceRoot) -or (Test-PathWithin $sourceRoot $modsDirectory) -or
+            (Test-PathWithin $installDirectory $modsDirectory) -or (Test-PathWithin $modsDirectory $installDirectory) -or
+            (Test-PathWithin $streamingAssetsDirectory $installDirectory) -or (Test-PathWithin $installDirectory $streamingAssetsDirectory) -or
+            (Test-PathWithin $streamingAssetsDirectory $sourceRoot) -or (Test-PathWithin $sourceRoot $streamingAssetsDirectory))) {
+            Stop-Install "Upgrade paths overlap the source checkout, host install, StreamingAssets, or Mods directory; refusing unsafe replacement: host=$installDirectory; mods=$modsDirectory"
+        }
         $modDirectory = Join-Path $modsDirectory 'ThunderRoadMcp'
+        if ($Upgrade -and ((Test-PathWithin $launchConfigPath $installDirectory) -or
+            (Test-PathWithin $bridgeConfigPath $installDirectory) -or
+            (Test-PathWithin $launchConfigPath $modDirectory) -or
+            (Test-PathWithin $bridgeConfigPath $modDirectory))) {
+            Stop-Install 'A launch or bridge config is inside a directory being replaced; move the config outside the host or mod directory first.'
+        }
         if (Test-Path -LiteralPath $modDirectory) {
-            Stop-Install "Bridge mod already exists; refusing to overwrite it: $modDirectory`nBack it up and remove it yourself before installing this build."
+            if (-not $Upgrade -or -not (Test-Path -LiteralPath $modDirectory -PathType Container) -or
+                (Test-DirectoryReparsePoint $modDirectory) -or
+                -not (Test-Path -LiteralPath (Join-Path $modDirectory 'ThunderRoadMcp.Bridge.dll') -PathType Leaf) -or
+                -not (Test-Path -LiteralPath (Join-Path $modDirectory 'manifest.json') -PathType Leaf)) {
+                Stop-Install "Bridge destination is not a recognized ThunderRoadMcp installation; refusing to replace it: $modDirectory"
+            }
+            try { $existingModManifest = Get-Content -LiteralPath (Join-Path $modDirectory 'manifest.json') -Raw | ConvertFrom-Json }
+            catch { Stop-Install "Existing bridge manifest is invalid; refusing to replace it: $modDirectory ($($_.Exception.Message))" }
+            if ([string]$existingModManifest.Name -ne 'ThunderRoadMcp') {
+                Stop-Install "Bridge destination manifest does not identify ThunderRoadMcp; refusing to replace it: $modDirectory"
+            }
+        } elseif ($Upgrade) {
+            Stop-Install "Selected game has no existing ThunderRoadMcp bridge to upgrade: $modDirectory. Use -SkipBridge for a host-only upgrade."
         }
 
         if (Test-Path -LiteralPath $prebuiltBridgeZip -PathType Leaf) {
@@ -447,6 +530,9 @@ try {
             $modInventory = Get-DirectoryInventory $packageDirectory
             $bridgeReady = $true
         } else {
+            if ($Upgrade) {
+                Stop-Install "Cannot upgrade the existing bridge: no prebuilt bridge package is present and no .NET 10 SDK was found to build one. Nothing was changed. Install the .NET 10 SDK or use a release package, or pass -SkipBridge for a host-only upgrade."
+            }
             Write-Warning ".NET 10 SDK was not found, so the bridge was not built. Installing the MCP host only; no bridge mod or bridge config will be created. Install the .NET 10 SDK and rerun with a new -InstallDirectory to add the bridge."
         }
     }
@@ -456,11 +542,11 @@ try {
         if ($selectedPath -and -not [string]::Equals([IO.Path]::GetFullPath([string]$launchOptions.executablePath), $selectedPath, [StringComparison]::OrdinalIgnoreCase)) {
             Stop-Install "Selected game conflicts with the existing launch config; preserving it: $launchConfigPath"
         }
-    } elseif ($selectedPath -and ($GameExecutablePath -or $env:THUNDERROAD_MCP_LAUNCH_CONFIG)) {
+    } elseif (-not $Upgrade -and $selectedPath -and ($GameExecutablePath -or $env:THUNDERROAD_MCP_LAUNCH_CONFIG)) {
         $newLaunchConfig = [ordered]@{ executablePath = $selectedPath; arguments = @() }
     }
 
-    if ($bridgeReady -and -not $bridgeConfigExists -and -not $NoBridgeConfig) {
+    if (-not $Upgrade -and $bridgeReady -and -not $bridgeConfigExists -and -not $NoBridgeConfig) {
         $randomBytes = New-Object byte[] 32
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
         try { $rng.GetBytes($randomBytes) } finally { $rng.Dispose() }
@@ -486,51 +572,164 @@ try {
     if ($environmentValues.Count -gt 0) { $agentServer['env'] = $environmentValues }
     $agentConfiguration = [ordered]@{ mcpServers = [ordered]@{ ThunderRoadMcp = $agentServer } }
     $agentJson = ConvertTo-Json -InputObject $agentConfiguration -Depth 8
-    [IO.File]::WriteAllText((Join-Path $stagedHost 'mcp-config.json'), $agentJson, [System.Text.UTF8Encoding]::new($false))
+    $existingAgentConfig = Join-Path $installDirectory 'mcp-config.json'
+    if ($Upgrade -and (Test-Path -LiteralPath $existingAgentConfig -PathType Leaf)) {
+        Copy-Item -LiteralPath $existingAgentConfig -Destination (Join-Path $stagedHost 'mcp-config.json') -Force
+    } else {
+        [IO.File]::WriteAllText((Join-Path $stagedHost 'mcp-config.json'), $agentJson, [System.Text.UTF8Encoding]::new($false))
+    }
     $hostInventory = Get-DirectoryInventory $stagedHost
 
-    foreach ($configuration in $stagedConfigs) {
-        if (Test-Path -LiteralPath $configuration.Target) { Stop-Install "Config appeared during installation; preserving it: $($configuration.Target)" }
-    }
-    if (Test-Path -LiteralPath $installDirectory) { Stop-Install "Host install directory appeared during installation; preserving it: $installDirectory" }
-    [IO.Directory]::Move($stagedHost, $installDirectory)
-    $createdHost = $true
-
-    if ($bridgeReady) {
-        Write-Host 'Installing bridge through the host safe-install path...'
-        $installOutput = & $publishedExe --install-bridge $bridgeZipPath --game-executable $selectedPath 2> $diagnostics
-        if ($LASTEXITCODE -ne 0) {
-            $errorText = if (Test-Path -LiteralPath $diagnostics) { Get-Content -LiteralPath $diagnostics -Raw } else { '' }
-            Stop-Install "Bridge installation failed: $errorText"
+    if ($Upgrade) {
+        if ($bridgeReady -and (Test-DirectoryReparsePoint $modsDirectory)) {
+            Stop-Install "Mods directory or one of its parents is a reparse point; refusing unsafe upgrade: $modsDirectory"
         }
-        $createdMod = $true
-        try { $installResult = ($installOutput -join [Environment]::NewLine) | ConvertFrom-Json }
-        catch { Stop-Install "Host bridge installer returned invalid JSON: $($installOutput -join [Environment]::NewLine)" }
-        if ($installResult.installed -ne $true -or
-            -not [string]::Equals([IO.Path]::GetFullPath([string]$installResult.destination), [IO.Path]::GetFullPath($modDirectory), [StringComparison]::OrdinalIgnoreCase)) {
-            Stop-Install 'Host bridge installer did not confirm installation at the requested destination.'
+        Assert-UpgradeProcessesStopped $installDirectory $(if ($bridgeReady) { $selectedPath } else { $null })
+        if ($bridgeReady) {
+            $syntheticGame = Join-Path $tempRoot 'validation-game\BladeAndSorcery.exe'
+            $syntheticMods = Join-Path $tempRoot 'validation-game\BladeAndSorcery_Data\StreamingAssets\Mods'
+            [void][IO.Directory]::CreateDirectory($syntheticMods)
+            [IO.File]::WriteAllText($syntheticGame, 'synthetic bridge validation target')
+            $installOutput = & $stagedHostExe --install-bridge $bridgeZipPath --game-executable $syntheticGame 2> $diagnostics
+            if ($LASTEXITCODE -ne 0) {
+                $errorText = if (Test-Path -LiteralPath $diagnostics) { Get-Content -LiteralPath $diagnostics -Raw } else { '' }
+                Stop-Install "Bridge package validation failed before upgrade: $errorText"
+            }
+            try { $installResult = ($installOutput -join [Environment]::NewLine) | ConvertFrom-Json }
+            catch { Stop-Install "Host bridge installer returned invalid JSON: $($installOutput -join [Environment]::NewLine)" }
+            $stagedMod = Join-Path $syntheticMods 'ThunderRoadMcp'
+            if ($installResult.installed -ne $true -or
+                -not [string]::Equals([IO.Path]::GetFullPath([string]$installResult.destination), [IO.Path]::GetFullPath($stagedMod), [StringComparison]::OrdinalIgnoreCase)) {
+                Stop-Install 'Host bridge installer did not confirm staged package validation.'
+            }
+            $modInventory = Get-DirectoryInventory $stagedMod
         }
     }
 
-    foreach ($configuration in $stagedConfigs) {
-        [IO.File]::Move($configuration.Stage, $configuration.Target)
-        $configuration.Committed = $true
-    }
-    $completed = $true
-
-    if ($newLaunchConfig) { Write-Host "Selected game saved to $launchConfigPath" }
-    if ($newBridgeConfig) { Write-Host "Bridge enabled; private config saved to $bridgeConfigPath (token not displayed)." }
-    elseif ($bridgeReady -and $bridgeConfig -and -not $bridgeConfig.enabled) { Write-Warning "Existing bridge config is disabled and was preserved. Installer will not enable it: $bridgeConfigPath" }
-    elseif ($bridgeReady -and $NoBridgeConfig -and -not $bridgeConfigExists) { Write-Host "Bridge installed but disabled because -NoBridgeConfig was passed. Create a config when you want to opt in: $bridgeConfigPath" }
-    Write-Host "`nInstalled host: $publishedExe"
-    Write-Host "Copyable MCP config saved to $(Join-Path $installDirectory 'mcp-config.json')"
-    Write-Host 'MCP stdio configuration:'
-    Write-Host $agentJson
-    if ($bridgeReady) {
-        Write-Host "`nRestart the game before using the bridge; installation does not launch or modify a running game."
+    if ($Upgrade) {
+        $upgradeId = [Guid]::NewGuid().ToString('N')
+        $hostBackupRoot = Join-Path (Split-Path -Parent $installDirectory) '.ThunderRoadMcp-backups'
+        $hostBackup = Join-Path (Join-Path $hostBackupRoot $upgradeId) 'host'
+        $bridgeBackup = $null
+        $stagedModOnVolume = $null
+        if ($bridgeReady) {
+            $streamingAssets = Split-Path -Parent $modsDirectory
+            if (-not (Test-Path -LiteralPath $streamingAssets -PathType Container) -or (Test-DirectoryReparsePoint $modsDirectory)) {
+                Stop-Install "Mods or StreamingAssets directory is missing or reparse-backed; refusing unsafe bridge swap: $modsDirectory"
+            }
+            $bridgeBackup = Join-Path (Join-Path (Join-Path $streamingAssets '.ThunderRoadMcp-backups') $upgradeId) 'ThunderRoadMcp'
+            $bridgeStagingRoot = Join-Path $streamingAssets ('.ThunderRoadMcp-upgrade-' + $upgradeId)
+            $stagedModOnVolume = Join-Path (Join-Path $bridgeStagingRoot 'Mods') 'ThunderRoadMcp'
+            [void][IO.Directory]::CreateDirectory($stagedModOnVolume)
+            Copy-Item -Path (Join-Path $stagedMod '*') -Destination $stagedModOnVolume -Recurse
+            if (-not (Test-DirectoryInventory $stagedModOnVolume $modInventory)) {
+                Stop-Install 'Staged bridge copy failed validation; existing installations were not changed.'
+            }
+        }
+        $backupBases = @((Join-Path (Split-Path -Parent $installDirectory) '.ThunderRoadMcp-backups'))
+        if ($bridgeReady) { $backupBases += (Join-Path $streamingAssets '.ThunderRoadMcp-backups') }
+        foreach ($backupBase in $backupBases) {
+            if ((Test-Path -LiteralPath $backupBase) -and
+                (-not (Test-Path -LiteralPath $backupBase -PathType Container) -or (Test-DirectoryReparsePoint $backupBase))) {
+                Stop-Install "Backup path exists but is not a safe directory: $backupBase"
+            }
+        }
+        $hostOldMoved = $false
+        $bridgeOldMoved = $false
+        $hostNewMoved = $false
+        $bridgeNewMoved = $false
+        try {
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $hostBackup))
+            if (Test-Path -LiteralPath $hostBackup) { Stop-Install "Backup path already exists: $hostBackup" }
+            [IO.Directory]::Move($installDirectory, $hostBackup)
+            $hostOldMoved = $true
+            if ($bridgeReady) {
+                [void][IO.Directory]::CreateDirectory((Split-Path -Parent $bridgeBackup))
+                if (Test-Path -LiteralPath $bridgeBackup) { Stop-Install "Backup path already exists: $bridgeBackup" }
+                [IO.Directory]::Move($modDirectory, $bridgeBackup)
+                $bridgeOldMoved = $true
+            }
+            [IO.Directory]::Move($stagedHost, $installDirectory)
+            $hostNewMoved = $true
+            if ($bridgeReady) {
+                [IO.Directory]::Move($stagedModOnVolume, $modDirectory)
+                $bridgeNewMoved = $true
+            }
+        } catch {
+            $transactionError = $_.Exception.Message
+            $rollbackErrors = New-Object 'System.Collections.Generic.List[string]'
+            if ($bridgeNewMoved) {
+                if (Test-DirectoryInventory $modDirectory $modInventory) {
+                    try { [IO.Directory]::Move($modDirectory, $stagedModOnVolume) } catch { $rollbackErrors.Add("could not move new bridge from ${modDirectory}: $($_.Exception.Message)") }
+                } else { $rollbackErrors.Add("new bridge changed at $modDirectory") }
+            }
+            if ($hostNewMoved) {
+                if (Test-DirectoryInventory $installDirectory $hostInventory) {
+                    try { [IO.Directory]::Move($installDirectory, $stagedHost) } catch { $rollbackErrors.Add("could not move new host from ${installDirectory}: $($_.Exception.Message)") }
+                } else { $rollbackErrors.Add("new host changed at $installDirectory") }
+            }
+            if ($bridgeOldMoved) {
+                if (-not (Test-Path -LiteralPath $modDirectory)) {
+                    try { [IO.Directory]::Move($bridgeBackup, $modDirectory) } catch { $rollbackErrors.Add("could not restore bridge from ${bridgeBackup}: $($_.Exception.Message)") }
+                } else { $rollbackErrors.Add("bridge destination occupied; original preserved at $bridgeBackup") }
+            }
+            if ($hostOldMoved) {
+                if (-not (Test-Path -LiteralPath $installDirectory)) {
+                    try { [IO.Directory]::Move($hostBackup, $installDirectory) } catch { $rollbackErrors.Add("could not restore host from ${hostBackup}: $($_.Exception.Message)") }
+                } else { $rollbackErrors.Add("host destination occupied; original preserved at $hostBackup") }
+            }
+            if ($rollbackErrors.Count -gt 0) {
+                Stop-Install "Upgrade failed: $transactionError. Rollback was blocked: $($rollbackErrors -join '; '). Recover from backups: host=$hostBackup; bridge=$bridgeBackup"
+            }
+            Stop-Install "Upgrade failed and both original components were restored: $transactionError"
+        }
+        $completed = $true
+        Write-Host "Upgrade backups retained: host=$hostBackup$(if ($bridgeBackup) { '; bridge=' + $bridgeBackup } else { '' })"
+        Write-Host "Preserved launch/bridge configuration paths: $launchConfigPath; $bridgeConfigPath"
+        Write-Host "Installed host: $publishedExe"
+        Write-Host "Copyable MCP config: $(Join-Path $installDirectory 'mcp-config.json')"
+        Write-Host 'MCP stdio configuration preserved or generated; details not printed.'
+        if ($bridgeReady) { Write-Host 'Bridge upgraded. Restart the game before using it.' }
+        else { Write-Host 'Host upgraded only; bridge unchanged by -SkipBridge.' }
     } else {
-        Write-Host "`nThe bridge was not installed. Installation did not launch or modify the game."
+        foreach ($configuration in $stagedConfigs) {
+            if (Test-Path -LiteralPath $configuration.Target) { Stop-Install "Config appeared during installation; preserving it: $($configuration.Target)" }
+        }
+        if (Test-Path -LiteralPath $installDirectory) { Stop-Install "Host install directory appeared during installation; preserving it: $installDirectory" }
+        [IO.Directory]::Move($stagedHost, $installDirectory)
+        $createdHost = $true
+        if ($bridgeReady) {
+            Write-Host 'Installing bridge through the host safe-install path...'
+            $installOutput = & $publishedExe --install-bridge $bridgeZipPath --game-executable $selectedPath 2> $diagnostics
+            if ($LASTEXITCODE -ne 0) {
+                $errorText = if (Test-Path -LiteralPath $diagnostics) { Get-Content -LiteralPath $diagnostics -Raw } else { '' }
+                Stop-Install "Bridge installation failed: $errorText"
+            }
+            $createdMod = $true
+            try { $installResult = ($installOutput -join [Environment]::NewLine) | ConvertFrom-Json }
+            catch { Stop-Install "Host bridge installer returned invalid JSON: $($installOutput -join [Environment]::NewLine)" }
+            if ($installResult.installed -ne $true -or
+                -not [string]::Equals([IO.Path]::GetFullPath([string]$installResult.destination), [IO.Path]::GetFullPath($modDirectory), [StringComparison]::OrdinalIgnoreCase)) {
+                Stop-Install 'Host bridge installer did not confirm installation at the requested destination.'
+            }
+        }
+        foreach ($configuration in $stagedConfigs) {
+            [IO.File]::Move($configuration.Stage, $configuration.Target)
+            $configuration.Committed = $true
+        }
+        $completed = $true
+        if ($newLaunchConfig) { Write-Host "Selected game saved to $launchConfigPath" }
+        if ($newBridgeConfig) { Write-Host "Bridge enabled; private config saved to $bridgeConfigPath (token not displayed)." }
+        elseif ($bridgeReady -and $bridgeConfig -and -not $bridgeConfig.enabled) { Write-Warning "Existing bridge config is disabled and was preserved. Installer will not enable it: $bridgeConfigPath" }
+        elseif ($bridgeReady -and $NoBridgeConfig -and -not $bridgeConfigExists) { Write-Host "Bridge installed but disabled because -NoBridgeConfig was passed. Create a config when you want to opt in: $bridgeConfigPath" }
+        Write-Host "`nInstalled host: $publishedExe"
+        Write-Host "Copyable MCP config saved to $(Join-Path $installDirectory 'mcp-config.json')"
+        Write-Host 'MCP stdio configuration:'
+        Write-Host $agentJson
+        if ($bridgeReady) { Write-Host "`nRestart the game before using the bridge; installation does not launch or modify a running game." }
+        else { Write-Host "`nThe bridge was not installed. Installation did not launch or modify the game." }
     }
+
 } finally {
     if (-not $completed) {
         foreach ($configuration in $stagedConfigs) { Remove-OwnedFile $configuration }
@@ -547,6 +746,20 @@ try {
     }
     foreach ($configuration in $stagedConfigs) {
         if (Test-Path -LiteralPath $configuration.Stage -PathType Leaf) { Remove-Item -LiteralPath $configuration.Stage -Force }
+    }
+    if ($stagedModOnVolume -and (Test-Path -LiteralPath $stagedModOnVolume)) {
+        if (Test-DirectoryInventory $stagedModOnVolume $modInventory) {
+            Remove-Item -LiteralPath $stagedModOnVolume -Recurse -Force
+        } else {
+            Write-Warning "Preserving changed staged bridge data during cleanup: $stagedModOnVolume"
+        }
+    }
+    if ($bridgeStagingRoot -and (Test-Path -LiteralPath $bridgeStagingRoot -PathType Container)) {
+        foreach ($directory in @((Join-Path $bridgeStagingRoot 'Mods'), $bridgeStagingRoot)) {
+            if ((Test-Path -LiteralPath $directory -PathType Container) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) {
+                Remove-Item -LiteralPath $directory -Force
+            }
+        }
     }
     if ($tempRoot -and (Test-Path -LiteralPath $tempRoot)) { Remove-Item -LiteralPath $tempRoot -Recurse -Force }
     if (-not $completed) {

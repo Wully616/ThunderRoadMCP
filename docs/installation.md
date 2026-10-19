@@ -81,7 +81,7 @@ Choose a different new host directory with `-InstallDirectory`:
 .\scripts\install.ps1 -InstallDirectory 'D:\Tools\ThunderRoadMcp\host'
 ```
 
-The installer refuses an existing host directory. Move or remove it yourself after preserving anything you need.
+The installer refuses an existing host directory. Move or remove it yourself after preserving anything you need, or use `upgrade.ps1` for an existing ThunderRoadMcp installation (see [Update](#update)).
 
 ## Default paths
 
@@ -124,7 +124,24 @@ If `THUNDERROAD_MCP_CONFIG` or `THUNDERROAD_MCP_LAUNCH_CONFIG` is set during ins
 
 ## Update
 
-There is no in-place updater. Back up the existing host and mod, then remove or rename both install directories yourself before running the installer again. The installer deliberately refuses to overwrite either directory. It does not remove or rewrite `launch.json`, `bridge.json`, or any agent configuration. Restart the game after updating the bridge mod.
+There is an in-place upgrader for an existing host installation and bridge mod. Before running it, stop the MCP host/client and close Blade & Sorcery; the upgrader refuses a running host or locked destination rather than terminating processes. Restart the game after upgrading its bridge.
+
+Run from either a source checkout or an extracted release ZIP:
+
+```powershell
+.\scripts\upgrade.ps1
+```
+
+The default host path is `%LOCALAPPDATA%\ThunderRoadMcp\host`. Select a custom existing host and game when needed:
+
+```powershell
+.\scripts\upgrade.ps1 -InstallDirectory 'D:\Tools\ThunderRoadMcp\host' -GameExecutablePath 'D:\Games\BladeAndSorcery\BladeAndSorcery.exe'
+```
+
+Source upgrades require the .NET 10 SDK; release ZIP upgrades use the prebuilt host and bridge and require the .NET 10 runtime. `-DotnetPath` selects an SDK explicitly, `-NonInteractive` disables game-selection prompts, and `-SkipBridge` upgrades only the host and leaves the bridge mod unchanged. A full upgrade requires the selected game's existing ThunderRoadMcp mod. Set `THUNDERROAD_MCP_LAUNCH_CONFIG` and `THUNDERROAD_MCP_CONFIG` as needed to select custom config paths; those files are preserved byte-for-byte, including disabled bridge state and token. Existing `mcp-config.json` and unrelated game mods/files are also retained.
+`-NoBridgeConfig` is accepted for command-line symmetry with installation but never creates or changes config during an upgrade. Full upgrades retain an existing bridge config exactly as-is, including disabled state; if it is absent, it remains absent.
+
+The upgrader validates inputs before replacement. Host backups are written to `.ThunderRoadMcp-backups` next to the host directory; bridge backups are written to `StreamingAssets\.ThunderRoadMcp-backups`, outside `Mods`. The command prints both retained backup paths. If replacement fails, it attempts to restore the old installation; if restoration is blocked, it reports that and leaves the backups for manual recovery. Retain the reported backup until the updated host and mod have been confirmed. Rollback cannot recover from external disk/device failure or user deletion of the backup.
 
 ## Uninstall
 
@@ -139,6 +156,6 @@ Stop or disconnect the MCP server and close the game. Remove the host directory 
 - **An existing disabled `bridge.json` stays disabled:** the installer never enables or rewrites an existing config, even without `-NoBridgeConfig`. Edit or replace the file yourself if you intend to enable it.
 - **Multiple game candidates:** pass `-GameExecutablePath` with an absolute `BladeAndSorcery.exe`. For a custom path, its sibling `BladeAndSorcery_Data\Managed` must contain the game assemblies.
 - **Script is blocked:** use the single-process execution-policy fallback above or run `Unblock-File .\scripts\install.ps1`.
-- **Destination already exists:** the installer does not update or overwrite host or mod directories. Back up and remove the conflicting directory yourself before a fresh install.
+- **Destination already exists:** a fresh install (`install.ps1`) does not overwrite host or mod directories; use `upgrade.ps1` for an existing ThunderRoadMcp installation, or back up and remove the conflicting directory yourself before a fresh install.
 - **Host does not start or has no tools:** use the absolute EXE `command` with empty `args` from `mcp-config.json`, confirm the .NET 10 runtime is installed, then restart or reconnect the agent.
 - **Bridge is offline after installation:** check that `bridge.json` exists and is enabled. The installer creates it by default when it installs the bridge mod, but leaves it absent with `-NoBridgeConfig` and leaves an existing disabled config disabled. See [runtime troubleshooting](usage.md#runtime-troubleshooting).

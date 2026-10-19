@@ -124,6 +124,12 @@ The installer behavior check uses a real installed game's `Managed` directory. I
 
 Installer checks use isolated synthetic game trees and do not claim a live Unity run.
 
+The isolated installer behavior check also upgrades source and release-layout installs using real installed game `Managed` assemblies copied into synthetic games. It verifies byte-preserved configs, replacement of obsolete host/mod files, MCP initialize and `tools/list`, host-only mode, and untouched unrelated mods; it never touches the live installation:
+
+```powershell
+.\tests\InstallerBehaviorCheck.ps1 -GameManagedDir $managed
+```
+
 ## Discovery performance measurements
 
 Set `THUNDERROAD_MCP_DIAGNOSTICS=1` on a benchmark host to emit bounded request metrics to stderr. Normal MCP text/structured results omit detailed metrics. Diagnostics do not contain bridge secrets, snippets, or full source/catalog bodies.

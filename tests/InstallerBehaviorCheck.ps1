@@ -151,6 +151,26 @@ function Invoke-Installer($Game, [string]$HostPath, [string]$ConfigRoot, [switch
     Invoke-Process $powershell $arguments $environment
 }
 
+function Invoke-Upgrader($Game, [string]$HostPath, [string]$UpgradeScript = (Join-Path $sourceRoot 'scripts\upgrade.ps1'), [switch]$SkipBridge, [switch]$NoBridgeConfig, [string]$DotnetPath, [hashtable]$EnvironmentOverride = @{}) {
+    $environment = @{}
+    if ($Game) {
+        $environment.THUNDERROAD_MCP_CONFIG = Join-Path (Split-Path -Parent $HostPath) 'upgrade-bridge.json'
+        $environment.THUNDERROAD_MCP_LAUNCH_CONFIG = Join-Path (Split-Path -Parent $HostPath) 'upgrade-launch.json'
+    }
+    foreach ($key in $EnvironmentOverride.Keys) { $environment[$key] = [string]$EnvironmentOverride[$key] }
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $UpgradeScript, '-InstallDirectory', $HostPath)
+    if ($Game) { $arguments += @('-GameExecutablePath', $Game.Executable) }
+    if ($DotnetPath) { $arguments += @('-DotnetPath', $DotnetPath) }
+    if ($SkipBridge) { $arguments += '-SkipBridge' }
+    if ($NoBridgeConfig) { $arguments += '-NoBridgeConfig' }
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Invoke-Process $powershell $arguments $environment
+}
+
+function Test-ByteEqual([byte[]]$Left, [byte[]]$Right) {
+    return [Convert]::ToBase64String($Left) -ceq [Convert]::ToBase64String($Right)
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('ThunderRoadMcp-installer-check-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
@@ -275,6 +295,7 @@ try {
     $releaseHost = Join-Path $releaseRoot 'host'
     $releaseBridge = Join-Path $releaseRoot 'bridge'
     New-Item -ItemType Directory -Path $releaseScripts, $releaseHost, $releaseBridge -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts\upgrade.ps1') -Destination $releaseScripts
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts\install.ps1') -Destination $releaseScripts
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts\package-bridge.ps1') -Destination $releaseScripts
     Copy-Item -Path (Join-Path $hostA '*') -Destination $releaseHost -Recurse
@@ -316,6 +337,81 @@ try {
         throw 'Release-layout install did not report its prebuilt host and bridge sources, game version provenance, and the generic MCP stdio label.'
     }
 
+    $releaseMcpPath = Join-Path $hostRelease 'mcp-config.json'
+    $releaseLaunchPath = Join-Path $configRelease 'launch.json'
+    $releaseBridgePath = Join-Path $configRelease 'bridge.json'
+    $savedReleaseMcp = [IO.File]::ReadAllBytes($releaseMcpPath)
+    $savedReleaseLaunch = [IO.File]::ReadAllBytes($releaseLaunchPath)
+    $savedReleaseBridge = [IO.File]::ReadAllBytes($releaseBridgePath)
+    Set-Content -LiteralPath (Join-Path $hostRelease 'old-host-only.bin') -Value 'obsolete'
+    Set-Content -LiteralPath (Join-Path $releaseMod 'old-mod-only.bin') -Value 'obsolete'
+    $releaseOtherMod = Join-Path $gameRelease.Mods 'OtherMod'
+    New-Item -ItemType Directory -Path $releaseOtherMod | Out-Null
+    Set-Content -LiteralPath (Join-Path $releaseOtherMod 'keep.txt') -Value 'keep'
+    $releaseUpgrade = Invoke-Upgrader $gameRelease $hostRelease -UpgradeScript (Join-Path $releaseScripts 'upgrade.ps1') -EnvironmentOverride @{
+        THUNDERROAD_MCP_CONFIG = $releaseBridgePath
+        THUNDERROAD_MCP_LAUNCH_CONFIG = $releaseLaunchPath
+    }
+    if ($releaseUpgrade.ExitCode -ne 0) { throw "Release upgrade failed: $($releaseUpgrade.Output)`n$($releaseUpgrade.Error)" }
+    if (($releaseUpgrade.Output + $releaseUpgrade.Error).Contains([string]$releaseConfig.token)) {
+        throw 'Release upgrade printed the bridge token.'
+    }
+    if ((Test-Path -LiteralPath (Join-Path $hostRelease 'old-host-only.bin')) -or
+        (Test-Path -LiteralPath (Join-Path $releaseMod 'old-mod-only.bin')) -or
+        -not (Test-ByteEqual $savedReleaseMcp ([IO.File]::ReadAllBytes($releaseMcpPath))) -or
+        -not (Test-ByteEqual $savedReleaseLaunch ([IO.File]::ReadAllBytes($releaseLaunchPath))) -or
+        -not (Test-ByteEqual $savedReleaseBridge ([IO.File]::ReadAllBytes($releaseBridgePath))) -or
+        (Get-Content -LiteralPath (Join-Path $releaseOtherMod 'keep.txt') -Raw).Trim() -ne 'keep' -or
+        @(Get-ChildItem -LiteralPath $gameRelease.Mods -Directory | Where-Object { $_.Name -match 'backup|rollback' }).Count -gt 0) {
+        throw 'Release upgrade retained obsolete files, changed configs/unrelated mods, or exposed a backup to game mod discovery.'
+    }
+    Test-GeneratedStdioServer ((Get-Content -LiteralPath $releaseMcpPath -Raw | ConvertFrom-Json).mcpServers.ThunderRoadMcp)
+
+    $sourceDrive = [IO.Path]::GetPathRoot($sourceRoot)
+    $temporaryDrive = [IO.Path]::GetPathRoot([IO.Path]::GetTempPath())
+    if (-not [string]::Equals($sourceDrive, $temporaryDrive, [StringComparison]::OrdinalIgnoreCase)) {
+        $crossVolumeRoot = Join-Path $sourceDrive ('ThunderRoadMcp-upgrade-check-' + [Guid]::NewGuid().ToString('N'))
+        if (Test-Path -LiteralPath $crossVolumeRoot) { throw "Cross-volume fixture path unexpectedly exists: $crossVolumeRoot" }
+        New-Item -ItemType Directory -Path $crossVolumeRoot | Out-Null
+        try {
+            $crossGame = New-Game (Join-Path $crossVolumeRoot 'synthetic-game')
+            $crossHost = Join-Path $root 'cross-volume-host'
+            $crossConfig = Join-Path $root 'cross-volume-config'
+            $crossInstall = Invoke-Installer $crossGame $crossHost $crossConfig -DotnetPath $testDotnet
+            if ($crossInstall.ExitCode -ne 0) { throw "Cross-volume source install failed: $($crossInstall.Output)`n$($crossInstall.Error)" }
+            $crossMcpPath = Join-Path $crossHost 'mcp-config.json'
+            $crossLaunchPath = Join-Path $crossConfig 'launch.json'
+            $crossBridgeConfigPath = Join-Path $crossConfig 'bridge.json'
+            $crossSavedMcp = [IO.File]::ReadAllBytes($crossMcpPath)
+            $crossSavedLaunch = [IO.File]::ReadAllBytes($crossLaunchPath)
+            $crossSavedBridge = [IO.File]::ReadAllBytes($crossBridgeConfigPath)
+            Set-Content -LiteralPath (Join-Path $crossHost 'old-host-only.bin') -Value 'obsolete'
+            Set-Content -LiteralPath (Join-Path $crossGame.Mods 'ThunderRoadMcp\old-mod-only.bin') -Value 'obsolete'
+            $crossOtherMod = Join-Path $crossGame.Mods 'AnotherMod'
+            New-Item -ItemType Directory -Path $crossOtherMod | Out-Null
+            Set-Content -LiteralPath (Join-Path $crossOtherMod 'keep.txt') -Value 'keep'
+            $crossUpgrade = Invoke-Upgrader $crossGame $crossHost -UpgradeScript (Join-Path $releaseScripts 'upgrade.ps1') -EnvironmentOverride @{
+                THUNDERROAD_MCP_CONFIG = $crossBridgeConfigPath
+                THUNDERROAD_MCP_LAUNCH_CONFIG = $crossLaunchPath
+            }
+            if ($crossUpgrade.ExitCode -ne 0) { throw "Cross-volume release upgrade failed: $($crossUpgrade.Output)`n$($crossUpgrade.Error)" }
+            if ((Test-Path -LiteralPath (Join-Path $crossHost 'old-host-only.bin')) -or
+                (Test-Path -LiteralPath (Join-Path $crossGame.Mods 'ThunderRoadMcp\old-mod-only.bin')) -or
+                -not (Test-ByteEqual $crossSavedMcp ([IO.File]::ReadAllBytes($crossMcpPath))) -or
+                -not (Test-ByteEqual $crossSavedLaunch ([IO.File]::ReadAllBytes($crossLaunchPath))) -or
+                -not (Test-ByteEqual $crossSavedBridge ([IO.File]::ReadAllBytes($crossBridgeConfigPath))) -or
+                (Get-Content -LiteralPath (Join-Path $crossOtherMod 'keep.txt') -Raw).Trim() -ne 'keep' -or
+                @(Get-ChildItem -LiteralPath $crossGame.Mods -Directory | Where-Object { $_.Name -match 'backup|rollback' }).Count -gt 0) {
+                throw 'Cross-volume upgrade changed unrelated/config data, retained obsolete outputs, or put backups in the game mod root.'
+            }
+            Test-GeneratedStdioServer ((Get-Content -LiteralPath $crossMcpPath -Raw | ConvertFrom-Json).mcpServers.ThunderRoadMcp)
+        } finally {
+            Remove-Item -LiteralPath $crossVolumeRoot -Recurse -Force
+        }
+    } else {
+        Write-Warning 'Skipping cross-volume upgrade check: source and temporary paths are on the same volume.'
+    }
+
     $gameB = New-Game (Join-Path $root 'preserve-config')
     $hostB = Join-Path $root 'preserve-host'
     $configB = Join-Path $root 'preserve-config-files'
@@ -337,6 +433,153 @@ try {
     }
     if (-not ($preserved.Output + $preserved.Error).Contains('disabled and was preserved')) {
         throw 'Installer did not warn that the existing disabled bridge config remains disabled.'
+    }
+
+    $hostBMcpPath = Join-Path $hostB 'mcp-config.json'
+    $savedHostBMcp = [IO.File]::ReadAllBytes($hostBMcpPath)
+    $savedLaunchBytes = [IO.File]::ReadAllBytes($launchBPath)
+    $savedBridgeBytes = [IO.File]::ReadAllBytes($bridgeBPath)
+    Set-Content -LiteralPath (Join-Path $hostB 'old-host-only.bin') -Value 'obsolete'
+    Set-Content -LiteralPath (Join-Path $gameB.Mods 'ThunderRoadMcp\old-mod-only.bin') -Value 'obsolete'
+    $otherMod = Join-Path $gameB.Mods 'UnrelatedMod'
+    New-Item -ItemType Directory -Path $otherMod | Out-Null
+    Set-Content -LiteralPath (Join-Path $otherMod 'user.txt') -Value 'untouched'
+    $sourceUpgrade = Invoke-Upgrader $gameB $hostB -DotnetPath $testDotnet -NoBridgeConfig -EnvironmentOverride @{
+        THUNDERROAD_MCP_CONFIG = $bridgeBPath
+        THUNDERROAD_MCP_LAUNCH_CONFIG = $launchBPath
+    }
+    if ($sourceUpgrade.ExitCode -ne 0) { throw "Source upgrade failed: $($sourceUpgrade.Output)`n$($sourceUpgrade.Error)" }
+    if (($sourceUpgrade.Output + $sourceUpgrade.Error).Contains('b' * 64)) {
+        throw 'Source upgrade printed the preserved bridge token.'
+    }
+    if ((Test-Path -LiteralPath (Join-Path $hostB 'old-host-only.bin')) -or
+        (Test-Path -LiteralPath (Join-Path $gameB.Mods 'ThunderRoadMcp\old-mod-only.bin')) -or
+        -not (Test-ByteEqual $savedHostBMcp ([IO.File]::ReadAllBytes($hostBMcpPath))) -or
+        -not (Test-ByteEqual $savedLaunchBytes ([IO.File]::ReadAllBytes($launchBPath))) -or
+        -not (Test-ByteEqual $savedBridgeBytes ([IO.File]::ReadAllBytes($bridgeBPath))) -or
+        (Get-Content -LiteralPath (Join-Path $otherMod 'user.txt') -Raw).Trim() -ne 'untouched' -or
+        @(Get-ChildItem -LiteralPath $gameB.Mods -Directory | Where-Object { $_.Name -match 'backup|rollback' }).Count -gt 0) {
+        throw 'Source upgrade retained obsolete files, changed configs/unrelated mods, or exposed a backup to game mod discovery.'
+    }
+    Test-GeneratedStdioServer ((Get-Content -LiteralPath $hostBMcpPath -Raw | ConvertFrom-Json).mcpServers.ThunderRoadMcp)
+
+    $hostNoConfigMcp = Join-Path $hostNoConfig 'mcp-config.json'
+    $savedNoConfigMcp = [IO.File]::ReadAllBytes($hostNoConfigMcp)
+    $noBridgeConfigPath = Join-Path $configNoConfig 'bridge.json'
+    $noLaunchConfigPath = Join-Path $configNoConfig 'launch.json'
+    $savedNoConfigLaunch = [IO.File]::ReadAllBytes($noLaunchConfigPath)
+    $absentConfigUpgrade = Invoke-Upgrader $gameNoConfig $hostNoConfig -DotnetPath $testDotnet -EnvironmentOverride @{
+        THUNDERROAD_MCP_CONFIG = $noBridgeConfigPath
+        THUNDERROAD_MCP_LAUNCH_CONFIG = $noLaunchConfigPath
+    }
+    if ($absentConfigUpgrade.ExitCode -ne 0 -or (Test-Path -LiteralPath $noBridgeConfigPath) -or
+        -not (Test-ByteEqual $savedNoConfigMcp ([IO.File]::ReadAllBytes($hostNoConfigMcp))) -or
+        -not (Test-ByteEqual $savedNoConfigLaunch ([IO.File]::ReadAllBytes($noLaunchConfigPath)))) {
+        throw "Upgrade changed absent config state or existing host/launch config: $($absentConfigUpgrade.Output)`n$($absentConfigUpgrade.Error)"
+    }
+
+    $hostSkipMcp = Join-Path $hostSkip 'mcp-config.json'
+    $savedSkipMcp = [IO.File]::ReadAllBytes($hostSkipMcp)
+    Set-Content -LiteralPath (Join-Path $hostSkip 'old-host-only.bin') -Value 'obsolete'
+    $hostOnlyUpgrade = Invoke-Upgrader $null $hostSkip -SkipBridge -DotnetPath $testDotnet -EnvironmentOverride @{
+        THUNDERROAD_MCP_CONFIG = (Join-Path $configSkip 'bridge.json')
+        THUNDERROAD_MCP_LAUNCH_CONFIG = (Join-Path $configSkip 'launch.json')
+    }
+    if ($hostOnlyUpgrade.ExitCode -ne 0 -or
+        (Test-Path -LiteralPath (Join-Path $hostSkip 'old-host-only.bin')) -or
+        -not (Test-ByteEqual $savedSkipMcp ([IO.File]::ReadAllBytes($hostSkipMcp))) -or
+        (Test-Path -LiteralPath (Join-Path $gameSkip.Mods 'ThunderRoadMcp'))) {
+        throw "Host-only upgrade failed, modified MCP config, or installed a bridge: $($hostOnlyUpgrade.Output)`n$($hostOnlyUpgrade.Error)"
+    }
+
+    $hostSkipDll = Join-Path $hostSkip 'ThunderRoadMcp.Host.dll'
+    $hostSkipBytes = [IO.File]::ReadAllBytes($hostSkipDll)
+    $missingModUpgrade = Invoke-Upgrader $gameSkip $hostSkip -DotnetPath $testDotnet
+    if ($missingModUpgrade.ExitCode -eq 0 -or
+        -not (Test-ByteEqual $hostSkipBytes ([IO.File]::ReadAllBytes($hostSkipDll))) -or
+        (Test-Path -LiteralPath (Join-Path $gameSkip.Mods 'ThunderRoadMcp'))) {
+        throw 'Full upgrade without the existing bridge mod was not refused without changing the host or game.'
+    }
+
+    $badRelease = Join-Path $root 'invalid-release'
+    $badReleaseScripts = Join-Path $badRelease 'scripts'
+    $badReleaseHost = Join-Path $badRelease 'host'
+    $badReleaseBridge = Join-Path $badRelease 'bridge'
+    New-Item -ItemType Directory -Path $badReleaseScripts, $badReleaseHost, $badReleaseBridge | Out-Null
+    Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts\upgrade.ps1') -Destination $badReleaseScripts
+    Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts\install.ps1') -Destination $badReleaseScripts
+    Copy-Item -Path (Join-Path $hostRelease '*') -Destination $badReleaseHost -Recurse
+    Copy-Item -LiteralPath (Join-Path $releaseBridge 'versions.json') -Destination $badReleaseBridge
+    Set-Content -LiteralPath (Join-Path $badReleaseBridge 'ThunderRoadMcp.zip') -Value 'not a package'
+    $releaseHostBeforeInvalid = [IO.File]::ReadAllBytes($releaseDll)
+    $releaseBridgeBeforeInvalid = [IO.File]::ReadAllBytes((Join-Path $releaseMod 'ThunderRoadMcp.Bridge.dll'))
+    $invalidPackageUpgrade = Invoke-Upgrader $gameRelease $hostRelease -UpgradeScript (Join-Path $badReleaseScripts 'upgrade.ps1') -EnvironmentOverride @{
+        THUNDERROAD_MCP_CONFIG = $releaseBridgePath
+        THUNDERROAD_MCP_LAUNCH_CONFIG = $releaseLaunchPath
+    }
+    if ($invalidPackageUpgrade.ExitCode -eq 0 -or
+        -not (Test-ByteEqual $releaseHostBeforeInvalid ([IO.File]::ReadAllBytes($releaseDll))) -or
+        -not (Test-ByteEqual $releaseBridgeBeforeInvalid ([IO.File]::ReadAllBytes((Join-Path $releaseMod 'ThunderRoadMcp.Bridge.dll'))))) {
+        throw 'Invalid release package was not rejected before changing the existing host/mod.'
+    }
+
+    $mismatchedGameUpgrade = Invoke-Upgrader $gameB $hostRelease -UpgradeScript (Join-Path $releaseScripts 'upgrade.ps1') -EnvironmentOverride @{
+        THUNDERROAD_MCP_CONFIG = $releaseBridgePath
+        THUNDERROAD_MCP_LAUNCH_CONFIG = $releaseLaunchPath
+    }
+    if ($mismatchedGameUpgrade.ExitCode -eq 0 -or
+        -not (Test-Path -LiteralPath $releaseDll) -or
+        -not (Test-Path -LiteralPath (Join-Path $releaseMod 'ThunderRoadMcp.Bridge.dll'))) {
+        throw 'Mismatched explicit game selection was not refused without removing the existing host/mod.'
+    }
+
+    $runningHostStart = New-Object Diagnostics.ProcessStartInfo
+    $runningHostStart.FileName = $releaseExe
+    $runningHostStart.WorkingDirectory = $hostRelease
+    $runningHostStart.UseShellExecute = $false
+    $runningHostStart.CreateNoWindow = $true
+    $runningHostStart.RedirectStandardInput = $true
+    $runningHostStart.RedirectStandardOutput = $true
+    $runningHostStart.RedirectStandardError = $true
+    $runningHostStart.EnvironmentVariables['THUNDERROAD_MCP_CONFIG'] = $releaseBridgePath
+    $runningHostStart.EnvironmentVariables['THUNDERROAD_MCP_LAUNCH_CONFIG'] = $releaseLaunchPath
+    $runningHostProcess = New-Object Diagnostics.Process
+    $runningHostProcess.StartInfo = $runningHostStart
+    [void]$runningHostProcess.Start()
+    try {
+        Start-Sleep -Milliseconds 500
+        if ($runningHostProcess.HasExited) { throw 'Isolated host exited before the running-host upgrade refusal check.' }
+        $runningUpgrade = Invoke-Upgrader $gameRelease $hostRelease -UpgradeScript (Join-Path $releaseScripts 'upgrade.ps1') -EnvironmentOverride @{
+            THUNDERROAD_MCP_CONFIG = $releaseBridgePath
+            THUNDERROAD_MCP_LAUNCH_CONFIG = $releaseLaunchPath
+        }
+    } finally {
+        if (-not $runningHostProcess.HasExited) { $runningHostProcess.Kill() }
+        [void]$runningHostProcess.WaitForExit(5000)
+        $runningHostProcess.Dispose()
+    }
+    if ($runningUpgrade.ExitCode -eq 0 -or -not (Test-Path -LiteralPath $releaseDll)) {
+        throw 'Upgrade did not refuse the running isolated host with the old host still present.'
+    }
+
+    $lockedBridgePath = Join-Path $releaseMod 'ThunderRoadMcp.Bridge.dll'
+    $lockedBridgeBytes = [IO.File]::ReadAllBytes($lockedBridgePath)
+    Set-Content -LiteralPath (Join-Path $hostRelease 'rollback-sentinel.txt') -Value 'original host data' -Encoding ASCII
+    $lockedBridgeStream = [IO.File]::Open($lockedBridgePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try {
+        $lockedUpgrade = Invoke-Upgrader $gameRelease $hostRelease -UpgradeScript (Join-Path $releaseScripts 'upgrade.ps1') -EnvironmentOverride @{
+            THUNDERROAD_MCP_CONFIG = $releaseBridgePath
+            THUNDERROAD_MCP_LAUNCH_CONFIG = $releaseLaunchPath
+        }
+    } finally {
+        $lockedBridgeStream.Dispose()
+    }
+    if ($lockedUpgrade.ExitCode -eq 0 -or
+        -not (Test-ByteEqual $lockedBridgeBytes ([IO.File]::ReadAllBytes($lockedBridgePath))) -or
+        -not (Test-ByteEqual $savedReleaseMcp ([IO.File]::ReadAllBytes($releaseMcpPath))) -or
+        (Get-Content -LiteralPath (Join-Path $hostRelease 'rollback-sentinel.txt') -Raw).Trim() -ne 'original host data' -or
+        -not (Test-Path -LiteralPath $releaseDll)) {
+        throw 'Upgrade did not refuse a locked bridge file or restore the original host/mod data.'
     }
 
     $gameC = New-Game (Join-Path $root 'occupied-host')
@@ -400,7 +643,7 @@ try {
         throw "Invalid -DotnetPath did not fail cleanly before side effects: $invalidText"
     }
 
-    Write-Output 'PASS: source and release-layout isolated installs with actual game Managed references; bridge enabled by default and disabled with -NoBridgeConfig; host-only -SkipBridge; user-local SDK discovery and invalid -DotnetPath handling; generated stdio initialize/tools/list; existing configs, occupied destinations, and missing dependencies preserve user data.'
+    Write-Output 'PASS: isolated source and release installs/upgrades; byte-preserved configs; replaced host/mod outputs; host-only and missing-mod behavior; actual game Managed references; MCP initialize/tools/list; invalid package, running host, locked files, and mismatched games refused; unrelated mods preserved.'
 } finally {
     Remove-Item -LiteralPath $root -Recurse -Force
 }
