@@ -877,13 +877,21 @@ async Task CheckApiToolsAsync()
         Assert(unloadedDefaultSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
                unloadedDefaultSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == gameAssemblyId,
             "default search excludes installed mod absent from loaded inventory");
-    Assert(IsError(await ToolAsync("api_lookup", new { query = "SharedSurface", includeUnloadedMods = true })),
-        "api_lookup does not accept includeUnloadedMods");
+    using (var installedSearch = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", scope = "installed" }))
+        Assert(installedSearch.RootElement.GetProperty("results").EnumerateArray()
+                   .Any(hit => hit.GetProperty("assemblyId").GetString() == modAssemblyId) &&
+               installedSearch.RootElement.GetProperty("diagnostics").EnumerateArray()
+                   .Any(diagnostic => diagnostic.GetString()!.StartsWith("Assembly scope: installed", StringComparison.Ordinal)),
+            "installed scope searches enabled mods on disk regardless of load state and reports its scope");
+    Assert(IsError(await ToolAsync("api_search", new { query = "SharedSurface", scope = "everything" })),
+        "unknown scope is rejected");
     foreach (var lookupMode in new[] { "task", "symbol" })
     {
-        using var hiddenLookup = await ApiToolJsonAsync("api_lookup", new { query = "SharedSurface", mode = lookupMode, kind = "type", includeExamples = false });
-        Assert(!hiddenLookup.RootElement.GetRawText().Contains(modAssemblyId, StringComparison.Ordinal),
-            $"api_lookup {lookupMode} mode never includes unloaded mods");
+        using var loadedLookup = await ApiToolJsonAsync("api_lookup", new { query = "SharedSurface", mode = lookupMode, kind = "type", includeExamples = false });
+        using var installedLookup = await ApiToolJsonAsync("api_lookup", new { query = "SharedSurface", mode = lookupMode, kind = "type", includeExamples = false, scope = "installed" });
+        Assert(!loadedLookup.RootElement.GetRawText().Contains(modAssemblyId, StringComparison.Ordinal) &&
+               installedLookup.RootElement.GetRawText().Contains(modAssemblyId, StringComparison.Ordinal),
+            $"api_lookup {lookupMode} mode uses loaded scope with a connected bridge and installed scope on request");
     }
     loadedAssemblyFixture.Add(loadedModFixture);
 
@@ -1161,28 +1169,12 @@ async Task CheckApiToolsAsync()
     File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Shared.dll"), apiGameSharedPath, overwrite: true);
     File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Base.dll"), apiDisabledModBasePath);
 
-    using var disabledModAssemblies = await ApiToolJsonAsync("api_assemblies", new { name = "Fixture.Base", origin = "mod", limit = 50 });
-    var disabledModAssembly = disabledModAssemblies.RootElement.GetProperty("assemblies").EnumerateArray().Single();
-    var disabledModAssemblyId = disabledModAssembly.GetProperty("assemblyId").GetString()!;
-    var disabledModRelativePath = disabledModAssembly.GetProperty("relativePath").GetString()!;
-    Assert(disabledModRelativePath == "_DisabledFixtureMod/Fixture.Base.dll",
-        "underscore-prefixed mod directory is discoverable as installed");
-    var reportedDisabledAssembly = new
-    {
-        name = disabledModAssembly.GetProperty("name").GetString(),
-        version = disabledModAssembly.GetProperty("version").GetString(),
-        moduleVersionId = disabledModAssembly.GetProperty("moduleVersionId").GetString(),
-        origin = "mod",
-        relativePath = disabledModRelativePath,
-    };
-    loadedAssemblyFixture.Add(reportedDisabledAssembly);
-    using (var disabledFolderSearch = await ApiToolJsonAsync("api_search", new
-           { query = "BaseSurface", kind = "type", assemblyId = disabledModAssemblyId }))
+    using (var disabledModAssemblies = await ApiToolJsonAsync("api_assemblies", new { name = "Fixture.Base", origin = "mod", limit = 50 }))
+        Assert(disabledModAssemblies.RootElement.GetProperty("assemblies").GetArrayLength() == 0,
+            "underscore-prefixed (disabled) mod directory is not part of the installed inventory");
+    using (var disabledFolderSearch = await ApiToolJsonAsync("api_search", new { query = "BaseSurface", kind = "type", origin = "mod", scope = "installed" }))
         Assert(disabledFolderSearch.RootElement.GetProperty("results").GetArrayLength() == 0,
-            "underscore-prefixed mod directory stays excluded even if bridge reports it loaded");
-    Assert(IsError(await ToolAsync("api_search", new { query = "BaseSurface", includeUnloadedMods = true })),
-        "includeUnloadedMods is not an accepted argument; unloaded mods are never searched");
-    loadedAssemblyFixture.Remove(reportedDisabledAssembly);
+            "installed scope never searches disabled mod directories");
     File.Delete(apiDisabledModBasePath);
 }
 async Task CheckCatalogToolsAsync()

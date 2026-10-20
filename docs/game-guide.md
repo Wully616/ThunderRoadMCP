@@ -160,7 +160,7 @@ Choose the workflow by task:
 - Custom script: one `api_lookup(query:"...")` call returns ranked signatures, bounded related declarations, relevant examples, and execution/cleanup context; then write a purposeful statement-body snippet and call `evaluate_csharp`.
 - Exact implementation question: use `api_lookup(mode:"symbol", query:"...")` or the lower-level `api_search`, `api_type`, and `api_decompile` tools. Do not fetch exhaustive inventory, inspect unrelated types, or read the guide twice by default.
 
-The API tools inspect installed files without executing them. `api_search` and `api_lookup` always include game assemblies and include only mod DLLs whose path and MVID match the bridge's loaded-assembly inventory outside underscore-prefixed mod folders; unloaded mods are never searched, and with the bridge offline no mods are searched. Base catalog records are shipped data, not proof that an object exists in the mod-merged runtime. Snapshot IDs reject stale symbols after files change.
+The API tools inspect installed files without executing them. They cover the game's `Managed` assemblies and enabled mod folders; disabled (underscore-prefixed) mod folders are never included. `api_search` and `api_lookup` take `scope`: before writing `evaluate_csharp` code, use `scope:"loaded"` (or the default `auto` while the bridge is connected) so results only include mods the running game actually loaded; for offline mod authoring, `scope:"installed"` covers every enabled mod. Base catalog records are shipped data, not proof that an object exists in the mod-merged runtime. Snapshot IDs reject stale symbols after files change.
 
 ## Logs
 

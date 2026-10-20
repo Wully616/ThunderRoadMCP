@@ -120,8 +120,7 @@ public sealed partial class InstalledApiCatalog
             if (origin is not null && entry.Origin != origin)
                 continue;
             if (loadedModAssemblies is not null && entry.Origin == "mod" &&
-                (IsUnderscorePrefixedModFolder(entry.RelativePath) ||
-                 !loadedModAssemblies.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId)))))
+                !loadedModAssemblies.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId))))
                 continue;
             try
             {
@@ -677,6 +676,8 @@ public sealed partial class InstalledApiCatalog
                 cancellationToken.ThrowIfCancellationRequested();
                 ToolTiming.Count("api.scan.filesConsidered");
                 string relativePath = Path.GetRelativePath(root, file).Replace(Path.DirectorySeparatorChar, '/');
+                if (configuredRoot.Origin == "mod" && IsUnderscorePrefixedModFolder(relativePath))
+                    continue; // disabled mod folder: never part of the installed API surface
                 try
                 {
                     byte[] bytes;
@@ -964,13 +965,12 @@ public sealed partial class InstalledApiCatalog
 
     internal static LoadedAssemblyIdentity CreateLoadedAssemblyIdentity(string relativePath, Guid moduleVersionId) =>
         new(relativePath.Replace('\\', '/'), moduleVersionId);
-    /// <summary>Ids of mod assemblies hidden by the loaded-mod filter; empty when the filter is off.</summary>
+    /// <summary>Ids of installed mod assemblies the bridge did not report as loaded; empty for installed scope.</summary>
     private static HashSet<string> ExcludedModAssemblyIds(CatalogSnapshot snapshot, IReadOnlySet<LoadedAssemblyIdentity>? loaded) =>
         loaded is null
             ? new HashSet<string>(StringComparer.Ordinal)
             : snapshot.Assemblies.Where(entry => entry.Origin == "mod" &&
-                    (IsUnderscorePrefixedModFolder(entry.RelativePath) ||
-                     !loaded.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId)))))
+                    !loaded.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId))))
                 .Select(entry => entry.Id).ToHashSet(StringComparer.Ordinal);
 
     private static bool IsUnderscorePrefixedModFolder(string relativePath) =>
