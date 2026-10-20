@@ -26,31 +26,28 @@ public static class ApiDiscoveryTools
         ToolInvocation.Run(() => catalog.AssembliesAsync(name, origin, offset, limit, snapshotId, cancellationToken));
 
     [McpServerTool(Name = "api_search", Title = "Search installed game APIs", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-    [Description("Search installed type and member names; public results are the default. Results are ranked: exact simple name, exact qualified name, name prefix, name substring, then qualified-name matches; types precede members and game assemblies precede mods within a rank. By default, mod results are limited to assemblies reported loaded by the game bridge and exclude underscore-prefixed mod directories. Set includeUnloadedMods=true to search installed mod DLLs regardless of load state or when offline. Use api_lookup to combine an unambiguous search hit with paged source; otherwise use the returned assemblyId and symbolId with api_type or api_decompile. Carry snapshotId and nextOffset for remaining pages. This reads metadata and does not execute game code.")]
+    [Description("Search installed type and member names; public results are the default. Results are ranked: exact simple name, exact qualified name, name prefix, name substring, then qualified-name matches; types precede members and game assemblies precede mods within a rank. Mod results are limited to assemblies the game bridge reports as loaded; unloaded mods, underscore-prefixed mod directories, and all mods while the bridge is offline are never searched. Use api_lookup to combine an unambiguous search hit with paged source; otherwise use the returned assemblyId and symbolId with api_type or api_decompile. Carry snapshotId and nextOffset for remaining pages. This reads metadata and does not execute game code.")]
     public static Task<CallToolResult> ApiSearch(InstalledApiCatalog catalog, GameProcess gameProcess,
         [Description("Case-insensitive type, member, or qualified-name search text.")] string query,
         [Description("Restrict search to an assemblyId returned by api_assemblies.")] string? assemblyId = null,
         [Description("Optional result kind, such as type, method, property, or field.")] string? kind = null,
         [Description("Optional origin filter: game or mod.")] string? origin = null,
         [Description("Include non-public declarations only when implementation details are needed.")] bool includeNonPublic = false,
-        [Description("Include installed mod DLLs regardless of load state, including underscore-prefixed folders.")] bool includeUnloadedMods = false,
         [Description("Zero-based result offset.")] int offset = 0,
         [Description("Maximum results in this page.")] int limit = 50,
         [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(async () =>
         {
-            var (loadedModAssemblies, loadedAssemblyDiagnostic) = await LoadedModsAsync(gameProcess, includeUnloadedMods, cancellationToken);
+            var (loadedModAssemblies, loadedAssemblyDiagnostic) = await LoadedModsAsync(gameProcess, cancellationToken);
             return await catalog.SearchAsync(query, assemblyId, kind, includeNonPublic, offset, limit, snapshotId,
                 cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic, origin);
         });
 
-    /// <summary>Loaded mod assemblies reported by the bridge, or null when unloaded mods are requested.</summary>
+    /// <summary>Loaded mod assemblies reported by the bridge; empty (so every mod is excluded) when the bridge is unavailable.</summary>
     internal static async Task<(IReadOnlySet<InstalledApiCatalog.LoadedAssemblyIdentity>? Loaded, string? Diagnostic)> LoadedModsAsync(
-        GameProcess gameProcess, bool includeUnloadedMods, CancellationToken cancellationToken)
+        GameProcess gameProcess, CancellationToken cancellationToken)
     {
-        if (includeUnloadedMods)
-            return (null, null);
         string? diagnostic = null;
         using var status = JsonDocument.Parse(await gameProcess.StatusAsync(true, cancellationToken));
         var root = status.RootElement;
@@ -58,11 +55,11 @@ public static class ApiDiscoveryTools
                               connected.ValueKind == JsonValueKind.True;
         var loaded = InstalledApiCatalog.CreateLoadedAssemblyIdentitySet();
         if (!bridgeConnected)
-            diagnostic = "Game bridge is not connected; mod assemblies are excluded. Set includeUnloadedMods=true to search installed mod DLLs.";
+            diagnostic = "Game bridge is not connected; mod assemblies are excluded because only loaded mods are searched.";
         else if (!root.TryGetProperty("status", out var bridgeStatus) ||
                  !bridgeStatus.TryGetProperty("loadedAssemblies", out var assemblies) ||
                  assemblies.ValueKind != JsonValueKind.Array)
-            diagnostic = "Connected bridge does not report loaded assemblies; mod assemblies are excluded. Set includeUnloadedMods=true to search installed mod DLLs.";
+            diagnostic = "Connected bridge does not report loaded assemblies; mod assemblies are excluded because only loaded mods are searched.";
         else
         {
             foreach (var assembly in assemblies.EnumerateArray())
@@ -100,7 +97,7 @@ public static class ApiDiscoveryTools
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(() => catalog.TypeAsync(assemblyId, typeSymbolId, includeInherited, includeNonPublic, name, kind, offset, limit, snapshotId, cancellationToken));
 [McpServerTool(Name = "api_lookup", Title = "Find an installed API for a task", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-[Description("Recommended first discovery tool. A natural-language query defaults to ranked task mode: it returns metadata-only declarations, bounded signatures/type context, related catalog records, and evidence-labelled examples without eager decompilation. Use mode=\"symbol\" for the legacy exact-symbol/source lookup, or pass exact assemblyId and symbolId to receive its source directly. Task mode never executes installed code; its executionContract explains the separate evaluator constraints. Continuations are bound to the exact query, options, ranking version, and full installed snapshot. Like api_search, query modes exclude mod assemblies the game bridge does not report as loaded (and underscore-prefixed mod folders) unless includeUnloadedMods=true.")]
+[Description("Recommended first discovery tool. A natural-language query defaults to ranked task mode: it returns metadata-only declarations, bounded signatures/type context, related catalog records, and evidence-labelled examples without eager decompilation. Use mode=\"symbol\" for the legacy exact-symbol/source lookup, or pass exact assemblyId and symbolId to receive its source directly. Task mode never executes installed code; its executionContract explains the separate evaluator constraints. Continuations are bound to the exact query, options, ranking version, and full installed snapshot. Like api_search, query modes only consider mod assemblies the game bridge reports as loaded; unloaded mods and underscore-prefixed mod folders are never included.")]
 public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCatalogDataCatalog baseCatalog, GameProcess gameProcess,
     [Description("Natural-language task or exact type/member text. Task mode accepts up to 2048 characters. Omit when passing the exact assemblyId and symbolId pair.")] string? query = null,
     [Description("Optional assemblyId restriction from api_assemblies or a previous lookup.")] string? assemblyId = null,
@@ -114,13 +111,12 @@ public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCa
     [Description("One-based first source line in symbol mode.")] int startLine = 1,
     [Description("Number of source lines to return in symbol mode.")] int lineCount = 200,
     [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
-    [Description("Include installed mod DLLs regardless of load state, including underscore-prefixed folders.")] bool includeUnloadedMods = false,
     CancellationToken cancellationToken = default) =>
     ToolInvocation.Run(async () =>
     {
         var (loadedModAssemblies, loadedAssemblyDiagnostic) = query is null
             ? (null, null)
-            : await LoadedModsAsync(gameProcess, includeUnloadedMods, cancellationToken);
+            : await LoadedModsAsync(gameProcess, cancellationToken);
         return await catalog.LookupAsync(query, assemblyId, symbolId, kind, mode, startLine, lineCount, snapshotId,
             maxResults, maxChars, includeExamples, continuation, baseCatalog, cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic);
     });

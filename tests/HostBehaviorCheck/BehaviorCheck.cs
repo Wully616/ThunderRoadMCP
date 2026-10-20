@@ -877,18 +877,13 @@ async Task CheckApiToolsAsync()
         Assert(unloadedDefaultSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
                unloadedDefaultSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == gameAssemblyId,
             "default search excludes installed mod absent from loaded inventory");
-    using (var offlineModSearch = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", includeUnloadedMods = true }))
-        Assert(offlineModSearch.RootElement.GetProperty("results").GetArrayLength() == 2 &&
-               offlineModSearch.RootElement.GetProperty("results").EnumerateArray()
-                   .Any(hit => hit.GetProperty("assemblyId").GetString() == modAssemblyId),
-            "includeUnloadedMods searches installed mod assemblies");
+    Assert(IsError(await ToolAsync("api_lookup", new { query = "SharedSurface", includeUnloadedMods = true })),
+        "api_lookup does not accept includeUnloadedMods");
     foreach (var lookupMode in new[] { "task", "symbol" })
     {
         using var hiddenLookup = await ApiToolJsonAsync("api_lookup", new { query = "SharedSurface", mode = lookupMode, kind = "type", includeExamples = false });
-        using var shownLookup = await ApiToolJsonAsync("api_lookup", new { query = "SharedSurface", mode = lookupMode, kind = "type", includeExamples = false, includeUnloadedMods = true });
-        Assert(!hiddenLookup.RootElement.GetRawText().Contains(modAssemblyId, StringComparison.Ordinal) &&
-               shownLookup.RootElement.GetRawText().Contains(modAssemblyId, StringComparison.Ordinal),
-            $"api_lookup {lookupMode} mode excludes unloaded mods unless includeUnloadedMods is set");
+        Assert(!hiddenLookup.RootElement.GetRawText().Contains(modAssemblyId, StringComparison.Ordinal),
+            $"api_lookup {lookupMode} mode never includes unloaded mods");
     }
     loadedAssemblyFixture.Add(loadedModFixture);
 
@@ -1185,10 +1180,8 @@ async Task CheckApiToolsAsync()
            { query = "BaseSurface", kind = "type", assemblyId = disabledModAssemblyId }))
         Assert(disabledFolderSearch.RootElement.GetProperty("results").GetArrayLength() == 0,
             "underscore-prefixed mod directory stays excluded even if bridge reports it loaded");
-    using (var explicitDisabledFolderSearch = await ApiToolJsonAsync("api_search", new
-           { query = "BaseSurface", kind = "type", assemblyId = disabledModAssemblyId, includeUnloadedMods = true }))
-        Assert(explicitDisabledFolderSearch.RootElement.GetProperty("results").GetArrayLength() == 1,
-            "explicit unloaded-mod search includes underscore-prefixed mod directories");
+    Assert(IsError(await ToolAsync("api_search", new { query = "BaseSurface", includeUnloadedMods = true })),
+        "includeUnloadedMods is not an accepted argument; unloaded mods are never searched");
     loadedAssemblyFixture.Remove(reportedDisabledAssembly);
     File.Delete(apiDisabledModBasePath);
 }
