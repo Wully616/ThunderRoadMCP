@@ -2,11 +2,13 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text.Json;
+using ModelContextProtocol;
 
 public sealed class GameProcess
 {
     private const int MaxLaunchArgumentCount = 64;
     private const int MaxLaunchArgumentLength = 4096;
+    private static readonly TimeSpan ProgressInterval = TimeSpan.FromSeconds(5);
     private readonly BridgeClient _bridgeClient;
     private Process? _ownedProcess;
     private string[]? _launchedArguments;
@@ -70,11 +72,13 @@ public sealed class GameProcess
         }
     }
 
-    public Task<string> WaitForReadyAsync(string? level, int timeoutMs, CancellationToken cancellationToken) =>
-        WaitForReadyAsync(level, timeoutMs, Stopwatch.StartNew(), cancellationToken, CancellationToken.None);
+    public Task<string> WaitForReadyAsync(string? level, int timeoutMs, CancellationToken cancellationToken,
+        IProgress<ProgressNotificationValue>? progress = null) =>
+        WaitForReadyAsync(level, timeoutMs, Stopwatch.StartNew(), cancellationToken, CancellationToken.None, false, progress);
 
     internal async Task<string> WaitForReadyAsync(string? level, int timeoutMs, Stopwatch stopwatch,
-        CancellationToken cancellationToken, CancellationToken deadlineToken = default, bool requireTransition = false)
+        CancellationToken cancellationToken, CancellationToken deadlineToken = default, bool requireTransition = false,
+        IProgress<ProgressNotificationValue>? progress = null)
     {
         if (timeoutMs is < 1 or > 300_000)
             throw new ArgumentOutOfRangeException(nameof(timeoutMs), "timeoutMs must be between 1 and 300000.");
@@ -87,6 +91,7 @@ public sealed class GameProcess
         var hasStatus = false;
         var transitionObserved = !requireTransition;
         var ready = false;
+        TimeSpan? lastProgress = null;
         while (true)
         {
             var remaining = timeout - stopwatch.Elapsed;
@@ -112,6 +117,16 @@ public sealed class GameProcess
             ready = statusReady && transitionObserved;
             if (ready)
                 break;
+            if (progress is not null && (lastProgress is null || stopwatch.Elapsed - lastProgress >= ProgressInterval))
+            {
+                lastProgress = stopwatch.Elapsed;
+                progress.Report(new ProgressNotificationValue
+                {
+                    Progress = (float)stopwatch.Elapsed.TotalMilliseconds,
+                    Total = timeoutMs,
+                    Message = $"Waiting for readiness: bridgeReady={DescribeStatusValue(lastStatus, "bridgeReady")}, sceneReady={DescribeStatusValue(lastStatus, "sceneReady")}, currentLevel={DescribeStatusValue(lastStatus, "currentLevel")}",
+                });
+            }
             remaining = timeout - stopwatch.Elapsed;
             if (remaining <= TimeSpan.Zero)
                 break;
@@ -149,6 +164,10 @@ public sealed class GameProcess
 
     private static bool IsTrue(JsonElement status, string name) =>
         status.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
+
+    private static string DescribeStatusValue(JsonElement status, string name) =>
+        !status.TryGetProperty(name, out var value) || value.ValueKind == JsonValueKind.Null ? "null"
+        : value.ValueKind == JsonValueKind.String ? value.GetString()! : value.GetRawText();
 
     public async Task<string> LaunchAsync(string[]? arguments, CancellationToken cancellationToken)
     {

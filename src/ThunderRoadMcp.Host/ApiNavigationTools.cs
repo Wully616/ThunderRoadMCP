@@ -13,8 +13,9 @@ public static class ApiNavigationTools
         [Description("Zero-based result offset.")] int offset = 0,
         [Description("Maximum results, 1 to 100.")] int limit = 50,
         [Description("Snapshot ID from the previous page.")] string? snapshotId = null,
+        [Description("Include the full searched-assembly list and every diagnostic; default returns counts and the first 5 diagnostics.")] bool includeDiagnostics = false,
         CancellationToken cancellationToken = default) =>
-        ToolInvocation.Run(() => catalog.FindCallersAsync(assemblyId, symbolId, scope, offset, limit, snapshotId, cancellationToken));
+        ToolInvocation.Run(() => catalog.FindCallersAsync(assemblyId, symbolId, scope, offset, limit, snapshotId, includeDiagnostics, cancellationToken));
 
     [McpServerTool(Name = "api_find_callees", Title = "Find static IL callees", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
     [Description("Decode the direct IL operands of an exact method symbol. Targets without an exact installed metadata definition remain unresolved references, not source IDs. Abstract, external, and runtime-provided methods have no IL body. No runtime dispatch or callback guarantee is implied.")]
@@ -32,6 +33,7 @@ public static class ApiNavigationTools
         [Description("Zero-based result offset.")] int offset = 0,
         [Description("Maximum results, 1 to 100.")] int limit = 50,
         [Description("Snapshot ID from the previous page.")] string? snapshotId = null,
+        [Description("Include the full searched-assembly list and every diagnostic; default returns counts and the first 5 diagnostics.")] bool includeDiagnostics = false,
         CancellationToken cancellationToken = default) =>
-        ToolInvocation.Run(() => catalog.FindUsagesAsync(assemblyId, symbolId, scope, offset, limit, snapshotId, cancellationToken));
+        ToolInvocation.Run(() => catalog.FindUsagesAsync(assemblyId, symbolId, scope, offset, limit, snapshotId, includeDiagnostics, cancellationToken));
 }

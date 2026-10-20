@@ -44,6 +44,8 @@ internal static class BridgeSelfTest
         VerifyStatusAndAssemblyIdentity(thunderRoad, managed);
         VerifyRuntimeValues();
         VerifyRequestTimings();
+        VerifyCoroutineObservability();
+        VerifyComponentTypeResolution();
 
         try
         {
@@ -87,7 +89,7 @@ internal static class BridgeSelfTest
             MainThreadQueue.Drain();
             Assert(!executed && queued.IsCanceled, "canceled queued work is skipped");
         }
-        Console.WriteLine("PASS: live status shape, loaded assembly MVID, arithmetic, metadata source precedence, game API metadata, runtime host reference, generic runtime retrieval and inspection, bounded runtime list, successful and failed bridge timing stages, newest bridge log page, mapped diagnostic, runtime exception, DTO serialization, pending Task rejection, and canceled queue. CLR " + Environment.Version);
+        Console.WriteLine("PASS: live status shape, loaded assembly MVID, arithmetic, metadata source precedence, game API metadata, runtime host reference, generic runtime retrieval and inspection, bounded runtime list, coroutine step and failure observability, successful and failed bridge timing stages, scene query component type resolution, newest bridge log page, mapped diagnostic, runtime exception, DTO serialization, pending Task rejection, and canceled queue. CLR " + Environment.Version);
     }
 
     private static void VerifyExampleCompilation()
@@ -435,10 +437,91 @@ internal static class BridgeSelfTest
             .SetValue(runtime, new Dictionary<string, object>(StringComparer.Ordinal));
         FieldInfo coroutines = typeof(McpRuntime).GetField("coroutines", BindingFlags.Instance | BindingFlags.NonPublic);
         coroutines.SetValue(runtime, Activator.CreateInstance(coroutines.FieldType));
+        FieldInfo recentFailures = typeof(McpRuntime).GetField("recentFailures", BindingFlags.Instance | BindingFlags.NonPublic);
+        recentFailures.SetValue(runtime, Activator.CreateInstance(recentFailures.FieldType));
         typeof(McpRuntime).GetField("mainThreadId", BindingFlags.Instance | BindingFlags.NonPublic)
             .SetValue(runtime, Thread.CurrentThread.ManagedThreadId);
         return runtime;
     }
+
+    private static IEnumerator FailingRoutine()
+    {
+        yield return null;
+        yield return null;
+        throw new InvalidOperationException("routine failed");
+    }
+
+    private static void VerifyCoroutineObservability()
+    {
+        McpRuntime runtime = CreateRuntimeForSelfTest();
+        FieldInfo coroutineField = typeof(McpRuntime).GetField("coroutines", BindingFlags.Instance | BindingFlags.NonPublic);
+        IDictionary coroutineEntries = (IDictionary)coroutineField.GetValue(runtime);
+        Type entryType = coroutineField.FieldType.GetGenericArguments()[1];
+        object failing = FormatterServices.GetUninitializedObject(entryType);
+        entryType.GetField("Routine").SetValue(failing, "Test.FailingRoutine");
+        entryType.GetField("StartedUtc").SetValue(failing, DateTime.UtcNow);
+        coroutineEntries.Add("failing", failing);
+
+        MethodInfo track = typeof(McpRuntime).GetMethod("Track", BindingFlags.Instance | BindingFlags.NonPublic);
+        IEnumerator tracked = (IEnumerator)track.Invoke(runtime, new object[] { "failing", failing, FailingRoutine() });
+        Assert(tracked.MoveNext() && tracked.MoveNext() && (int)entryType.GetField("Steps").GetValue(failing) == 2,
+            "tracked coroutine counts each yielded step");
+        try
+        {
+            tracked.MoveNext();
+            throw new Exception("Expected the tracked coroutine failure.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Assert(ex.Message == "routine failed", "tracked coroutine rethrows its failure");
+        }
+        Assert(coroutineEntries.Count == 0, "a failed coroutine leaves the managed list");
+
+        JArray failures = (JArray)JObject.Parse(BridgeRequestHandler.SerializeResult(runtime.Describe()))["recentFailures"];
+        Assert(failures.Count == 1 && (string)failures[0]["key"] == "failing" &&
+            (string)failures[0]["routine"] == "Test.FailingRoutine" && (int)failures[0]["steps"] == 2 &&
+            ((string)failures[0]["error"]).StartsWith("System.InvalidOperationException: routine failed", StringComparison.Ordinal),
+            "recent failures record the routine, step count, and exception text");
+
+        MethodInfo recordFailure = typeof(McpRuntime).GetMethod("RecordCoroutineFailure", BindingFlags.Instance | BindingFlags.NonPublic);
+        for (int index = 0; index < 20; index++)
+            recordFailure.Invoke(runtime, new object[] { "k" + index, failing, new InvalidOperationException("failure " + index) });
+        failures = (JArray)JObject.Parse(BridgeRequestHandler.SerializeResult(runtime.Describe()))["recentFailures"];
+        Assert(failures.Count == 16 && (string)failures[0]["key"] == "k4" && (string)failures[15]["key"] == "k19",
+            "recent failures keep only the newest 16");
+
+        object live = FormatterServices.GetUninitializedObject(entryType);
+        entryType.GetField("Routine").SetValue(live, "Test.LiveRoutine");
+        entryType.GetField("StartedUtc").SetValue(live, DateTime.UtcNow);
+        entryType.GetField("Steps").SetValue(live, 3);
+        coroutineEntries.Add("live", live);
+        string liveJson = BridgeRequestHandler.SerializeResult(runtime.Describe());
+        JObject listed = (JObject)((JArray)JObject.Parse(liveJson)["coroutines"])[0];
+        Assert((string)listed["key"] == "live" && (string)listed["routine"] == "Test.LiveRoutine" && (int)listed["steps"] == 3 &&
+            System.Text.RegularExpressions.Regex.IsMatch(liveJson, "\"startedAtUtc\":\"\\d{4}-\\d{2}-\\d{2}T[\\d:.]+Z\""),
+            "list reports each coroutine's routine, UTC start time, and steps");
+
+        runtime.Clear();
+        Assert(((JArray)JObject.Parse(BridgeRequestHandler.SerializeResult(runtime.Describe()))["recentFailures"]).Count == 0,
+            "clear empties the coroutine failure history");
+    }
+
+    private static void VerifyComponentTypeResolution()
+    {
+        Assert(BridgeRequestHandler.ResolveComponentType("Transform") == typeof(UnityEngine.Transform) &&
+            BridgeRequestHandler.ResolveComponentType("UnityEngine.Transform") == typeof(UnityEngine.Transform),
+            "scene query resolves simple and full Component type names");
+        try
+        {
+            BridgeRequestHandler.ResolveComponentType("NoSuchComponentXyz");
+            throw new Exception("Expected an unknown component type rejection.");
+        }
+        catch (InvalidDataException ex)
+        {
+            Assert(ex.Message.Contains("api_search"), "unknown component type points to api_search");
+        }
+    }
+
     private static void VerifyRequestTimings()
     {
         var handler = new BridgeRequestHandler(new BridgeConfig());

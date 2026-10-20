@@ -27,6 +27,8 @@ public sealed partial class BaseCatalogDataCatalog
         "on", "please", "record", "the", "to", "use", "using", "want", "what", "with",
     };
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    // Accessed only under the catalog operation gate; keyed by snapshot so a changed archive rebuilds it.
+    private (string SnapshotId, IReadOnlyDictionary<string, string> Texts)? _localizedText;
 
     public async Task<string> SearchAsync(string? query, string? catalogType, string? id, int offset, int limit,
         string? snapshotId, CancellationToken cancellationToken)
@@ -48,8 +50,14 @@ public sealed partial class BaseCatalogDataCatalog
         if (index is null)
             return await SearchUncachedAsync(opened, query, catalogType, id, offset, limit, cancellationToken);
 
+        if (catalogType is not null)
+            RequireKnownCatalogType(index, catalogType);
         var diagnostics = index.Diagnostics.ToList();
-        var results = new List<CatalogRecord>();
+        var terms = query is null ? Array.Empty<string>() : GetTaskTerms(query).Included;
+        var texts = query is null ? null : await GetLocalizedTextAsync(opened, index, diagnostics, cancellationToken);
+        var hideTextData = query is not null && catalogType is null && id is null;
+        var hiddenTextData = 0;
+        var matches = new List<(CatalogIndexedRecord Record, int Score)>();
         foreach (var member in index.Records)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -59,18 +67,31 @@ public sealed partial class BaseCatalogDataCatalog
                 continue;
             if (catalogType is not null && !MatchesType(catalogType, member.Metadata.FullType, member.Metadata.Type))
                 continue;
-            if (query is not null && !await MatchesQueryAsync(query, opened, member, cancellationToken, diagnostics))
-                continue;
-
-            results.Add(new CatalogRecord(
-                CreateEntryId(opened.SnapshotId, member.EntryIndex, member.Path),
-                member.Metadata.Id,
-                member.Metadata.Name,
-                member.Metadata.Type,
-                member.Metadata.FullType,
-                member.Path,
-                member.Size));
+            var score = 0;
+            if (query is not null)
+            {
+                score = await ScoreQueryAsync(query, terms, opened, member, texts, cancellationToken, diagnostics);
+                if (score == 0)
+                    continue;
+                if (hideTextData && IsTextData(member.Metadata))
+                {
+                    hiddenTextData++;
+                    continue;
+                }
+            }
+            matches.Add((member, score));
         }
+
+        AddTextDataDiagnostic(diagnostics, hiddenTextData);
+        // OrderByDescending is stable: equal scores, and every unranked browse, keep index order.
+        var results = matches.OrderByDescending(match => match.Score).Select(match => new CatalogRecord(
+            CreateEntryId(opened.SnapshotId, match.Record.EntryIndex, match.Record.Path),
+            match.Record.Metadata!.Id,
+            match.Record.Metadata.Name,
+            match.Record.Metadata.Type,
+            match.Record.Metadata.FullType,
+            match.Record.Path,
+            match.Record.Size)).ToList();
 
         ToolTiming.Count("catalogRecordsConsidered", index.Records.Length);
         ToolTiming.Count("catalogResultsReturned", Math.Min(limit, Math.Max(0, results.Count - offset)));
@@ -194,6 +215,7 @@ public sealed partial class BaseCatalogDataCatalog
         using var operation = await EnterCatalogOperationAsync(cancellationToken);
         await using var opened = await OpenArchiveAsync(cancellationToken);
         var index = await GetIndexAsync(opened, cancellationToken);
+        var texts = index is null ? null : await GetLocalizedTextAsync(opened, index, new List<string>(), cancellationToken);
         var candidates = new List<(CatalogIndexedRecord Record, string[] Terms)>();
         var complete = (index?.IsComplete ?? true) && omittedTerms.Length == 0;
         long recordsConsidered = index?.Records.Length ?? 0;
@@ -202,9 +224,9 @@ public sealed partial class BaseCatalogDataCatalog
             foreach (var record in index.Records)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (record.State != CatalogRecordState.Valid || record.Metadata is null)
+                if (record.State != CatalogRecordState.Valid || record.Metadata is null || IsTextData(record.Metadata))
                     continue;
-                var matches = await GetMatchedTermsAsync(terms, opened, record, cancellationToken);
+                var matches = await GetMatchedTermsAsync(terms, opened, record, texts, cancellationToken);
                 if (matches is null)
                 {
                     complete = false;
@@ -240,6 +262,8 @@ public sealed partial class BaseCatalogDataCatalog
                     ToolTiming.Count("catalogJsonParseCount", 1);
                     using var document = JsonDocument.Parse(bytes, DocumentOptions);
                     var metadata = ReadMetadata(document.RootElement);
+                    if (IsTextData(metadata))
+                        continue;
                     var record = new CatalogIndexedRecord(member.Index, member.Entry.FullName, member.Entry.Length,
                         CatalogRecordState.Valid, metadata, null);
                     var matches = GetMatchedTerms(terms, record, document.RootElement, cancellationToken);
@@ -291,7 +315,11 @@ public sealed partial class BaseCatalogDataCatalog
         int offset, int limit, CancellationToken cancellationToken)
     {
         var diagnostics = new List<string>();
-        var results = new List<CatalogRecord>();
+        var matches = new List<(CatalogRecord Record, int Score)>();
+        // ponytail: the unindexed path skips localized text; only an archive too large to index reaches it.
+        var terms = query is null ? Array.Empty<string>() : GetTaskTerms(query).Included;
+        var hideTextData = query is not null && catalogType is null && id is null;
+        var hiddenTextData = 0;
         long expandedBytes = 0;
         var catalogTruncated = false;
         long recordsConsidered = 0;
@@ -329,11 +357,23 @@ public sealed partial class BaseCatalogDataCatalog
                     continue;
                 if (catalogType is not null && !MatchesType(catalogType, metadata.FullType, metadata.Type))
                     continue;
-                if (query is not null && !MatchesQuery(query, path, metadata, document.RootElement, cancellationToken))
-                    continue;
-                results.Add(new CatalogRecord(
+                var score = 0;
+                if (query is not null)
+                {
+                    score = ScoreMetadata(query, terms, path, metadata);
+                    if (score == 0 && MatchesContent(query, terms, path, metadata, document.RootElement, cancellationToken))
+                        score = 1;
+                    if (score == 0)
+                        continue;
+                    if (hideTextData && IsTextData(metadata))
+                    {
+                        hiddenTextData++;
+                        continue;
+                    }
+                }
+                matches.Add((new CatalogRecord(
                     CreateEntryId(opened.SnapshotId, member.Index, path), metadata.Id, metadata.Name, metadata.Type,
-                    metadata.FullType, path, member.Entry.Length));
+                    metadata.FullType, path, member.Entry.Length), score));
             }
             catch (JsonException exception)
             {
@@ -344,6 +384,8 @@ public sealed partial class BaseCatalogDataCatalog
                 AddDiagnostic(diagnostics, $"Could not read JSON member {path}: {exception.Message}");
             }
         }
+        AddTextDataDiagnostic(diagnostics, hiddenTextData);
+        var results = matches.OrderByDescending(match => match.Score).Select(match => match.Record).ToList();
         ToolTiming.Count("catalogRecordsConsidered", recordsConsidered);
         ToolTiming.Count("catalogResultsReturned", Math.Min(limit, Math.Max(0, results.Count - offset)));
         if (offset > results.Count)
@@ -374,14 +416,27 @@ public sealed partial class BaseCatalogDataCatalog
         });
     }
 
-    private async Task<bool> MatchesQueryAsync(string query, OpenedArchive opened, CatalogIndexedRecord record,
-        CancellationToken cancellationToken, List<string> diagnostics)
+    // Ranking tiers: 4 = ID or name equals the query; 3 = path, ID, or name contains it; 2 = path, ID, and name
+    // together contain every word of a multi-word query; 1 = a string (or the record's localized text) contains
+    // the phrase, or every word appears somewhere in the record; 0 = no match.
+    private async Task<int> ScoreQueryAsync(string query, string[] terms, OpenedArchive opened, CatalogIndexedRecord record,
+        IReadOnlyDictionary<string, string>? texts, CancellationToken cancellationToken, List<string> diagnostics)
     {
         var metadata = record.Metadata!;
-        if (MatchesQueryPrefix(query, record.Path, metadata))
-            return true;
+        var score = ScoreMetadata(query, terms, record.Path, metadata);
+        if (score > 0)
+            return score;
         if (record.SearchableStrings is not null)
-            return record.SearchableStrings.Any(value => value.Contains(query, StringComparison.OrdinalIgnoreCase));
+        {
+            var values = WithLocalizedText(record, record.SearchableStrings, texts);
+            if (values.Any(value => value.Contains(query, StringComparison.OrdinalIgnoreCase)))
+                return 1;
+            if (terms.Length < 2)
+                return 0;
+            var matched = SeedMatchedTerms(terms, record.Path, metadata);
+            MatchTerms(values, terms, matched, cancellationToken);
+            return matched.All(value => value) ? 1 : 0;
+        }
 
         try
         {
@@ -389,7 +444,8 @@ public sealed partial class BaseCatalogDataCatalog
             ToolTiming.Count("catalogJsonParseCount", 1);
             ToolTiming.Count("catalogSearchFallbackParses", 1);
             using var document = JsonDocument.Parse(bytes, DocumentOptions);
-            return ContainsStringValue(document.RootElement, query, cancellationToken);
+            // ponytail: oversize records skip localized text; cache their {Id} tokens if this matters
+            return MatchesContent(query, terms, record.Path, metadata, document.RootElement, cancellationToken) ? 1 : 0;
         }
         catch (JsonException exception)
         {
@@ -399,11 +455,110 @@ public sealed partial class BaseCatalogDataCatalog
         {
             AddDiagnostic(diagnostics, $"Could not read JSON member {record.Path}: {exception.Message}");
         }
-        return false;
+        return 0;
+    }
+
+    private static int ScoreMetadata(string query, string[] terms, string path, CatalogMetadata metadata)
+    {
+        if (string.Equals(metadata.Id, query, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(metadata.Name, query, StringComparison.OrdinalIgnoreCase))
+            return 4;
+        if (MatchesQueryPrefix(query, path, metadata))
+            return 3;
+        return terms.Length >= 2 && terms.All(term => MatchesQueryPrefix(term, path, metadata)) ? 2 : 0;
+    }
+
+    private static bool[] SeedMatchedTerms(string[] terms, string path, CatalogMetadata metadata) =>
+        terms.Select(term => MatchesQueryPrefix(term, path, metadata)).ToArray();
+
+    private static bool MatchesContent(string query, string[] terms, string path, CatalogMetadata metadata, JsonElement root,
+        CancellationToken cancellationToken)
+    {
+        if (ContainsStringValue(root, query, cancellationToken))
+            return true;
+        if (terms.Length < 2)
+            return false;
+        var matched = SeedMatchedTerms(terms, path, metadata);
+        MatchTerms(root, terms, matched, cancellationToken);
+        return matched.All(value => value);
+    }
+
+    private async Task<IReadOnlyDictionary<string, string>> GetLocalizedTextAsync(OpenedArchive opened, CatalogIndex index,
+        List<string> diagnostics, CancellationToken cancellationToken)
+    {
+        if (_localizedText is { } cached && cached.SnapshotId == opened.SnapshotId)
+            return cached.Texts;
+        var texts = new Dictionary<string, string>(StringComparer.Ordinal);
+        var english = index.Records.FirstOrDefault(record => record.State == CatalogRecordState.Valid &&
+            record.Metadata is { } metadata && IsTextData(metadata) &&
+            string.Equals(metadata.Id, "English", StringComparison.OrdinalIgnoreCase));
+        if (english is not null)
+        {
+            try
+            {
+                var bytes = await ReadMemberBytesAsync(opened.GetArchive().Entries[english.EntryIndex], cancellationToken);
+                ToolTiming.Count("catalogJsonParseCount", 1);
+                using var document = JsonDocument.Parse(bytes, DocumentOptions);
+                AddLocalizedTexts(texts, document.RootElement);
+            }
+            catch (Exception exception) when (exception is JsonException or IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                // ponytail: a failed read is cached as an empty map for this snapshot and reported once.
+                AddDiagnostic(diagnostics, $"Could not read English TextData for localized search: {exception.Message}");
+            }
+        }
+        _localizedText = (opened.SnapshotId, texts);
+        return texts;
+    }
+
+    // Keys: "{TextId}" for textGroups[].texts[] (duplicate IDs are concatenated) and "item:{ItemId}" for items[].
+    private static void AddLocalizedTexts(Dictionary<string, string> texts, JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object)
+            return;
+        if (root.TryGetProperty("textGroups", out var textGroups) && textGroups.ValueKind == JsonValueKind.Array)
+            foreach (var textGroup in textGroups.EnumerateArray())
+                if (textGroup.ValueKind == JsonValueKind.Object && textGroup.TryGetProperty("texts", out var entries) &&
+                    entries.ValueKind == JsonValueKind.Array)
+                    foreach (var entry in entries.EnumerateArray())
+                        if (StringProperty(entry, "id") is { } textId && StringProperty(entry, "text") is { } text)
+                            Add("{" + textId + "}", text);
+        if (root.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+            foreach (var item in items.EnumerateArray())
+            {
+                var itemText = string.Join(' ', new[] { StringProperty(item, "name"), StringProperty(item, "description") }
+                    .Where(part => !string.IsNullOrEmpty(part)));
+                if (StringProperty(item, "id") is { } itemId && itemText.Length > 0)
+                    Add("item:" + itemId, itemText);
+            }
+
+        void Add(string key, string value) =>
+            texts[key] = texts.TryGetValue(key, out var existing) ? existing + " " + value : value;
+    }
+
+    private static string? StringProperty(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) &&
+        value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
+    // Yields the record's strings, then the English text behind each "{Token}" string and, for ItemData, behind its ID.
+    private static IEnumerable<string> WithLocalizedText(CatalogIndexedRecord record, string[] values,
+        IReadOnlyDictionary<string, string>? texts)
+    {
+        foreach (var value in values)
+        {
+            yield return value;
+            if (texts is not null && value.Length > 2 && value[0] == '{' && value[^1] == '}' &&
+                texts.TryGetValue(value, out var text))
+                yield return text;
+        }
+        if (texts is not null && record.Metadata is { Id: { } id } metadata &&
+            string.Equals(metadata.Type, "ItemData", StringComparison.OrdinalIgnoreCase) &&
+            texts.TryGetValue("item:" + id, out var itemText))
+            yield return itemText;
     }
 
     private async Task<string[]?> GetMatchedTermsAsync(string[] terms, OpenedArchive opened, CatalogIndexedRecord record,
-        CancellationToken cancellationToken)
+        IReadOnlyDictionary<string, string>? texts, CancellationToken cancellationToken)
     {
         if (terms.Length == 0)
             return Array.Empty<string>();
@@ -413,7 +568,7 @@ public sealed partial class BaseCatalogDataCatalog
             matched[index] = MatchesQueryPrefix(terms[index], record.Path, metadata);
         if (record.SearchableStrings is not null)
         {
-            MatchTerms(record.SearchableStrings, terms, matched, cancellationToken);
+            MatchTerms(WithLocalizedText(record, record.SearchableStrings, texts), terms, matched, cancellationToken);
         }
         else if (matched.Any(value => !value))
         {
@@ -626,9 +781,32 @@ public sealed partial class BaseCatalogDataCatalog
         string.Equals(requested, fullType, StringComparison.OrdinalIgnoreCase) ||
         string.Equals(requested, fullType?.Split(',', 2)[0].Trim(), StringComparison.OrdinalIgnoreCase);
 
-    private static bool MatchesQuery(string query, string path, CatalogMetadata metadata, JsonElement root,
-        CancellationToken cancellationToken) =>
-        MatchesQueryPrefix(query, path, metadata) || ContainsStringValue(root, query, cancellationToken);
+    private static void RequireKnownCatalogType(CatalogIndex index, string catalogType)
+    {
+        if (index.Records.Any(record => record.State == CatalogRecordState.Valid && record.Metadata is { } metadata &&
+                                        MatchesType(catalogType, metadata.FullType, metadata.Type)))
+            return;
+        var known = index.Records
+            .Where(record => record.State == CatalogRecordState.Valid && record.Metadata?.Type is not null)
+            .Select(record => record.Metadata!.Type!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var similar = known.Where(type => type.Contains(catalogType, StringComparison.OrdinalIgnoreCase)).Take(20).ToArray();
+        var listing = similar.Length > 0
+            ? "Known types containing it: " + string.Join(", ", similar)
+            : "Known types: " + string.Join(", ", known.Take(20));
+        throw new ArgumentException($"catalogType '{catalogType}' matches no catalog records. {listing}.", nameof(catalogType));
+    }
+
+    private static bool IsTextData(CatalogMetadata metadata) =>
+        string.Equals(metadata.Type, "TextData", StringComparison.OrdinalIgnoreCase);
+
+    private static void AddTextDataDiagnostic(List<string> diagnostics, int hidden)
+    {
+        if (hidden > 0)
+            AddDiagnostic(diagnostics, $"{hidden} TextData record(s) matched but are excluded by default; their English text is searched through the records that reference it. Pass catalogType=\"TextData\" to search text tables directly.");
+    }
 
     private static bool ContainsStringValue(JsonElement element, string query, CancellationToken cancellationToken)
     {

@@ -440,6 +440,10 @@ try
             "game_spawn_item accepts explicit coordinates, a generated key, and the default despawn policy");
     Assert(IsError(await ToolAsync("game_spawn_item", new { itemId = "CrystalBlank", x = 1 })), "game_spawn_item requires all coordinates");
     Assert(IsError(await ToolAsync("game_spawn_item", new { itemId = "" })), "game_spawn_item validates the item id");
+    Assert(IsError(await ToolAsync("evaluate_csharp", new { code = "return 1;", timeoutMs = 120000 })), "evaluate_csharp rejects timeoutMs above the bridge limit");
+    Assert(IsError(await ToolAsync("game_find_objects", new { componentType = "Transform", includeFields = true, limit = 11 })), "game_find_objects bounds limit when fields are included");
+    Assert(IsError(await ToolAsync("catalog_search", new { recordType = "SpellData" })), "unknown tool arguments are rejected");
+    DiscoveryImprovementsCheck.RunRanking();
 
     using (var listedRuntime = await ApiToolJsonAsync("game_runtime", new { action = "list" }))
         Assert(listedRuntime.RootElement.GetProperty("coroutineCount").GetInt32() == 1 &&
@@ -723,7 +727,7 @@ async Task CheckApiToolsAsync()
     using var list = await CallAsync("tools/list", new { });
     var toolNames = list.RootElement.GetProperty("result").GetProperty("tools")
         .EnumerateArray().Select(tool => tool.GetProperty("name").GetString() ?? "").ToHashSet(StringComparer.Ordinal);
-    foreach (var toolName in new[] { "game_installations", "game_status", "game_guide", "game_launch", "game_wait_ready", "game_load_level", "game_spawn_item", "game_runtime", "game_install_mod", "game_stop", "game_restart", "game_logs", "evaluate_csharp", "api_assemblies", "api_search", "api_type", "api_decompile", "api_decompile_batch", "api_find_callers", "api_find_callees", "api_find_usages", "api_lookup", "catalog_search", "catalog_read" })
+    foreach (var toolName in new[] { "game_installations", "game_status", "game_guide", "game_launch", "game_wait_ready", "game_load_level", "game_spawn_item", "game_spawn_creature", "game_spawn_effect", "game_find_objects", "game_runtime", "game_install_mod", "game_stop", "game_restart", "game_logs", "evaluate_csharp", "api_assemblies", "api_search", "api_type", "api_decompile", "api_decompile_batch", "api_find_callers", "api_find_callees", "api_find_usages", "api_lookup", "catalog_search", "catalog_read" })
         Assert(toolNames.Contains(toolName), $"{toolName} is exposed through tools/list");
     var toolDefinitions = list.RootElement.GetProperty("result").GetProperty("tools").EnumerateArray()
         .ToDictionary(tool => tool.GetProperty("name").GetString()!, tool => tool, StringComparer.Ordinal);
@@ -739,6 +743,8 @@ async Task CheckApiToolsAsync()
     Assert(IsReadOnlyTool(toolDefinitions["api_lookup"]), "api_lookup is read-only");
     Assert(!IsReadOnlyTool(toolDefinitions["game_load_level"]) &&
            !IsReadOnlyTool(toolDefinitions["game_spawn_item"]) &&
+           !IsReadOnlyTool(toolDefinitions["game_spawn_creature"]) &&
+           !IsReadOnlyTool(toolDefinitions["game_spawn_effect"]) &&
            !IsReadOnlyTool(toolDefinitions["game_runtime"]),
         "level, spawn, and runtime tools are not read-only");
 

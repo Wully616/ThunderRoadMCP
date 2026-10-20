@@ -64,75 +64,12 @@ return new { available = true, position = player.head.transform.position };",
         Example(
             "creature.spawn",
             "Spawn a configured creature near the player",
-            "csharp",
-            @"var player = Player.local;
-if (player == null || player.head == null) return new { requested = false, reason = ""no local player"" };
-var data = Catalog.GetData<CreatureData>(""<CreatureData id>"");
-if (data == null) return new { requested = false, reason = ""CreatureData id not found"" };
-var runtime = McpRuntime.Current;
-const string creatureKey = ""demo.creature"";
-const string requestKey = ""demo.creature.request"";
-const string timeoutKey = ""demo.creature.timeout"";
-if (runtime.Get<object>(requestKey) != null)
-    return new { requested = false, reason = ""spawn already pending"" };
-Creature previous = runtime.Get<Creature>(creatureKey);
-if (previous != null) previous.Despawn();
-runtime.Remove(creatureKey);
-object request = new object();
-runtime.Set(requestKey, request);
-try
-{
-    runtime.StartManagedCoroutine(timeoutKey, ExpireRequest());
-    data.SpawnAsync(
-        player.head.transform.position + player.head.transform.forward * 2f,
-        player.head.transform.eulerAngles.y,
-        null,
-        true,
-        null,
-        creature =>
-        {
-            if (!runtime.TryGet<object>(requestKey, out object activeRequest) || !ReferenceEquals(activeRequest, request))
-            {
-                if (creature != null) creature.Despawn();
-                return;
-            }
-            runtime.Remove(requestKey);
-            runtime.StopManagedCoroutine(timeoutKey);
-            if (creature != null) runtime.Set(creatureKey, creature);
-        });
-}
-catch
-{
-    runtime.Remove(requestKey);
-    runtime.StopManagedCoroutine(timeoutKey);
-    throw;
-}
-return new { requested = true, key = creatureKey };
-
-System.Collections.IEnumerator ExpireRequest()
-{
-    for (int frame = 0; frame < 300; frame++)
-    {
-        if (!runtime.TryGet<object>(requestKey, out object activeRequest) || !ReferenceEquals(activeRequest, request))
-            yield break;
-        yield return null;
-    }
-    if (runtime.TryGet<object>(requestKey, out object expiredRequest) && ReferenceEquals(expiredRequest, request))
-        runtime.Remove(requestKey);
-}",
-            "Installed Blade & Sorcery 1.3.2 ThunderRoad.dll metadata: public CreatureData.SpawnAsync(Vector3, Single, Transform, Boolean, WayPoint[], Action<Creature>) calls ConfigCreature before its callback. asm_FB4AFDCA51764E3CAC303D71A457ED86, sym_51831887BF24B494F2EA8C54F2E9B7C7, MVID 7c3f68b0-6dd9-431c-b97d-3ea4fdbc55ec; the selected installation identity must be re-resolved by api_lookup.",
-            new[] { "ThunderRoad.Catalog.GetData<T>", "ThunderRoad.Player.local", "ThunderRoad.Player.head", "ThunderRoad.CreatureData.SpawnAsync", "ThunderRoad.Creature.Despawn", "ThunderRoadMcp.Bridge.McpRuntime.Set", "ThunderRoadMcp.Bridge.McpRuntime.Get<T>", "ThunderRoadMcp.Bridge.McpRuntime.TryGet<T>", "ThunderRoadMcp.Bridge.McpRuntime.Remove", "ThunderRoadMcp.Bridge.McpRuntime.StartManagedCoroutine", "ThunderRoadMcp.Bridge.McpRuntime.StopManagedCoroutine" },
-            new[] { "A ready game bridge, a local player with a head, and a CreatureData id resolved through catalog_search(catalogType=\"CreatureData\"). Spawn completion is asynchronous; the callback is not guaranteed if the game content is inactive. The 300-frame expiry releases pending state; cleanup despawns completed creatures and a late callback despawns its result." },
-            new[] { @"var runtime = McpRuntime.Current;
-const string creatureKey = ""demo.creature"";
-const string requestKey = ""demo.creature.request"";
-const string timeoutKey = ""demo.creature.timeout"";
-runtime.StopManagedCoroutine(timeoutKey);
-Creature creature = runtime.Get<Creature>(creatureKey);
-runtime.Remove(requestKey);
-if (creature != null) creature.Despawn();
-runtime.Remove(creatureKey);
-return new { cleaned = true, hadCreature = creature != null };" }),
+            "mcp",
+            "game_spawn_creature(creatureId: \"<CreatureData id>\", key: \"demo-creature\")",
+            "ThunderRoadMcp.Bridge.BridgeRequestHandler resolves Catalog.GetData<CreatureData> and calls CreatureData.SpawnAsync(Vector3 position, float rotationY, Transform parent = null, bool pooled = true, WayPoint[] waypoints = null, Action<Creature> callback = null) on a bridge-managed coroutine; no custom C# spawn code is needed.",
+            new[] { "ThunderRoad.Catalog.GetData<ThunderRoad.CreatureData>", "ThunderRoad.CreatureData.SpawnAsync", "ThunderRoad.Creature.Despawn", "ThunderRoadMcp.Bridge.McpRuntime.StartManagedCoroutine" },
+            new[] { "A ready game bridge and a CreatureData id from catalog_search(catalogType=\"CreatureData\")." },
+            new[] { "Use evaluate_csharp: var creature = McpRuntime.Current.Get<Creature>(\"demo-creature\"); if (creature != null) creature.Despawn(); McpRuntime.Current.Remove(\"demo-creature\"); game_runtime(action:\"clear\") only drops references." }),
         Example(
             "runtime.counter",
             "Store and inspect a runtime counter",
@@ -162,6 +99,22 @@ System.Collections.IEnumerator CountFrames()
             new[] { "ThunderRoadMcp.Bridge.McpRuntime.StartManagedCoroutine", "UnityEngine.MonoBehaviour.StartCoroutine" },
             new[] { "A ready bridge and an unused runtime coroutine key." },
             new[] { "return new { stopped = McpRuntime.Current.StopManagedCoroutine(\"demo.frames\") };" }),
+        Example(
+            "eval.helper",
+            "Reuse a stored helper delegate across evaluations",
+            "csharp",
+            @"var runtime = McpRuntime.Current;
+const string key = ""demo.helper.distance"";
+Func<Creature, float> distanceToPlayer = creature =>
+    creature == null || Player.local == null || Player.local.head == null
+        ? -1f
+        : Vector3.Distance(Player.local.head.transform.position, creature.transform.position);
+runtime.Set(key, distanceToPlayer);
+return new { stored = key, usage = ""McpRuntime.Current.Get<Func<Creature, float>>(\""demo.helper.distance\"")(creature)"" };",
+            "McpRuntime stores any object, including delegates; evaluation assemblies stay loaded for the process lifetime, so a stored delegate stays callable from later evaluate_csharp calls without resending its code.",
+            new[] { "ThunderRoadMcp.Bridge.McpRuntime.Set", "ThunderRoadMcp.Bridge.McpRuntime.Get<T>" },
+            new[] { "A ready bridge. Re-store the helper after changing its code; keys are process-local." },
+            new[] { "return new { removed = McpRuntime.Current.Remove(\"demo.helper.distance\") };" }),
         Example(
             "unity.scene-event",
             "Subscribe once and explicitly unsubscribe a Unity scene event",

@@ -11,7 +11,7 @@ public static class BaseCatalogDataTools
     [McpServerTool(Name = "catalog_search", Title = "Search shipped game catalog data", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
     [Description("Browse the shipped bas.jsondb by query, record type, or ID. Results are deterministic and paged; carry snapshotId and nextOffset to continue and use entryId with catalog_read. Records with a usable $type name include an apiLookup query for api_lookup(kind=type). The archive is read-only. " + ModGuidance)]
     public static Task<CallToolResult> CatalogSearch(BaseCatalogDataCatalog catalog,
-        [Description("Optional case-insensitive search over record strings, IDs, names, and archive paths.")] string? query = null,
+        [Description("Optional case-insensitive search. Matches the phrase or all of its words across record strings, IDs, names, paths, and the record's English display text; results are ranked by ID/name matches first. TextData tables are excluded unless catalogType=TextData or id is given.")] string? query = null,
         [Description("Optional catalog record type filter, such as LevelData or ItemData.")] string? catalogType = null,
         [Description("Optional case-insensitive record ID filter.")] string? id = null,
         [Description("Zero-based result offset.")] int offset = 0,

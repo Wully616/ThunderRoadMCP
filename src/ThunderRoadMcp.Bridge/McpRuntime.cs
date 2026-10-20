@@ -14,15 +14,30 @@ namespace ThunderRoadMcp.Bridge
     {
         public const int MaxKeyLength = 128;
         public const int MaxEntries = 128;
+        private const int MaxRecentFailures = 16;
 
         private sealed class ManagedCoroutine
         {
             public Coroutine Handle;
+            public string Routine;
+            public DateTime StartedUtc;
+            public int Steps;
+        }
+
+        private sealed class CoroutineFailure
+        {
+            public string key { get; set; }
+            public string routine { get; set; }
+            public string error { get; set; }
+            public int steps { get; set; }
+            public string startedAtUtc { get; set; }
+            public string failedAtUtc { get; set; }
         }
 
         private static McpRuntime current;
         private readonly Dictionary<string, ManagedCoroutine> coroutines = new Dictionary<string, ManagedCoroutine>(StringComparer.Ordinal);
         private readonly Dictionary<string, object> values = new Dictionary<string, object>(StringComparer.Ordinal);
+        private readonly Queue<CoroutineFailure> recentFailures = new Queue<CoroutineFailure>();
         private int mainThreadId;
 
         /// <summary>Null before the bridge starts and after it stops, including after the host object is destroyed.</summary>
@@ -76,7 +91,11 @@ namespace ThunderRoadMcp.Bridge
                 throw new InvalidOperationException("McpRuntime supports at most " + MaxEntries + " managed coroutines.");
             }
 
-            var entry = new ManagedCoroutine();
+            var entry = new ManagedCoroutine
+            {
+                Routine = BoundedText(routine.GetType().FullName, MaxTypeNameLength, out _),
+                StartedUtc = DateTime.UtcNow
+            };
             coroutines.Add(key, entry);
             try
             {
@@ -181,7 +200,7 @@ namespace ThunderRoadMcp.Bridge
         private const int MaxCollectionElementTextLength = 64;
         private const long MaxJsonSafeInteger = 9007199254740991L;
 
-        private static object DescribeValue(object value, int maxStringLength, bool includeCollections)
+        internal static object DescribeValue(object value, int maxStringLength, bool includeCollections)
         {
             if (ReferenceEquals(value, null))
                 return new { kind = "null" };
@@ -368,7 +387,7 @@ namespace ThunderRoadMcp.Bridge
             return values.Remove(key);
         }
 
-        /// <summary>Keys, runtime types, and safe bounded value summaries.</summary>
+        /// <summary>Keys, runtime types, safe bounded value summaries, and recent coroutine failures.</summary>
         public object Describe()
         {
             EnsureMainThread();
@@ -381,6 +400,10 @@ namespace ThunderRoadMcp.Bridge
             var describedObjects = new List<object>(objectKeys.Count);
             // Reserve space for the root object, counts, flags, and array delimiters.
             int remaining = BridgeRequestHandler.MaxLineBytes - 512 - 1024;
+            // Failures are always listed in full, so their estimated size comes off the budget first.
+            CoroutineFailure[] failures = recentFailures.ToArray();
+            foreach (CoroutineFailure failure in failures)
+                remaining -= EstimateListEntryLength(failure.key, failure.routine) + JsonStringLength(failure.error);
             bool coroutinesTruncated = false;
             bool objectsTruncated = false;
             string coroutineType = typeof(Coroutine).FullName;
@@ -390,10 +413,18 @@ namespace ThunderRoadMcp.Bridge
                 if (index < coroutineKeys.Count)
                 {
                     string key = coroutineKeys[index];
-                    int size = EstimateListEntryLength(key, coroutineType);
+                    ManagedCoroutine entry = coroutines[key];
+                    int size = EstimateListEntryLength(key, coroutineType) + JsonStringLength(entry.Routine) + 96;
                     if (size <= remaining)
                     {
-                        describedCoroutines.Add(new { key, type = coroutineType });
+                        describedCoroutines.Add(new
+                        {
+                            key,
+                            type = coroutineType,
+                            routine = entry.Routine,
+                            startedAtUtc = entry.StartedUtc.ToString("o"),
+                            steps = entry.Steps
+                        });
                         remaining -= size;
                     }
                     else
@@ -427,6 +458,7 @@ namespace ThunderRoadMcp.Bridge
                 objectCount = objectKeys.Count,
                 coroutinesTruncated,
                 objectsTruncated,
+                recentFailures = failures,
             };
         }
 
@@ -458,7 +490,7 @@ namespace ThunderRoadMcp.Bridge
         private const int MaxTypeNameLength = 128;
         private const string TruncationMarker = "…[truncated]";
 
-        private static string BoundedText(string value, int maxLength, out bool truncated)
+        internal static string BoundedText(string value, int maxLength, out bool truncated)
         {
             truncated = value.Length > maxLength;
             if (!truncated) return value;
@@ -481,6 +513,7 @@ namespace ThunderRoadMcp.Bridge
             finally
             {
                 values.Clear();
+                recentFailures.Clear();
             }
         }
 
@@ -488,14 +521,43 @@ namespace ThunderRoadMcp.Bridge
         {
             try
             {
-                while (routine.MoveNext())
+                while (true)
+                {
+                    bool moved;
+                    try
+                    {
+                        moved = routine.MoveNext();
+                    }
+                    catch (Exception exception)
+                    {
+                        RecordCoroutineFailure(key, entry, exception);
+                        throw;
+                    }
+                    if (!moved) break;
+                    entry.Steps++;
                     yield return routine.Current;
+                }
             }
             finally
             {
                 if (coroutines.TryGetValue(key, out ManagedCoroutine tracked) && ReferenceEquals(tracked, entry))
                     coroutines.Remove(key);
             }
+        }
+
+        private void RecordCoroutineFailure(string key, ManagedCoroutine entry, Exception exception)
+        {
+            recentFailures.Enqueue(new CoroutineFailure
+            {
+                key = key,
+                routine = entry.Routine,
+                error = BoundedText(exception.GetType().FullName + ": " + exception.Message, 256, out _),
+                steps = entry.Steps,
+                startedAtUtc = entry.StartedUtc.ToString("o"),
+                failedAtUtc = DateTime.UtcNow.ToString("o")
+            });
+            while (recentFailures.Count > MaxRecentFailures)
+                recentFailures.Dequeue();
         }
 
         private void EnsureMainThread()

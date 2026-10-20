@@ -825,7 +825,6 @@ public sealed partial class InstalledApiCatalog
             if (source.Length > MaxDecompiledChars)
                 throw new InvalidOperationException($"Reconstructed source exceeds the {MaxDecompiledChars} character safety limit; select a smaller member.");
             AddWarnings(warnings, resolver.Warnings);
-            AddWarnings(snapshot.Diagnostics, resolver.Warnings.Select(w => $"{entry.Origin}/{entry.RelativePath}: {w}"));
             var normalized = source.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
             var starts = new List<int> { 0 };
             var totalLines = 1;

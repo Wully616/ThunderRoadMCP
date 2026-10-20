@@ -26,11 +26,12 @@ public static class ApiDiscoveryTools
         ToolInvocation.Run(() => catalog.AssembliesAsync(name, origin, offset, limit, snapshotId, cancellationToken));
 
     [McpServerTool(Name = "api_search", Title = "Search installed game APIs", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-    [Description("Search installed type and member names; public results are the default. By default, mod results are limited to assemblies reported loaded by the game bridge and exclude underscore-prefixed mod directories. Set includeUnloadedMods=true to search installed mod DLLs regardless of load state or when offline. Use api_lookup to combine an unambiguous search hit with paged source; otherwise use the returned assemblyId and symbolId with api_type or api_decompile. Carry snapshotId and nextOffset for remaining pages. This reads metadata and does not execute game code.")]
+    [Description("Search installed type and member names; public results are the default. Results are ranked: exact simple name, exact qualified name, name prefix, name substring, then qualified-name matches; types precede members and game assemblies precede mods within a rank. By default, mod results are limited to assemblies reported loaded by the game bridge and exclude underscore-prefixed mod directories. Set includeUnloadedMods=true to search installed mod DLLs regardless of load state or when offline. Use api_lookup to combine an unambiguous search hit with paged source; otherwise use the returned assemblyId and symbolId with api_type or api_decompile. Carry snapshotId and nextOffset for remaining pages. This reads metadata and does not execute game code.")]
     public static Task<CallToolResult> ApiSearch(InstalledApiCatalog catalog, GameProcess gameProcess,
         [Description("Case-insensitive type, member, or qualified-name search text.")] string query,
         [Description("Restrict search to an assemblyId returned by api_assemblies.")] string? assemblyId = null,
         [Description("Optional result kind, such as type, method, property, or field.")] string? kind = null,
+        [Description("Optional origin filter: game or mod.")] string? origin = null,
         [Description("Include non-public declarations only when implementation details are needed.")] bool includeNonPublic = false,
         [Description("Include installed mod DLLs regardless of load state, including underscore-prefixed folders.")] bool includeUnloadedMods = false,
         [Description("Zero-based result offset.")] int offset = 0,
@@ -76,21 +77,23 @@ public static class ApiDiscoveryTools
                 loadedModAssemblies = loaded;
             }
             return await catalog.SearchAsync(query, assemblyId, kind, includeNonPublic, offset, limit, snapshotId,
-                cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic);
+                cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic, origin);
         });
 
     [McpServerTool(Name = "api_type", Title = "Inspect an installed API type", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-    [Description("Inspect a discovered type's declaration, bases, interfaces, generic constraints, and paged members. Use the type symbolId and assemblyId from api_search; inherited members report their declaring assembly and type. Carry snapshotId and nextOffset to continue.")]
+    [Description("Inspect a discovered type's declaration, bases, interfaces, generic constraints, and paged members. Use the type symbolId and assemblyId from api_search; inherited members report their declaring assembly and type. Carry snapshotId and nextOffset to continue. Members omit fields identical to the type's own provenance; inherited members from other assemblies keep assemblyId and declaringType.")]
     public static Task<CallToolResult> ApiType(InstalledApiCatalog catalog,
         [Description("Assembly identifier returned by api_search.")] string assemblyId,
         [Description("Type symbolId returned by api_search.")] string typeSymbolId,
         [Description("Include public inherited members and their declaring types.")] bool includeInherited = false,
         [Description("Include non-public declarations only when needed.")] bool includeNonPublic = false,
+        [Description("Optional case-insensitive member-name substring filter.")] string? name = null,
+        [Description("Optional member kind: constructor, method, field, property, or event.")] string? kind = null,
         [Description("Zero-based member offset.")] int offset = 0,
         [Description("Maximum members in this page.")] int limit = 100,
         [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
         CancellationToken cancellationToken = default) =>
-        ToolInvocation.Run(() => catalog.TypeAsync(assemblyId, typeSymbolId, includeInherited, includeNonPublic, offset, limit, snapshotId, cancellationToken));
+        ToolInvocation.Run(() => catalog.TypeAsync(assemblyId, typeSymbolId, includeInherited, includeNonPublic, name, kind, offset, limit, snapshotId, cancellationToken));
 [McpServerTool(Name = "api_lookup", Title = "Find an installed API for a task", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
 [Description("Recommended first discovery tool. A natural-language query defaults to ranked task mode: it returns metadata-only declarations, bounded signatures/type context, related catalog records, and evidence-labelled examples without eager decompilation. Use mode=\"symbol\" for the legacy exact-symbol/source lookup, or pass exact assemblyId and symbolId to receive its source directly. Task mode never executes installed code; its executionContract explains the separate evaluator constraints. Continuations are bound to the exact query, options, ranking version, and full installed snapshot.")]
 public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCatalogDataCatalog baseCatalog,

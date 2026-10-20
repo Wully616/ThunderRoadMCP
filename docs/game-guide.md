@@ -57,6 +57,7 @@ Every `evaluate_csharp` call compiles a fresh assembly and runs its body synchro
 - `McpRuntime.Current.StopManagedCoroutine("key")` stops that coroutine.
 - `McpRuntime.Current.Set("key", value)`, `Get<T>("key")`/`TryGet<T>("key", out value)` are reference-type retrieval APIs; `Get<T>` returns `default(T)` for a missing or mismatched key, and `TryGet<T>` reports whether a compatible value (including stored null) exists. Value types use the distinct `GetValue<T>`/`TryGetValue<T>` APIs, for example `TryGetValue<int>("counter", out count)` distinguishes stored zero from absence or mismatch.
 - `game_runtime(action:"list")` lists managed keys, types, and bounded summaries; `action:"inspect"` requires a key and returns a detached DTO without compiling C#. It preserves booleans, strings, numeric primitives, enums, common Unity vectors/quaternions/colors, and exact bounded one-dimensional arrays or `List<T>` of supported scalar/value elements. Collections include at most 16 elements. Large integers/decimal and non-finite floating-point values use labeled strings where JSON consumers could lose fidelity. Unity objects include a destroyed flag; arbitrary objects remain opaque. Inspection invokes no user getters or enumerators and runs on Unity's main thread. The complete result fits the 64 KiB UTF-8 bridge limit.
+- `list` also reports each managed coroutine's `routine` (the iterator's type name), `startedAtUtc`, and `steps` (how many times it has yielded), so bridge-started work such as an in-flight `spawn-<guid>` coroutine is visible. `recentFailures` holds the last 16 exceptions thrown by managed coroutines as `{key,routine,error,steps,startedAtUtc,failedAtUtc}`. A routine that throws is removed from `coroutines`, so check `recentFailures` (and `game_logs(source:"bridge")`) when a coroutine disappears. `clear` empties the failure history.
 - `game_runtime(action:"stop", key:"key")` stops one managed coroutine and returns `{action,key,stopped}`. `key` is required; omitting it is a validation error and stops nothing.
 - `game_runtime(action:"clear")` stops all managed coroutines and clears stored object references, returning `{action:"clear",cleared:true}`. Use it before reusing keys or after a level change.
 
@@ -91,6 +92,39 @@ runtime.Remove(key);
 return new { unsubscribed = handler != null };
 ```
 
+Reusable helpers: `McpRuntime` stores any object, including delegates, and every evaluation assembly stays loaded until the game process restarts, so a delegate stored by one `evaluate_csharp` call stays callable from later calls without resending its code. Keys are process-local: a stored delegate survives level loads but not `game_runtime(action:"clear")` or a game restart, and it must be stored again after its code changes.
+
+```csharp
+var runtime = McpRuntime.Current;
+const string key = "demo.helper.distance";
+Func<Creature, float> distanceToPlayer = creature =>
+    creature == null || Player.local == null || Player.local.head == null
+        ? -1f
+        : Vector3.Distance(Player.local.head.transform.position, creature.transform.position);
+runtime.Set(key, distanceToPlayer);
+return new { stored = key, usage = "McpRuntime.Current.Get<Func<Creature, float>>(\"demo.helper.distance\")(creature)" };
+```
+
+Call it from a later eval with `McpRuntime.Current.Get<Func<Creature, float>>("demo.helper.distance")(creature)` and remove it with `McpRuntime.Current.Remove("demo.helper.distance")`.
+
+## Finding live objects
+
+`game_find_objects(componentType, name?, includeInactive?, includeFields?, offset?, limit?)` is a read-only scene query. It lists loaded `UnityEngine.Component` instances of one type, so you can locate a `LightningStriker`, a creature's `Brain`, or a named GameObject without writing an `evaluate_csharp` scan first. It needs a ready bridge; an older bridge without it returns a redeploy-the-bridge error.
+
+```text
+game_find_objects(componentType: "LightningStriker")
+game_find_objects(componentType: "Locomotion", includeFields: true, limit: 3)
+game_find_objects(componentType: "Transform", name: "Arena", includeInactive: true)
+```
+
+- `componentType` is a simple name (`LightningStriker`) or a full name (`ThunderRoad.Creature`) of a loaded `UnityEngine.Component` type. An unknown name is an error that points at `api_search(query, kind:"type")`, and an ambiguous simple name lists the full names to choose from. Use `Transform` with `name` to find GameObjects by name.
+- `name` is an optional case-insensitive substring of the GameObject name. `includeInactive` (default false) also searches inactive GameObjects.
+- Results are ordered by instance id and paged: `offset` is 0 to 100000, and `limit` defaults to 25 with a maximum of 50 (10 with `includeFields`). The response reports `total`, `hasMore`, and `nextOffset`.
+- Each result has `instanceId`, the runtime `type`, the GameObject `name`, a hierarchy `path` (at most 32 levels and 512 characters, prefixed with `…` when cut), `scene`, `activeInHierarchy`, `enabled` (null unless the component is a `Behaviour`), and the world `position`.
+- `includeFields:true` adds up to 24 public instance fields per component, sorted by name and excluding fields declared by Unity types, as `{name,type,value}` with `value` summarized like `game_runtime` inspect; `fieldsTruncated` says whether more existed. Only fields are read, never properties, because a property getter can run game code.
+
+The query only reads. To act on a result, resolve its `instanceId` in `evaluate_csharp`, for example with `Resources.InstanceIDToObject(instanceId)` (confirm the member with `api_type` on the selected installation; the result is null once the object is destroyed), or keep what you need in `McpRuntime`. The scan runs on Unity's main thread over every object of the type, so prefer a specific type, or a `name` filter and small `limit` for broad types such as `Transform`.
+
 ## Spawning items
 
 `game_spawn_item(itemId, x?, y?, z?, key?, disallowDespawn?)` resolves `Catalog.GetData<ItemData>(itemId)`, spawns the item, and returns `{key,itemId,position:{x,y,z},instanceId,name}`.
@@ -105,13 +139,24 @@ game_spawn_item(itemId: "<ItemData id>", key: "demo-sword")
 - `disallowDespawn` defaults to `true` on the host and sets `Item.DisallowDespawn`; pass `false` to allow normal despawn. Keeping it true is useful for props you intend to inspect over time.
 - After a level load, the spawned object is destroyed. Remove the stale key and spawn again.
 
-For the tracked public PC 1.3.2 API, metadata identifies `Catalog.GetData<CreatureData>(id)` followed by `CreatureData.SpawnAsync(position, rotationY, parent, pooled, waypoints, callback)`; its implementation calls `ConfigCreature` before the callback, and the callback may not run when game content is inactive. This is `CreatureData.SpawnAsync`, not `Creature.SpawnAsync`. Use `api_lookup(query:"spawn a creature", includeExamples:true)` to re-resolve the selected installation and retrieve the bounded callback/late-result cleanup recipe; don't use raw prefab instantiation as a configured creature. Use `evaluate_csharp` only after the recipe is resolved and the game is ready.
+`game_spawn_creature(creatureId, x?, y?, z?, rotationY?, key?)` resolves `Catalog.GetData<CreatureData>(creatureId)` and runs `CreatureData.SpawnAsync(position, rotationY, parent, pooled, waypoints, callback)` on a bridge-managed coroutine; the game configures the creature before its callback. It returns `{key,creatureId,position:{x,y,z},rotationY,instanceId,name}` and stores the `Creature` under `key`, retrievable with `McpRuntime.Current.Get<Creature>(key)`.
+
+```text
+game_spawn_creature(creatureId: "<CreatureData id>", key: "demo-creature")
+```
+
+- Find ids with `catalog_search(catalogType="CreatureData")`. An unknown id is a bridge error: `Catalog creature not found: <id>`.
+- Omit `x`/`y`/`z` to spawn 2 m in front of the player, facing them; explicit coordinates are world-space. `rotationY` is yaw in degrees: it defaults to facing the player for the default position and to 0 for explicit coordinates. When omitted, `key` is generated as `creature-<12 hex>`.
+- The spawn is asynchronous: the call waits up to 20 seconds for the game to finish, and a creature that arrives after the call gave up is despawned instead of being left untracked. This is `CreatureData.SpawnAsync`, not `Creature.SpawnAsync`, and raw prefab instantiation does not produce a configured creature.
+- Clean up with `evaluate_csharp`: `var creature = McpRuntime.Current.Get<Creature>("demo-creature"); if (creature != null) creature.Despawn(); McpRuntime.Current.Remove("demo-creature");`. `game_runtime(action:"clear")` only drops references; it does not despawn creatures.
+
+`game_spawn_effect(effectId, x?, y?, z?, key?)` resolves `Catalog.GetData<EffectData>(effectId)`, spawns it with `EffectData.Spawn`, calls `EffectInstance.Play()`, stores the `EffectInstance` under `key` (generated as `effect-<12 hex>` when omitted), and returns `{key,effectId,position:{x,y,z}}`. Omit `x`/`y`/`z` to play it 1.5 m in front of the player. Find ids with `catalog_search(catalogType="EffectData")`. Stop it with `McpRuntime.Current.Get<EffectInstance>(key).End()` (or `Despawn()`), then `McpRuntime.Current.Remove(key)`.
 
 ## API workflow
 
 Choose the workflow by task:
 
-- Existing game action: use its dedicated tool, such as `game_spawn_item`; search catalog data only if the required ID is unknown. Readiness checks are needed only before bridge-backed actions.
+- Existing game action: use its dedicated tool, such as `game_spawn_item`, `game_spawn_creature`, or `game_spawn_effect`, and `game_find_objects` to locate live scene components; search catalog data only if the required ID is unknown. Readiness checks are needed only before bridge-backed actions.
 - Custom script: one `api_lookup(query:"...")` call returns ranked signatures, bounded related declarations, relevant examples, and execution/cleanup context; then write a purposeful statement-body snippet and call `evaluate_csharp`.
 - Exact implementation question: use `api_lookup(mode:"symbol", query:"...")` or the lower-level `api_search`, `api_type`, and `api_decompile` tools. Do not fetch exhaustive inventory, inspect unrelated types, or read the guide twice by default.
 
@@ -127,7 +172,7 @@ Use `source:"current"` and `source:"previous"` to read `Player.log` and `Player-
 
 - The snippet is a **statement body** returning `object`, compiled into a synchronous method and invoked on Unity's main thread.
 - Top-level `await` is unsupported, and a returned `Task` is rejected before serialization. Use a managed coroutine or a normal blocking call.
-- `timeoutMs` bounds compilation, queue wait, and dispatch. It cannot interrupt a method that is already running; a long loop keeps blocking the game after the error is returned.
+- `timeoutMs` (1 to 30000, default 30000; the host rejects other values as `request.invalid`) bounds compilation, queue wait, and dispatch. It cannot interrupt a method that is already running; a long loop keeps blocking the game after the error is returned. For longer work, start a managed coroutine and poll `game_runtime(action:"list")`. An MCP client can enforce its own request timeout that is shorter than `timeoutMs`, so keep each call short. `game_wait_ready` and `game_load_level` with `waitUntilReady` send MCP progress notifications about every 5 seconds when the client supplies a progress token; if the client times out first, poll again with `game_wait_ready` and a smaller `timeoutMs` rather than repeating a load.
 - Every successful eval leaves a compiled assembly loaded until the game process restarts. Prefer a small number of purposeful snippets over a stream of one-liners.
 - The code is trusted arbitrary C# with full game-process and filesystem access. Prefer read-only probes; mutate only when that is the goal.
 - Runtime exceptions come back as errors with the exception message; compile diagnostics refer to `evaluation.cs` line numbers.

@@ -209,7 +209,7 @@ internal static class CatalogReuseCheck
                    boundedHandoff.Records.Count == 1 &&
                    boundedHandoff.Records[0].MatchedTerms.Contains("Twin", StringComparer.OrdinalIgnoreCase),
                 "task catalog lookup returns partial matches, discloses omitted terms, and marks the handoff incomplete");
-
+            await CheckRankedLocalizedSearchAsync(root);
 
             var concurrentInstall = CreateInstall(root, "concurrent-install");
             var concurrentArchive = GameInstallConfiguration.CatalogArchivePath(
@@ -308,6 +308,83 @@ internal static class CatalogReuseCheck
             await entryStream.WriteAsync(bytes);
         }
     }
+
+    private static async Task CheckRankedLocalizedSearchAsync(string root)
+    {
+        var install = CreateInstall(root, "localized-install");
+        await WriteArchiveAsync(
+            GameInstallConfiguration.CatalogArchivePath(new LaunchOptions(install.ExecutablePath, Array.Empty<string>())),
+            ("Effects/Effect_A_Spark.json", """{"$type":"ThunderRoad.EffectData, ThunderRoad","id":"Spark","sound":"Spell.NuclearCore","loop":"HumLoop"}"""),
+            ("Effects/Effect_Core.json", """{"$type":"ThunderRoad.EffectData, ThunderRoad","id":"Core","sound":"Spell.BlackHoleLoop"}"""),
+            ("Effects/Effect_HumCore.json", """{"$type":"ThunderRoad.EffectData, ThunderRoad","id":"HumCore"}"""),
+            ("Items/Item_Blade.json", """{"$type":"ThunderRoad.ItemData, ThunderRoad","id":"Blade","displayName":"Placeholder"}"""),
+            ("Skills/Skill_Nova.json", """{"$type":"ThunderRoad.SkillData, ThunderRoad","id":"Nova","description":"{NovaDescription}"}"""),
+            ("Texts/Text_English.json", """{"$type":"ThunderRoad.TextData, ThunderRoad","id":"English","textGroups":[{"id":"Skills","texts":[{"id":"NovaDescription","text":"collapses into a black hole"}]},{"id":"Menu","texts":[{"id":"NovaDescription","text":"also a quasar"}]}],"items":[{"id":"Blade","name":"Radiant Sword","description":"hums with plasma"}]}"""));
+        await SelectInstallAsync(install);
+        var catalog = new BaseCatalogDataCatalog();
+
+        var cold = await MeasureSearchAsync(catalog, "black hole");
+        using (var coldJson = JsonDocument.Parse(cold.Json))
+            Assert(ResultIds(coldJson.RootElement).SequenceEqual(new[] { "Core", "Nova" }) &&
+                   DiagnosticMessages(coldJson.RootElement).Any(message =>
+                       message.Contains("1 TextData record(s) matched but are excluded by default", StringComparison.Ordinal)),
+                "a multi-word search matches its words across fields and localized {Token} text, and reports the TextData tables it hides");
+        var warm = await MeasureSearchAsync(catalog, "quasar");
+        using (var warmJson = JsonDocument.Parse(warm.Json))
+            Assert(ResultIds(warmJson.RootElement).SequenceEqual(new[] { "Nova" }) &&
+                   Count(cold, "catalogJsonParseCount") == 7 && Count(warm, "catalogJsonParseCount") == 0,
+                "duplicate text IDs are concatenated, and the English text map is parsed once per snapshot");
+
+        using (var tables = await SearchJsonAsync(catalog, "black hole", catalogType: "TextData"))
+            Assert(ResultIds(tables.RootElement).SequenceEqual(new[] { "English" }),
+                "catalogType=TextData searches the text tables directly");
+        using (var byId = await SearchJsonAsync(catalog, "black hole", id: "English"))
+            Assert(ResultIds(byId.RootElement).SequenceEqual(new[] { "English" }),
+                "an explicit id keeps matching TextData records");
+        using (var browse = await SearchJsonAsync(catalog, null))
+            Assert(ResultIds(browse.RootElement).Length == 6, "browsing without a query still lists TextData records");
+
+        using (var exact = await SearchJsonAsync(catalog, "Core"))
+            Assert(ResultIds(exact.RootElement).SequenceEqual(new[] { "Core", "HumCore", "Spark" }),
+                "ID matches rank above path/ID substrings, which rank above content-only matches");
+        using (var words = await SearchJsonAsync(catalog, "Core Hum"))
+            Assert(ResultIds(words.RootElement).SequenceEqual(new[] { "HumCore", "Spark" }),
+                "words found in the path, ID, or name rank above words found only across record content");
+        using (var item = await SearchJsonAsync(catalog, "radiant sword"))
+            Assert(ResultIds(item.RootElement).SequenceEqual(new[] { "Blade" }),
+                "ItemData records match their English item name and description");
+
+        var unknownType = await CatalogTypeErrorAsync(catalog, "NoSuchType");
+        var partialType = await CatalogTypeErrorAsync(catalog, "Skill");
+        Assert(unknownType.Contains("matches no catalog records", StringComparison.Ordinal) &&
+               new[] { "EffectData", "ItemData", "SkillData", "TextData" }
+                   .All(type => unknownType.Contains(type, StringComparison.Ordinal)) &&
+               partialType.Contains("SkillData", StringComparison.Ordinal) &&
+               !partialType.Contains("EffectData", StringComparison.Ordinal),
+            "an unknown catalogType is rejected with the known type names instead of returning an empty page");
+
+        var handoff = await catalog.SearchTaskCatalogAsync("black hole", 5, null, CancellationToken.None);
+        Assert(handoff.Records.Select(record => record.Id).SequenceEqual(new[] { "Core", "Nova" }),
+            "task catalog evidence resolves localized text and skips TextData tables");
+    }
+
+    private static async Task<JsonDocument> SearchJsonAsync(BaseCatalogDataCatalog catalog, string? query,
+        string? catalogType = null, string? id = null) =>
+        JsonDocument.Parse(await catalog.SearchAsync(query, catalogType, id, 0, 25, null, CancellationToken.None));
+
+    private static string?[] ResultIds(JsonElement response) =>
+        response.GetProperty("results").EnumerateArray().Select(record => record.GetProperty("id").GetString()).ToArray();
+
+    private static string[] DiagnosticMessages(JsonElement response) =>
+        response.GetProperty("diagnostics").EnumerateArray().Select(item => item.GetString() ?? "").ToArray();
+
+    private static async Task<string> CatalogTypeErrorAsync(BaseCatalogDataCatalog catalog, string catalogType)
+    {
+        try { await catalog.SearchAsync(null, catalogType, null, 0, 25, null, CancellationToken.None); }
+        catch (ArgumentException exception) { return exception.Message; }
+        return "";
+    }
+
     private static async Task CheckConcurrentPersistentAdmissionAsync(string root, string cacheDirectory)
     {
         const long maxDiskBytes = 128L * 1024 * 1024;

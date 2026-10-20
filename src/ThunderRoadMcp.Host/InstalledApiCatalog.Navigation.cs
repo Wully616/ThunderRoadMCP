@@ -30,10 +30,10 @@ public sealed partial class InstalledApiCatalog
     private static NavigationReferenceIndex? _navigationReferenceIndex;
 
     public Task<string> FindCallersAsync(string assemblyId, string symbolId, string scope, int offset, int limit,
-        string? snapshotId, CancellationToken cancellationToken) => FindReferencesAsync("callers", assemblyId, symbolId, scope, offset, limit, snapshotId, cancellationToken);
+        string? snapshotId, bool includeDiagnostics, CancellationToken cancellationToken) => FindReferencesAsync("callers", assemblyId, symbolId, scope, offset, limit, snapshotId, includeDiagnostics, cancellationToken);
 
     public Task<string> FindUsagesAsync(string assemblyId, string symbolId, string scope, int offset, int limit,
-        string? snapshotId, CancellationToken cancellationToken) => FindReferencesAsync("usages", assemblyId, symbolId, scope, offset, limit, snapshotId, cancellationToken);
+        string? snapshotId, bool includeDiagnostics, CancellationToken cancellationToken) => FindReferencesAsync("usages", assemblyId, symbolId, scope, offset, limit, snapshotId, includeDiagnostics, cancellationToken);
 
     public async Task<string> FindCalleesAsync(string assemblyId, string symbolId, int offset, int limit,
         string? snapshotId, CancellationToken cancellationToken)
@@ -91,7 +91,7 @@ public sealed partial class InstalledApiCatalog
     }
 
     private async Task<string> FindReferencesAsync(string mode, string assemblyId, string symbolId, string scope, int offset, int limit,
-        string? snapshotId, CancellationToken cancellationToken)
+        string? snapshotId, bool includeDiagnostics, CancellationToken cancellationToken)
     {
         ValidateNavigationPage(offset, limit);
         if (scope is not ("assembly" or "snapshot"))
@@ -137,10 +137,17 @@ public sealed partial class InstalledApiCatalog
         var page = await MaterializeNavigationResultsAsync(snapshot, index.Assemblies, pageEdges, cancellationToken).ConfigureAwait(false);
         var hasMore = offset + page.Length < total;
         if (queryLimited) diagnostics = diagnostics.Append($"Target results stopped at the {NavigationMaxResults} result safety limit.").ToArray();
-        return SerializeResponse(new { results = page, total, offset, limit, hasMore,
-            nextOffset = hasMore ? offset + page.Length : (int?)null, snapshotId = snapshot.Id, scope,
-            searchedAssemblies, unresolvedReferences,
-            complete = complete && !queryLimited, diagnostics });
+        var response = new Dictionary<string, object?>
+        {
+            ["results"] = page, ["total"] = total, ["offset"] = offset, ["limit"] = limit, ["hasMore"] = hasMore,
+            ["nextOffset"] = hasMore ? offset + page.Length : (int?)null, ["snapshotId"] = snapshot.Id, ["scope"] = scope,
+            ["searchedAssemblyCount"] = searchedAssemblies.Length, ["unresolvedReferences"] = unresolvedReferences,
+            ["complete"] = complete && !queryLimited, ["diagnosticCount"] = diagnostics.Length,
+            ["diagnostics"] = includeDiagnostics ? diagnostics : diagnostics.Take(5).ToArray(),
+        };
+        if (includeDiagnostics)
+            response["searchedAssemblies"] = searchedAssemblies;
+        return SerializeResponse(response);
     }
     private async Task<NavigationQueryScan> ScanNavigationOverflowAsync(CatalogSnapshot snapshot,
         NavigationAssembly[] assemblies, ResolvedNavigationTarget target, string mode, CancellationToken cancellationToken)

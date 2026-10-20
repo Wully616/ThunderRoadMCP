@@ -76,16 +76,19 @@ public sealed partial class InstalledApiCatalog
 
     internal async Task<string> SearchAsync(string query, string? assemblyId, string? kind, bool includeNonPublic,
         int offset, int limit, string? snapshotId, CancellationToken cancellationToken,
-        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies, string? loadedAssemblyDiagnostic)
+        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies, string? loadedAssemblyDiagnostic, string? origin = null)
     {
         ValidatePage(offset, limit, MaxPageSize);
         if (string.IsNullOrWhiteSpace(query) || query.Length > 128)
             throw new ArgumentException("query must contain 1 to 128 characters.", nameof(query));
         var kindFilter = ParseKind(kind);
+        if (origin is not null && !origin.Equals("game", StringComparison.OrdinalIgnoreCase) && !origin.Equals("mod", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("origin must be 'game' or 'mod'.", nameof(origin));
+        origin = origin?.ToLowerInvariant();
         using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
         var (ordered, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, includeNonPublic,
-            cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic);
+            cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic, origin);
         if (offset > ordered.Length)
             throw new ArgumentOutOfRangeException(nameof(offset), $"offset {offset} exceeds the result count {ordered.Length}.");
         var page = ordered.Skip(offset).Take(limit).ToArray();
@@ -104,7 +107,7 @@ public sealed partial class InstalledApiCatalog
     }
     private async Task<(ApiHit[] Hits, List<string> Diagnostics)> SearchHitsAsync(CatalogSnapshot snapshot, string query,
         string? assemblyId, string? kindFilter, bool includeNonPublic, CancellationToken cancellationToken,
-        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies = null, string? loadedAssemblyDiagnostic = null)
+        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies = null, string? loadedAssemblyDiagnostic = null, string? origin = null)
     {
         using var timing = ToolTiming.Measure("apiSearchMs");
         var hits = new List<ApiHit>();
@@ -114,6 +117,8 @@ public sealed partial class InstalledApiCatalog
         foreach (var entry in SelectAssemblies(snapshot, assemblyId))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (origin is not null && entry.Origin != origin)
+                continue;
             if (loadedModAssemblies is not null && entry.Origin == "mod" &&
                 (IsUnderscorePrefixedModFolder(entry.RelativePath) ||
                  !loadedModAssemblies.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId)))))
@@ -159,14 +164,48 @@ public sealed partial class InstalledApiCatalog
             }
         }
         var ordered = hits.GroupBy(hit => hit.symbolId, StringComparer.Ordinal).Select(group => group.First())
-            .OrderBy(h => h.assemblyName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(h => h.origin, StringComparer.Ordinal)
-            .ThenBy(h => h.relativePath, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(h => h.qualifiedName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(h => h.symbolId, StringComparer.Ordinal)
+            .Order(Comparer<ApiHit>.Create((a, b) => CompareSearchHits(query, a, b)))
             .ToArray();
         return (ordered, diagnostics);
     }
+
+    internal static int CompareSearchHits(string query, ApiHit left, ApiHit right)
+    {
+        var result = SearchTier(query, left).CompareTo(SearchTier(query, right));
+        if (result != 0)
+            return result;
+        result = IsTypeKind(left.kind) == IsTypeKind(right.kind) ? 0 : IsTypeKind(left.kind) ? -1 : 1;
+        if (result != 0)
+            return result;
+        result = (left.origin == "game" ? 0 : 1).CompareTo(right.origin == "game" ? 0 : 1);
+        if (result != 0)
+            return result;
+        result = StringComparer.OrdinalIgnoreCase.Compare(left.assemblyName, right.assemblyName);
+        if (result != 0)
+            return result;
+        result = StringComparer.Ordinal.Compare(left.origin, right.origin);
+        if (result != 0)
+            return result;
+        result = StringComparer.OrdinalIgnoreCase.Compare(left.relativePath, right.relativePath);
+        if (result != 0)
+            return result;
+        result = StringComparer.OrdinalIgnoreCase.Compare(left.qualifiedName, right.qualifiedName);
+        return result != 0 ? result : StringComparer.Ordinal.Compare(left.symbolId, right.symbolId);
+    }
+
+    private static int SearchTier(string query, ApiHit hit)
+    {
+        var qualified = hit.qualifiedName;
+        var name = qualified[(qualified.LastIndexOf('.') + 1)..];
+        if (name.Equals(query, StringComparison.OrdinalIgnoreCase))
+            return 0;
+        if (qualified.Equals(query, StringComparison.OrdinalIgnoreCase) || qualified.EndsWith("." + query, StringComparison.OrdinalIgnoreCase))
+            return 1;
+        if (name.StartsWith(query, StringComparison.OrdinalIgnoreCase))
+            return 2;
+        return name.Contains(query, StringComparison.OrdinalIgnoreCase) ? 3 : 4;
+    }
+
     private async Task AddOverflowSearchHitsAsync(CatalogSnapshot snapshot, AssemblyEntry entry, string query,
         string? kindFilter, bool includeNonPublic, ApiAssemblyIndex index, List<ApiHit> hits,
         CancellationToken cancellationToken)
@@ -248,9 +287,17 @@ public sealed partial class InstalledApiCatalog
 
 
     public async Task<string> TypeAsync(string assemblyId, string typeSymbolId, bool includeInherited, bool includeNonPublic,
-        int offset, int limit, string? snapshotId, CancellationToken cancellationToken)
+        string? name, string? kind, int offset, int limit, string? snapshotId, CancellationToken cancellationToken)
     {
         ValidatePage(offset, limit, MaxPageSize);
+        if (name?.Length > 128)
+            throw new ArgumentException("name may contain at most 128 characters.", nameof(name));
+        if (kind is not null)
+        {
+            kind = kind.Trim().ToLowerInvariant();
+            if (kind is not ("constructor" or "method" or "field" or "property" or "event"))
+                throw new ArgumentException("kind must be constructor, method, field, property, or event.", nameof(kind));
+        }
         using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
         var entry = SelectAssembly(snapshot, assemblyId);
@@ -316,6 +363,10 @@ public sealed partial class InstalledApiCatalog
             orderedMembers = members.OrderBy(member => member.qualifiedName, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(member => member.symbolId, StringComparer.Ordinal).ToArray();
         }
+        if (name is not null || kind is not null)
+            orderedMembers = orderedMembers.Where(member =>
+                (kind is null || member.kind == kind) &&
+                (name is null || member.qualifiedName[(member.qualifiedName.LastIndexOf('.') + 1)..].Contains(name, StringComparison.OrdinalIgnoreCase))).ToArray();
         if (offset > orderedMembers.Length)
             throw new ArgumentOutOfRangeException(nameof(offset), $"offset {offset} exceeds the member count {orderedMembers.Length}.");
         var page = orderedMembers.Skip(offset).Take(limit).ToArray();
@@ -323,7 +374,7 @@ public sealed partial class InstalledApiCatalog
         var baseType = baseTypes.FirstOrDefault(t => t.GetDefinition()?.Kind != TypeKind.Interface);
         var interfaces = baseTypes.Where(t => t.GetDefinition()?.Kind == TypeKind.Interface).Select(FormatType).ToArray();
         var hasMore = offset + page.Length < orderedMembers.Length;
-        AddWarnings(snapshot.Diagnostics, resolver.Warnings.Select(w => $"{entry.Origin}/{entry.RelativePath}: {w}"));
+        var typeName = FormatTypeName(type.FullTypeName.FullName);
         AddWarnings(typeWarnings, resolver.Warnings);
         return SerializeResponse(new
         {
@@ -332,7 +383,7 @@ public sealed partial class InstalledApiCatalog
             origin = entry.Origin,
             relativePath = entry.RelativePath,
             symbolId = typeSymbolId,
-            qualifiedName = FormatTypeName(type.FullTypeName.FullName),
+            qualifiedName = typeName,
             typeKind = TypeKindName(type.Kind),
             typeDeclaration = FormatTypeDeclaration(type),
             attributes = typeSymbol.Hit.attributes,
@@ -345,6 +396,23 @@ public sealed partial class InstalledApiCatalog
             {
                 var node = JsonSerializer.SerializeToNode(member)!.AsObject();
                 node["name"] = member.qualifiedName[(member.qualifiedName.LastIndexOf('.') + 1)..];
+                if (member.assemblyId == entry.Id)
+                {
+                    node.Remove("assemblyId");
+                    node.Remove("assemblyName");
+                    node.Remove("origin");
+                    node.Remove("relativePath");
+                }
+                if (member.declaringType == typeName)
+                    node.Remove("declaringType");
+                if (member.warnings.Length == 0)
+                    node.Remove("warnings");
+                if (member.attributes is null or { Length: 0 })
+                    node.Remove("attributes");
+                if (!member.attributesTruncated)
+                    node.Remove("attributesTruncated");
+                if (!member.isInherited)
+                    node.Remove("isInherited");
                 return node;
             }).ToArray(),
             total = orderedMembers.Length,
@@ -1696,7 +1764,16 @@ public sealed partial class InstalledApiCatalog
                 .ThenBy(a => a.RelativePath, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(a => a.RelativePath, StringComparer.Ordinal).ToArray();
             if (candidates.Length > 1)
-                AddWarning($"Assembly reference '{reference.Name}' is ambiguous among installed files; chose {candidates[0].Origin}/{candidates[0].RelativePath} deterministically.");
+            {
+                var versionText = reference.Version?.ToString();
+                (bool Version, bool Directory, bool Origin) Key(AssemblyEntry a) =>
+                    (a.Version.Equals(versionText, StringComparison.OrdinalIgnoreCase),
+                     PathComparer.Equals(Path.GetDirectoryName(a.FullPath), preferredDirectory),
+                     a.Origin == _mainEntry.Origin);
+                var firstKey = Key(candidates[0]);
+                if (candidates.Skip(1).Any(a => !a.ContentHash.Equals(candidates[0].ContentHash, StringComparison.Ordinal) && Key(a) == firstKey))
+                    AddWarning($"Assembly reference '{reference.Name}' is ambiguous among installed files; chose {candidates[0].Origin}/{candidates[0].RelativePath} deterministically.");
+            }
             var selected = candidates[0];
             if (selected.Id.Equals(_mainEntry.Id, StringComparison.Ordinal)) return _main.File;
             if (_opened.TryGetValue(selected.Id, out var alreadyOpen)) return alreadyOpen.File;

@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using ModelContextProtocol.Server;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 
@@ -59,22 +60,7 @@ internal static class ToolInvocation
                 ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
                 ToolTiming.WriteDiagnostics();
             }
-            var error = new JsonObject
-            {
-                ["error"] = new JsonObject
-                {
-                    ["code"] = "request.invalid",
-                    ["message"] = exception.Message.Length <= 512 ? exception.Message : exception.Message[..512],
-                    ["messageTruncated"] = exception.Message.Length > 512,
-                    ["recovery"] = null,
-                },
-            };
-            return new CallToolResult
-            {
-                IsError = true,
-                Content = [new TextContentBlock { Text = error.ToJsonString() }],
-                StructuredContent = JsonSerializer.SerializeToElement(error),
-            };
+            return InvalidRequest(exception.Message);
         }
         catch (ApiDiscoveryException exception)
         {
@@ -102,6 +88,51 @@ internal static class ToolInvocation
             throw new McpException(exception.Message, exception);
         }
     }
+
+    internal static CallToolResult InvalidRequest(string message)
+    {
+        var error = new JsonObject
+        {
+            ["error"] = new JsonObject
+            {
+                ["code"] = "request.invalid",
+                ["message"] = message.Length <= 512 ? message : message[..512],
+                ["messageTruncated"] = message.Length > 512,
+                ["recovery"] = null,
+            },
+        };
+        return new CallToolResult
+        {
+            IsError = true,
+            Content = [new TextContentBlock { Text = error.ToJsonString() }],
+            StructuredContent = JsonSerializer.SerializeToElement(error),
+        };
+    }
+
+    internal static McpRequestHandler<CallToolRequestParams, CallToolResult> RejectUnknownArguments(McpRequestHandler<CallToolRequestParams, CallToolResult> next) =>
+        async (context, cancellationToken) =>
+        {
+            var name = context.Params?.Name;
+            var tool = context.MatchedPrimitive as McpServerTool;
+            if (tool is null && name is not null)
+                tool = context.Server.ServerOptions.ToolCollection?.FirstOrDefault(candidate => candidate.ProtocolTool.Name == name);
+            if (tool is null)
+                return await next(context, cancellationToken);
+
+            var valid = new SortedSet<string>(StringComparer.Ordinal);
+            if (tool.ProtocolTool.InputSchema.ValueKind == JsonValueKind.Object
+                && tool.ProtocolTool.InputSchema.TryGetProperty("properties", out var properties)
+                && properties.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var property in properties.EnumerateObject())
+                    valid.Add(property.Name);
+            }
+
+            var unknown = context.Params?.Arguments?.Keys.Where(key => !valid.Contains(key)).Order(StringComparer.Ordinal).ToArray() ?? [];
+            if (unknown.Length == 0)
+                return await next(context, cancellationToken);
+            return InvalidRequest($"Unknown argument(s) for {name}: {string.Join(", ", unknown)}. Valid arguments: {(valid.Count == 0 ? "none" : string.Join(", ", valid))}.");
+        };
 
     private static void RecordFailure(long started)
     {
