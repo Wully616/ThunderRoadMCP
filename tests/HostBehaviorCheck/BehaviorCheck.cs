@@ -178,15 +178,22 @@ var reloadAlreadyCurrentNext = 0;
 var sameLevelReloadPhase = 0;
 var oldBridgeStatus = false;
 var oldBridgeRuntime = false;
-var loadedAssemblyFixture = new[]
+string loadedModMvid;
+using (var loadedModStream = File.OpenRead(apiModSharedPath))
+using (var loadedModPe = new PEReader(loadedModStream))
+{
+    var loadedModMetadata = loadedModPe.GetMetadataReader();
+    loadedModMvid = loadedModMetadata.GetGuid(loadedModMetadata.GetModuleDefinition().Mvid).ToString("D");
+}
+var loadedAssemblyFixture = new List<object>
 {
     new
     {
-        name = "Fixture.Mod",
+        name = "Fixture.Shared",
         version = "1.0.0.0",
-        moduleVersionId = "00000000-0000-0000-0000-000000000001",
+        moduleVersionId = loadedModMvid,
         origin = "mod",
-        relativePath = "Fixture.Mod.dll",
+        relativePath = Path.Combine("FixtureMod", "Fixture.Shared.dll").Replace(Path.DirectorySeparatorChar, '/'),
     },
 };
 var server = Task.Run(async () =>
@@ -317,7 +324,7 @@ try
         {
             var inventory = inventoryStatus.RootElement.GetProperty("status");
             Assert(inventory.GetProperty("loadedAssemblies").GetArrayLength() == 1 &&
-                   inventory.GetProperty("loadedAssemblies")[0].GetProperty("moduleVersionId").GetString() == "00000000-0000-0000-0000-000000000001" &&
+                   inventory.GetProperty("loadedAssemblies")[0].GetProperty("moduleVersionId").GetString() == loadedModMvid &&
                    inventory.GetProperty("loadedAssemblyCount").GetInt32() == 1 &&
                    !inventory.GetProperty("loadedAssembliesTruncated").GetBoolean(),
                 "game_status explicitly requests loaded assembly inventory and preserves MVID metadata");
@@ -798,6 +805,9 @@ async Task CheckApiToolsAsync()
         Assert(gameAssembly.GetProperty("moduleVersionId").GetString() == fixtureMvid,
             "installed moduleVersionId matches the PE fixture metadata");
     }
+    Assert(modAssembly.GetProperty("moduleVersionId").GetString() == loadedModMvid &&
+           modAssembly.GetProperty("relativePath").GetString() == "FixtureMod/Fixture.Shared.dll",
+        "loaded fixture matches installed mod provenance");
     Assert(!Path.IsPathRooted(gameAssembly.GetProperty("relativePath").GetString()!) &&
            !Path.IsPathRooted(modAssembly.GetProperty("relativePath").GetString()!), "assembly provenance paths are relative");
 
@@ -852,6 +862,19 @@ async Task CheckApiToolsAsync()
     Assert(modSharedSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
            modSharedSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == modAssemblyId,
         "assembly-filtered search selects only the requested mod");
+
+    var loadedModFixture = loadedAssemblyFixture[0];
+    loadedAssemblyFixture.Clear();
+    using (var unloadedDefaultSearch = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type" }))
+        Assert(unloadedDefaultSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
+               unloadedDefaultSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == gameAssemblyId,
+            "default search excludes installed mod absent from loaded inventory");
+    using (var offlineModSearch = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", includeUnloadedMods = true }))
+        Assert(offlineModSearch.RootElement.GetProperty("results").GetArrayLength() == 2 &&
+               offlineModSearch.RootElement.GetProperty("results").EnumerateArray()
+                   .Any(hit => hit.GetProperty("assemblyId").GetString() == modAssemblyId),
+            "includeUnloadedMods searches installed mod assemblies");
+    loadedAssemblyFixture.Add(loadedModFixture);
 
     using var sharedSearchPage = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", offset = 0, limit = 1 });
     Assert(sharedSearchPage.RootElement.GetProperty("total").GetInt32() == 2 && sharedSearchPage.RootElement.GetProperty("hasMore").GetBoolean(),
@@ -1253,8 +1276,7 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                     processId = 123,
                     bridgeReady = true,
                     loadedAssemblies = loadedAssemblyFixture,
-                    loadedAssemblyCount = 1,
-                    loadedAssembliesTruncated = false,
+                    loadedAssemblyCount = loadedAssemblyFixture.Count,
                 };
             else if (!includeAssemblies && Volatile.Read(ref sameLevelReloadPhase) > 0)
             {
@@ -1284,7 +1306,7 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                     levelState = "Loaded",
                     sceneReady = true,
                     loadedAssemblies = loadedAssemblyFixture,
-                    loadedAssemblyCount = 1,
+                    loadedAssemblyCount = loadedAssemblyFixture.Count,
                     loadedAssembliesTruncated = false,
                 };
             else

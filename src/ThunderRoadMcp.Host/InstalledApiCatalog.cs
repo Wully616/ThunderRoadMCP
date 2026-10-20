@@ -74,8 +74,9 @@ public sealed partial class InstalledApiCatalog
         });
     }
 
-    public async Task<string> SearchAsync(string query, string? assemblyId, string? kind, bool includeNonPublic,
-        int offset, int limit, string? snapshotId, CancellationToken cancellationToken)
+    internal async Task<string> SearchAsync(string query, string? assemblyId, string? kind, bool includeNonPublic,
+        int offset, int limit, string? snapshotId, CancellationToken cancellationToken,
+        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies, string? loadedAssemblyDiagnostic)
     {
         ValidatePage(offset, limit, MaxPageSize);
         if (string.IsNullOrWhiteSpace(query) || query.Length > 128)
@@ -83,7 +84,8 @@ public sealed partial class InstalledApiCatalog
         var kindFilter = ParseKind(kind);
         using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
-        var (ordered, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, includeNonPublic, cancellationToken);
+        var (ordered, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, includeNonPublic,
+            cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic);
         if (offset > ordered.Length)
             throw new ArgumentOutOfRangeException(nameof(offset), $"offset {offset} exceeds the result count {ordered.Length}.");
         var page = ordered.Skip(offset).Take(limit).ToArray();
@@ -101,14 +103,20 @@ public sealed partial class InstalledApiCatalog
         });
     }
     private async Task<(ApiHit[] Hits, List<string> Diagnostics)> SearchHitsAsync(CatalogSnapshot snapshot, string query,
-        string? assemblyId, string? kindFilter, bool includeNonPublic, CancellationToken cancellationToken)
+        string? assemblyId, string? kindFilter, bool includeNonPublic, CancellationToken cancellationToken,
+        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies = null, string? loadedAssemblyDiagnostic = null)
     {
         using var timing = ToolTiming.Measure("apiSearchMs");
         var hits = new List<ApiHit>();
         var diagnostics = new List<string>(snapshot.Diagnostics);
+        if (loadedAssemblyDiagnostic is not null)
+            AddDiagnostic(diagnostics, loadedAssemblyDiagnostic);
         foreach (var entry in SelectAssemblies(snapshot, assemblyId))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (loadedModAssemblies is not null && entry.Origin == "mod" &&
+                !loadedModAssemblies.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId))))
+                continue;
             try
             {
                 using var indexLease = await GetApiIndexAsync(snapshot, entry, cancellationToken);
@@ -879,6 +887,11 @@ public sealed partial class InstalledApiCatalog
         if (assemblyId is null) return snapshot.Assemblies.ToArray();
         return new[] { SelectAssembly(snapshot, assemblyId) };
     }
+    internal static HashSet<LoadedAssemblyIdentity> CreateLoadedAssemblyIdentitySet() =>
+        new(LoadedAssemblyIdentityComparer.Instance);
+
+    internal static LoadedAssemblyIdentity CreateLoadedAssemblyIdentity(string relativePath, Guid moduleVersionId) =>
+        new(relativePath.Replace('\\', '/'), moduleVersionId);
 
     private static AssemblyEntry SelectAssembly(CatalogSnapshot snapshot, string assemblyId) =>
         snapshot.Assemblies.FirstOrDefault(a => a.Id.Equals(assemblyId, StringComparison.Ordinal))
@@ -1744,6 +1757,19 @@ public sealed partial class InstalledApiCatalog
         }
     }
 
+
+    internal readonly record struct LoadedAssemblyIdentity(string RelativePath, Guid ModuleVersionId);
+
+    private sealed class LoadedAssemblyIdentityComparer : IEqualityComparer<LoadedAssemblyIdentity>
+    {
+        public static readonly LoadedAssemblyIdentityComparer Instance = new();
+
+        public bool Equals(LoadedAssemblyIdentity left, LoadedAssemblyIdentity right) =>
+            left.ModuleVersionId == right.ModuleVersionId && PathComparer.Equals(left.RelativePath, right.RelativePath);
+
+        public int GetHashCode(LoadedAssemblyIdentity identity) =>
+            HashCode.Combine(PathComparer.GetHashCode(identity.RelativePath), identity.ModuleVersionId);
+    }
 
     private sealed record InstallRoot(string Origin, string Path);
     private sealed record AssemblyEntry(string Id, string Name, string Version, string ModuleVersionId, string Origin,
