@@ -115,7 +115,8 @@ public sealed partial class InstalledApiCatalog
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (loadedModAssemblies is not null && entry.Origin == "mod" &&
-                !loadedModAssemblies.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId))))
+                (IsUnderscorePrefixedModFolder(entry.RelativePath) ||
+                 !loadedModAssemblies.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId)))))
                 continue;
             try
             {
@@ -892,6 +893,8 @@ public sealed partial class InstalledApiCatalog
 
     internal static LoadedAssemblyIdentity CreateLoadedAssemblyIdentity(string relativePath, Guid moduleVersionId) =>
         new(relativePath.Replace('\\', '/'), moduleVersionId);
+    private static bool IsUnderscorePrefixedModFolder(string relativePath) =>
+        relativePath.Length > 0 && relativePath[0] == '_' && relativePath.IndexOf('/') > 0;
 
     private static AssemblyEntry SelectAssembly(CatalogSnapshot snapshot, string assemblyId) =>
         snapshot.Assemblies.FirstOrDefault(a => a.Id.Equals(assemblyId, StringComparison.Ordinal))

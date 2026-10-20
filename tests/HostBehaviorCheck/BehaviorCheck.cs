@@ -130,6 +130,9 @@ Assert(multipleInstallsRejected, "multiple installations produce an ambiguity er
 var apiFixtureModDirectory = Path.Combine(gameDirectory, "BladeAndSorcery_Data", "StreamingAssets", "Mods", "FixtureMod");
 Directory.CreateDirectory(apiFixtureModDirectory);
 var fixtureOutputDirectory = Path.Combine(AppContext.BaseDirectory, "api-fixtures");
+var apiDisabledModDirectory = Path.Combine(gameDirectory, "BladeAndSorcery_Data", "StreamingAssets", "Mods", "_DisabledFixtureMod");
+Directory.CreateDirectory(apiDisabledModDirectory);
+var apiDisabledModBasePath = Path.Combine(apiDisabledModDirectory, "Fixture.Base.dll");
 var apiGameSharedPath = Path.Combine(managedDirectory, "Fixture.Shared.dll");
 var apiModSharedPath = Path.Combine(apiFixtureModDirectory, "Fixture.Shared.dll");
 var apiGameBasePath = Path.Combine(managedDirectory, "Fixture.Base.dll");
@@ -820,7 +823,6 @@ async Task CheckApiToolsAsync()
                                           warning.Contains("missing", StringComparison.OrdinalIgnoreCase)), "missing dependency is reported while type decompilation remains available");
     Assert(missingDependencySource.RootElement.GetProperty("source").GetString()!.Contains("DerivedSurface", StringComparison.Ordinal), "missing dependency does not block unrelated source discovery");
     File.Move(missingDependencyPath, apiGameBasePath);
-
     using var baseAssemblies = await ApiToolJsonAsync("api_assemblies", new { name = "Fixture.Base", origin = "game", limit = 50 });
     var baseAssemblyId = baseAssemblies.RootElement.GetProperty("assemblies").EnumerateArray().Single().GetProperty("assemblyId").GetString()!;
 
@@ -1148,6 +1150,33 @@ async Task CheckApiToolsAsync()
     Assert(!File.Exists(renamedModPath), "browsed assembly can be renamed and deleted without a file lock");
     Assert(!File.Exists(fixtureSentinelPath), "fixture static initializer remains unexecuted after all API calls");
     File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Shared.dll"), apiGameSharedPath, overwrite: true);
+    File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Base.dll"), apiDisabledModBasePath);
+
+    using var disabledModAssemblies = await ApiToolJsonAsync("api_assemblies", new { name = "Fixture.Base", origin = "mod", limit = 50 });
+    var disabledModAssembly = disabledModAssemblies.RootElement.GetProperty("assemblies").EnumerateArray().Single();
+    var disabledModAssemblyId = disabledModAssembly.GetProperty("assemblyId").GetString()!;
+    var disabledModRelativePath = disabledModAssembly.GetProperty("relativePath").GetString()!;
+    Assert(disabledModRelativePath == "_DisabledFixtureMod/Fixture.Base.dll",
+        "underscore-prefixed mod directory is discoverable as installed");
+    var reportedDisabledAssembly = new
+    {
+        name = disabledModAssembly.GetProperty("name").GetString(),
+        version = disabledModAssembly.GetProperty("version").GetString(),
+        moduleVersionId = disabledModAssembly.GetProperty("moduleVersionId").GetString(),
+        origin = "mod",
+        relativePath = disabledModRelativePath,
+    };
+    loadedAssemblyFixture.Add(reportedDisabledAssembly);
+    using (var disabledFolderSearch = await ApiToolJsonAsync("api_search", new
+           { query = "BaseSurface", kind = "type", assemblyId = disabledModAssemblyId }))
+        Assert(disabledFolderSearch.RootElement.GetProperty("results").GetArrayLength() == 0,
+            "underscore-prefixed mod directory stays excluded even if bridge reports it loaded");
+    using (var explicitDisabledFolderSearch = await ApiToolJsonAsync("api_search", new
+           { query = "BaseSurface", kind = "type", assemblyId = disabledModAssemblyId, includeUnloadedMods = true }))
+        Assert(explicitDisabledFolderSearch.RootElement.GetProperty("results").GetArrayLength() == 1,
+            "explicit unloaded-mod search includes underscore-prefixed mod directories");
+    loadedAssemblyFixture.Remove(reportedDisabledAssembly);
+    File.Delete(apiDisabledModBasePath);
 }
 async Task CheckCatalogToolsAsync()
 {

@@ -26,13 +26,13 @@ public static class ApiDiscoveryTools
         ToolInvocation.Run(() => catalog.AssembliesAsync(name, origin, offset, limit, snapshotId, cancellationToken));
 
     [McpServerTool(Name = "api_search", Title = "Search installed game APIs", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-    [Description("Search installed type and member names; public results are the default. By default, mod results are limited to assemblies reported loaded by the game bridge. Set includeUnloadedMods=true to search installed mod DLLs regardless of load state or when offline. Use api_lookup to combine an unambiguous search hit with paged source; otherwise use the returned assemblyId and symbolId with api_type or api_decompile. Carry snapshotId and nextOffset for remaining pages. This reads metadata and does not execute game code.")]
+    [Description("Search installed type and member names; public results are the default. By default, mod results are limited to assemblies reported loaded by the game bridge and exclude underscore-prefixed mod directories. Set includeUnloadedMods=true to search installed mod DLLs regardless of load state or when offline. Use api_lookup to combine an unambiguous search hit with paged source; otherwise use the returned assemblyId and symbolId with api_type or api_decompile. Carry snapshotId and nextOffset for remaining pages. This reads metadata and does not execute game code.")]
     public static Task<CallToolResult> ApiSearch(InstalledApiCatalog catalog, GameProcess gameProcess,
         [Description("Case-insensitive type, member, or qualified-name search text.")] string query,
         [Description("Restrict search to an assemblyId returned by api_assemblies.")] string? assemblyId = null,
         [Description("Optional result kind, such as type, method, property, or field.")] string? kind = null,
         [Description("Include non-public declarations only when implementation details are needed.")] bool includeNonPublic = false,
-        [Description("Include installed mod DLLs not reported loaded by the bridge.")] bool includeUnloadedMods = false,
+        [Description("Include installed mod DLLs regardless of load state, including underscore-prefixed folders.")] bool includeUnloadedMods = false,
         [Description("Zero-based result offset.")] int offset = 0,
         [Description("Maximum results in this page.")] int limit = 50,
         [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
