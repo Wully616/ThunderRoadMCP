@@ -882,6 +882,14 @@ async Task CheckApiToolsAsync()
                offlineModSearch.RootElement.GetProperty("results").EnumerateArray()
                    .Any(hit => hit.GetProperty("assemblyId").GetString() == modAssemblyId),
             "includeUnloadedMods searches installed mod assemblies");
+    foreach (var lookupMode in new[] { "task", "symbol" })
+    {
+        using var hiddenLookup = await ApiToolJsonAsync("api_lookup", new { query = "SharedSurface", mode = lookupMode, kind = "type", includeExamples = false });
+        using var shownLookup = await ApiToolJsonAsync("api_lookup", new { query = "SharedSurface", mode = lookupMode, kind = "type", includeExamples = false, includeUnloadedMods = true });
+        Assert(!hiddenLookup.RootElement.GetRawText().Contains(modAssemblyId, StringComparison.Ordinal) &&
+               shownLookup.RootElement.GetRawText().Contains(modAssemblyId, StringComparison.Ordinal),
+            $"api_lookup {lookupMode} mode excludes unloaded mods unless includeUnloadedMods is set");
+    }
     loadedAssemblyFixture.Add(loadedModFixture);
 
     using var sharedSearchPage = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", offset = 0, limit = 1 });

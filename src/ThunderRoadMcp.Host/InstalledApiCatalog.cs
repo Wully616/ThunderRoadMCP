@@ -497,9 +497,10 @@ public sealed partial class InstalledApiCatalog
         }
         return null;
     }
-    public async Task<string> LookupAsync(string? query, string? assemblyId, string? symbolId, string? kind,
+    internal async Task<string> LookupAsync(string? query, string? assemblyId, string? symbolId, string? kind,
         string? mode, int startLine, int lineCount, string? snapshotId, int maxResults, int maxChars,
-        bool includeExamples, string? continuation, BaseCatalogDataCatalog? baseCatalog, CancellationToken cancellationToken)
+        bool includeExamples, string? continuation, BaseCatalogDataCatalog? baseCatalog, CancellationToken cancellationToken,
+        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies = null, string? loadedAssemblyDiagnostic = null)
     {
         using var timing = ToolTiming.Measure("apiLookupMs");
         if (query is not null && symbolId is not null)
@@ -534,7 +535,8 @@ public sealed partial class InstalledApiCatalog
             if (maxChars is < 3000 or > 32000)
                 throw new ArgumentOutOfRangeException(nameof(maxChars), "maxChars must be between 3000 and 32000.");
             return await TaskLookupAsync(snapshot, query, assemblyId, kindFilter, maxResults, maxChars,
-                includeExamples, continuation, baseCatalog, cancellationToken);
+                includeExamples, continuation, baseCatalog, cancellationToken,
+                ExcludedModAssemblyIds(snapshot, loadedModAssemblies), loadedAssemblyDiagnostic);
         }
         if (startLine < 1)
             throw new ArgumentOutOfRangeException(nameof(startLine), "startLine must be at least 1.");
@@ -543,7 +545,8 @@ public sealed partial class InstalledApiCatalog
 
         if (query is not null)
         {
-            var (searchHits, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, false, cancellationToken);
+            var (searchHits, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, false, cancellationToken,
+                loadedModAssemblies, loadedAssemblyDiagnostic);
             var exactHitCount = searchHits.Count(hit => hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase));
             var hits = exactHitCount > 0
                 ? searchHits.Where(hit => hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase)).ToArray()
@@ -961,6 +964,15 @@ public sealed partial class InstalledApiCatalog
 
     internal static LoadedAssemblyIdentity CreateLoadedAssemblyIdentity(string relativePath, Guid moduleVersionId) =>
         new(relativePath.Replace('\\', '/'), moduleVersionId);
+    /// <summary>Ids of mod assemblies hidden by the loaded-mod filter; empty when the filter is off.</summary>
+    private static HashSet<string> ExcludedModAssemblyIds(CatalogSnapshot snapshot, IReadOnlySet<LoadedAssemblyIdentity>? loaded) =>
+        loaded is null
+            ? new HashSet<string>(StringComparer.Ordinal)
+            : snapshot.Assemblies.Where(entry => entry.Origin == "mod" &&
+                    (IsUnderscorePrefixedModFolder(entry.RelativePath) ||
+                     !loaded.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId)))))
+                .Select(entry => entry.Id).ToHashSet(StringComparer.Ordinal);
+
     private static bool IsUnderscorePrefixedModFolder(string relativePath) =>
         relativePath.Length > 0 && relativePath[0] == '_' && relativePath.IndexOf('/') > 0;
 

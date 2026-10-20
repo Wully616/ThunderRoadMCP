@@ -40,45 +40,50 @@ public static class ApiDiscoveryTools
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(async () =>
         {
-            IReadOnlySet<InstalledApiCatalog.LoadedAssemblyIdentity>? loadedModAssemblies = null;
-            string? loadedAssemblyDiagnostic = null;
-            if (!includeUnloadedMods)
-            {
-                using var status = JsonDocument.Parse(await gameProcess.StatusAsync(true, cancellationToken));
-                var root = status.RootElement;
-                var bridgeConnected = root.TryGetProperty("bridgeConnected", out var connected) &&
-                                      connected.ValueKind == JsonValueKind.True;
-                var loaded = InstalledApiCatalog.CreateLoadedAssemblyIdentitySet();
-                if (!bridgeConnected)
-                    loadedAssemblyDiagnostic = "Game bridge is not connected; mod assemblies are excluded. Set includeUnloadedMods=true to search installed mod DLLs.";
-                else if (!root.TryGetProperty("status", out var bridgeStatus) ||
-                         !bridgeStatus.TryGetProperty("loadedAssemblies", out var assemblies) ||
-                         assemblies.ValueKind != JsonValueKind.Array)
-                    loadedAssemblyDiagnostic = "Connected bridge does not report loaded assemblies; mod assemblies are excluded. Set includeUnloadedMods=true to search installed mod DLLs.";
-                else
-                {
-                    foreach (var assembly in assemblies.EnumerateArray())
-                    {
-                        if (!assembly.TryGetProperty("origin", out var origin) ||
-                            origin.ValueKind != JsonValueKind.String ||
-                            !string.Equals(origin.GetString(), "mod", StringComparison.OrdinalIgnoreCase) ||
-                            !assembly.TryGetProperty("relativePath", out var relativePath) ||
-                            relativePath.ValueKind != JsonValueKind.String ||
-                            !assembly.TryGetProperty("moduleVersionId", out var moduleVersionId) ||
-                            moduleVersionId.ValueKind != JsonValueKind.String ||
-                            !Guid.TryParse(moduleVersionId.GetString(), out var parsedMvid))
-                            continue;
-                        loaded.Add(InstalledApiCatalog.CreateLoadedAssemblyIdentity(relativePath.GetString()!, parsedMvid));
-                    }
-                    if (bridgeStatus.TryGetProperty("loadedAssembliesTruncated", out var truncated) &&
-                        truncated.ValueKind == JsonValueKind.True)
-                        loadedAssemblyDiagnostic = "Bridge loaded-assembly inventory was truncated; some loaded mod assemblies may be omitted.";
-                }
-                loadedModAssemblies = loaded;
-            }
+            var (loadedModAssemblies, loadedAssemblyDiagnostic) = await LoadedModsAsync(gameProcess, includeUnloadedMods, cancellationToken);
             return await catalog.SearchAsync(query, assemblyId, kind, includeNonPublic, offset, limit, snapshotId,
                 cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic, origin);
         });
+
+    /// <summary>Loaded mod assemblies reported by the bridge, or null when unloaded mods are requested.</summary>
+    internal static async Task<(IReadOnlySet<InstalledApiCatalog.LoadedAssemblyIdentity>? Loaded, string? Diagnostic)> LoadedModsAsync(
+        GameProcess gameProcess, bool includeUnloadedMods, CancellationToken cancellationToken)
+    {
+        if (includeUnloadedMods)
+            return (null, null);
+        string? diagnostic = null;
+        using var status = JsonDocument.Parse(await gameProcess.StatusAsync(true, cancellationToken));
+        var root = status.RootElement;
+        var bridgeConnected = root.TryGetProperty("bridgeConnected", out var connected) &&
+                              connected.ValueKind == JsonValueKind.True;
+        var loaded = InstalledApiCatalog.CreateLoadedAssemblyIdentitySet();
+        if (!bridgeConnected)
+            diagnostic = "Game bridge is not connected; mod assemblies are excluded. Set includeUnloadedMods=true to search installed mod DLLs.";
+        else if (!root.TryGetProperty("status", out var bridgeStatus) ||
+                 !bridgeStatus.TryGetProperty("loadedAssemblies", out var assemblies) ||
+                 assemblies.ValueKind != JsonValueKind.Array)
+            diagnostic = "Connected bridge does not report loaded assemblies; mod assemblies are excluded. Set includeUnloadedMods=true to search installed mod DLLs.";
+        else
+        {
+            foreach (var assembly in assemblies.EnumerateArray())
+            {
+                if (!assembly.TryGetProperty("origin", out var assemblyOrigin) ||
+                    assemblyOrigin.ValueKind != JsonValueKind.String ||
+                    !string.Equals(assemblyOrigin.GetString(), "mod", StringComparison.OrdinalIgnoreCase) ||
+                    !assembly.TryGetProperty("relativePath", out var relativePath) ||
+                    relativePath.ValueKind != JsonValueKind.String ||
+                    !assembly.TryGetProperty("moduleVersionId", out var moduleVersionId) ||
+                    moduleVersionId.ValueKind != JsonValueKind.String ||
+                    !Guid.TryParse(moduleVersionId.GetString(), out var parsedMvid))
+                    continue;
+                loaded.Add(InstalledApiCatalog.CreateLoadedAssemblyIdentity(relativePath.GetString()!, parsedMvid));
+            }
+            if (bridgeStatus.TryGetProperty("loadedAssembliesTruncated", out var truncated) &&
+                truncated.ValueKind == JsonValueKind.True)
+                diagnostic = "Bridge loaded-assembly inventory was truncated; some loaded mod assemblies may be omitted.";
+        }
+        return (loaded, diagnostic);
+    }
 
     [McpServerTool(Name = "api_type", Title = "Inspect an installed API type", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
     [Description("Inspect a discovered type's declaration, bases, interfaces, generic constraints, and paged members. Use the type symbolId and assemblyId from api_search; inherited members report their declaring assembly and type. Carry snapshotId and nextOffset to continue. Members omit fields identical to the type's own provenance; inherited members from other assemblies keep assemblyId and declaringType.")]
@@ -95,8 +100,8 @@ public static class ApiDiscoveryTools
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(() => catalog.TypeAsync(assemblyId, typeSymbolId, includeInherited, includeNonPublic, name, kind, offset, limit, snapshotId, cancellationToken));
 [McpServerTool(Name = "api_lookup", Title = "Find an installed API for a task", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-[Description("Recommended first discovery tool. A natural-language query defaults to ranked task mode: it returns metadata-only declarations, bounded signatures/type context, related catalog records, and evidence-labelled examples without eager decompilation. Use mode=\"symbol\" for the legacy exact-symbol/source lookup, or pass exact assemblyId and symbolId to receive its source directly. Task mode never executes installed code; its executionContract explains the separate evaluator constraints. Continuations are bound to the exact query, options, ranking version, and full installed snapshot.")]
-public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCatalogDataCatalog baseCatalog,
+[Description("Recommended first discovery tool. A natural-language query defaults to ranked task mode: it returns metadata-only declarations, bounded signatures/type context, related catalog records, and evidence-labelled examples without eager decompilation. Use mode=\"symbol\" for the legacy exact-symbol/source lookup, or pass exact assemblyId and symbolId to receive its source directly. Task mode never executes installed code; its executionContract explains the separate evaluator constraints. Continuations are bound to the exact query, options, ranking version, and full installed snapshot. Like api_search, query modes exclude mod assemblies the game bridge does not report as loaded (and underscore-prefixed mod folders) unless includeUnloadedMods=true.")]
+public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCatalogDataCatalog baseCatalog, GameProcess gameProcess,
     [Description("Natural-language task or exact type/member text. Task mode accepts up to 2048 characters. Omit when passing the exact assemblyId and symbolId pair.")] string? query = null,
     [Description("Optional assemblyId restriction from api_assemblies or a previous lookup.")] string? assemblyId = null,
     [Description("Exact symbolId returned by api_search, api_lookup, or api_type. Requires assemblyId and no query.")] string? symbolId = null,
@@ -109,9 +114,16 @@ public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCa
     [Description("One-based first source line in symbol mode.")] int startLine = 1,
     [Description("Number of source lines to return in symbol mode.")] int lineCount = 200,
     [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
+    [Description("Include installed mod DLLs regardless of load state, including underscore-prefixed folders.")] bool includeUnloadedMods = false,
     CancellationToken cancellationToken = default) =>
-    ToolInvocation.Run(() => catalog.LookupAsync(query, assemblyId, symbolId, kind, mode, startLine, lineCount, snapshotId,
-        maxResults, maxChars, includeExamples, continuation, baseCatalog, cancellationToken));
+    ToolInvocation.Run(async () =>
+    {
+        var (loadedModAssemblies, loadedAssemblyDiagnostic) = query is null
+            ? (null, null)
+            : await LoadedModsAsync(gameProcess, includeUnloadedMods, cancellationToken);
+        return await catalog.LookupAsync(query, assemblyId, symbolId, kind, mode, startLine, lineCount, snapshotId,
+            maxResults, maxChars, includeExamples, continuation, baseCatalog, cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic);
+    });
 
 
     [McpServerTool(Name = "api_decompile", Title = "Read reconstructed API source", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]

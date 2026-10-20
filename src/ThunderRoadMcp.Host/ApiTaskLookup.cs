@@ -15,7 +15,7 @@ public sealed partial class InstalledApiCatalog
     private const int MaxLookupTotalRelatedNames = MaxLookupRelatedNames + MaxLookupRelatedDepth * MaxLookupRelatedTypes;
     private async Task<string> TaskLookupAsync(CatalogSnapshot snapshot, string query, string? assemblyId, string? kindFilter,
         int maxResults, int maxChars, bool includeExamples, string? continuation, BaseCatalogDataCatalog? baseCatalog,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, HashSet<string> excludedAssemblyIds, string? loadedAssemblyDiagnostic)
     {
         var (offset, continuationError) = ReadLookupContinuation(continuation, snapshot.Id, query, assemblyId,
             kindFilter, maxResults, maxChars, includeExamples);
@@ -29,6 +29,8 @@ public sealed partial class InstalledApiCatalog
             : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var exampleCandidates = new Dictionary<string, List<ApiHit>>(StringComparer.OrdinalIgnoreCase);
         var diagnostics = new List<string>(snapshot.Diagnostics);
+        if (loadedAssemblyDiagnostic is not null)
+            AddDiagnostic(diagnostics, loadedAssemblyDiagnostic);
         var indexComplete = !snapshot.CatalogTruncated;
         var typeMap = await ReadApiTypeMapAsync(snapshot);
         ApiHit[]? directoryHits = null;
@@ -45,7 +47,7 @@ public sealed partial class InstalledApiCatalog
 
         void Consider(ApiHit hit)
         {
-            if (hit.accessibility != "public")
+            if (hit.accessibility != "public" || excludedAssemblyIds.Contains(hit.assemblyId))
                 return;
             var normalizedName = NormalizeTypeName(hit.qualifiedName);
             if (exampleNames.Contains(normalizedName))
@@ -201,7 +203,7 @@ public sealed partial class InstalledApiCatalog
         foreach (var record in catalogRecords)
             AddRelatedName(record.DeclaredApiType, "catalog:" + record.EntryId, relatedNames, relationOwners);
         var (relatedTypes, relatedResolutionComplete) = await ResolveRelatedTypesAsync(snapshot, relatedNames, relationOwners,
-            typeMap, diagnostics, cancellationToken);
+            typeMap, diagnostics, cancellationToken, excludedAssemblyIds);
         ToolTiming.Count("api.lookup.relatedConsidered", relatedNames.Count);
         var resolvedRelatedNames = relatedTypes.Select(type => type.Symbol.Hit.qualifiedName)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -787,7 +789,7 @@ public sealed partial class InstalledApiCatalog
     private async Task<(ApiTypeRecord[] Types, bool Complete)> ResolveRelatedTypesAsync(CatalogSnapshot snapshot,
         HashSet<string> names, Dictionary<string, HashSet<string>> relationOwners,
         IReadOnlyDictionary<string, string[]>? typeMap, List<string> diagnostics,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, HashSet<string> excludedAssemblyIds)
     {
         if (names.Count == 0)
             return (Array.Empty<ApiTypeRecord>(), true);
@@ -808,7 +810,7 @@ public sealed partial class InstalledApiCatalog
                     cancellationToken.ThrowIfCancellationRequested();
                     if (!typeMap.TryGetValue(typeName, out var assemblyIds))
                         continue;
-                    foreach (var assemblyId in assemblyIds)
+                    foreach (var assemblyId in assemblyIds.Where(id => !excludedAssemblyIds.Contains(id)))
                     {
                         var entry = snapshot.Assemblies.FirstOrDefault(candidate =>
                             candidate.Id.Equals(assemblyId, StringComparison.Ordinal));
