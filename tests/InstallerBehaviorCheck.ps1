@@ -171,6 +171,22 @@ function Test-ByteEqual([byte[]]$Left, [byte[]]$Right) {
     return [Convert]::ToBase64String($Left) -ceq [Convert]::ToBase64String($Right)
 }
 
+function Assert-InstalledReferencePayload([string]$HostDirectory) {
+    foreach ($relativePath in @(
+        'docs\game-guide.md',
+        'docs\api-discovery.md',
+        'skills\blade-and-sorcery\SKILL.md',
+        'skills\blade-and-sorcery\references\unity-2021.3.md'
+    )) {
+        $installedPath = Join-Path $HostDirectory $relativePath
+        $sourcePath = Join-Path $sourceRoot $relativePath
+        if (-not (Test-Path -LiteralPath $installedPath -PathType Leaf) -or
+            -not (Test-ByteEqual ([IO.File]::ReadAllBytes($installedPath)) ([IO.File]::ReadAllBytes($sourcePath)))) {
+            throw "Installed host did not preserve '$relativePath'."
+        }
+    }
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('ThunderRoadMcp-installer-check-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
@@ -188,6 +204,8 @@ try {
         -not (Test-Path -LiteralPath (Join-Path $installedMod 'ThunderRoadMcp.Bridge.dll') -PathType Leaf)) {
         throw 'Real install did not publish the host and deploy the bridge into the isolated game tree.'
     }
+    Assert-InstalledReferencePayload $hostA
+
     $bridgeConfigPath = Join-Path $configA 'bridge.json'
     $bridgeConfig = Get-Content -LiteralPath $bridgeConfigPath -Raw | ConvertFrom-Json
     if ($bridgeConfig.enabled -ne $true -or $bridgeConfig.host -ne '127.0.0.1' -or [string]$bridgeConfig.token -notmatch '^[0-9a-f]{64}$') {
@@ -295,6 +313,8 @@ try {
     $releaseHost = Join-Path $releaseRoot 'host'
     $releaseBridge = Join-Path $releaseRoot 'bridge'
     New-Item -ItemType Directory -Path $releaseScripts, $releaseHost, $releaseBridge -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $sourceRoot 'docs') -Destination $releaseRoot -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $sourceRoot 'skills') -Destination $releaseRoot -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts\upgrade.ps1') -Destination $releaseScripts
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts\install.ps1') -Destination $releaseScripts
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts\package-bridge.ps1') -Destination $releaseScripts
@@ -320,6 +340,8 @@ try {
         -not (Test-Path -LiteralPath (Join-Path $releaseMod 'manifest.json') -PathType Leaf)) {
         throw 'Release-layout install did not use the prebuilt host and bridge.'
     }
+    Assert-InstalledReferencePayload $hostRelease
+
     $releaseConfig = Get-Content -LiteralPath (Join-Path $configRelease 'bridge.json') -Raw | ConvertFrom-Json
     if ($releaseConfig.enabled -ne $true -or [string]$releaseConfig.token -notmatch '^[0-9a-f]{64}$') {
         throw 'Release-layout install did not create an enabled bridge config by default.'

@@ -393,6 +393,14 @@ try {
         & $dotnet publish $hostProject -c Release -o $stagedHost
         if ($LASTEXITCODE -ne 0) { Stop-Install 'Host publish failed; no game mod or user config was changed.' }
     }
+    foreach ($contentDirectory in @('docs', 'skills')) {
+        $contentSource = Join-Path $sourceRoot $contentDirectory
+        if (-not (Test-Path -LiteralPath $contentSource -PathType Container)) {
+            Stop-Install "Install source is missing required directory: $contentSource"
+        }
+        Copy-Item -LiteralPath $contentSource -Destination $stagedHost -Recurse -Force
+    }
+
     $stagedHostExe = Join-Path $stagedHost 'ThunderRoadMcp.Host.exe'
     $stagedHostDll = Join-Path $stagedHost 'ThunderRoadMcp.Host.dll'
     if (-not (Test-Path -LiteralPath $stagedHostExe -PathType Leaf) -or

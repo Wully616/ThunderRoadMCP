@@ -47,6 +47,8 @@ The installer prints a generic MCP stdio configuration and saves it as `mcp-conf
 If `THUNDERROAD_MCP_CONFIG` or `THUNDERROAD_MCP_LAUNCH_CONFIG` is set during installation, the generated configuration includes those environment overrides. The bridge config path must also be available to the game. See [generated stdio configuration](docs/installation.md#generated-stdio-configuration) for details.
 
 Restart or reconnect the agent after changing its MCP configuration. Check `game_installations` and `game_status` first, then use the offline tools. `game_guide` returns the embedded game guide by section (default `bootstrap`) and works without the game or bridge. See [Usage](docs/usage.md) for workflows and readiness checks.
+The installer keeps the full `docs/` and `skills/` folders in the installed host directory, so they remain available after deleting the release ZIP. The optional skill is not registered with your harness automatically; copy the entire `skills/blade-and-sorcery` folder from the installed host directory to the skill location documented by your harness.
+
 
 ## Documentation
 
