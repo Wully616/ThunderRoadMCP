@@ -22,4 +22,6 @@ public class NavigationCaller
     }
     public void SubscribeLambda(Fixture.Base.NavigationTarget target) => target.Changed += () => target.CallbackWork();
     private static void OnChanged() { }
+    public void VirtualBaseCall(Fixture.Base.VirtualNavigationBase target) => target.Dispatch();
+    public void VirtualOverrideCall(Fixture.Base.VirtualNavigationOverride target) => target.Dispatch();
 }

@@ -27,7 +27,7 @@ public static class ApiNavigationTools
         ToolInvocation.Run(() => catalog.FindCalleesAsync(assemblyId, symbolId, offset, limit, snapshotId, cancellationToken));
 
     [McpServerTool(Name = "api_find_usages", Title = "Find static IL usages", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-    [Description("Find metadata-resolved field/type/method token references and property/event accessor calls to an exact symbol. Scope is required: assembly or installed snapshot. Results report actual IL opcode/offset and are static evidence only.")]
+    [Description("Find metadata-resolved field/type/method token references and property/event accessor calls. For overrides, also include callvirt references to overridden base methods as potential dispatches, marked matchKind=potentialVirtualDispatch; exact token references are marked direct. These remain static evidence, not proof of runtime dispatch.")]
     public static Task<CallToolResult> ApiFindUsages(InstalledApiCatalog catalog, string assemblyId, string symbolId,
         [Description("Required search scope: assembly or snapshot.")] string scope,
         [Description("Zero-based result offset.")] int offset = 0,

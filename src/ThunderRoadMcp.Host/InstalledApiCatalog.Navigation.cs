@@ -99,7 +99,7 @@ public sealed partial class InstalledApiCatalog
         using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
         var selected = SelectAssembly(snapshot, assemblyId);
-        var target = await ResolveApiEntityAsync(snapshot, selected, symbolId, mode == "callers", cancellationToken);
+        var target = await ResolveApiEntityAsync(snapshot, selected, symbolId, mode == "callers", mode == "usages", cancellationToken);
         var indexScope = scope == "assembly" ? selected.Id : "*";
         var index = await GetNavigationReferenceIndexAsync(snapshot, indexScope, selected, cancellationToken);
         var matched = new List<NavigationEdge>();
@@ -123,6 +123,11 @@ public sealed partial class InstalledApiCatalog
                     matched.AddRange(references.Where(reference =>
                         (scope != "assembly" || index.Assemblies[reference.AssemblyIndex].Id == selected.Id) &&
                         (mode != "callers" || reference.opcode is "call" or "callvirt" or "newobj")));
+            foreach (var targetKey in target.PotentialTargets)
+                if (index.ByTarget.TryGetValue(targetKey, out var potentialReferences))
+                    matched.AddRange(potentialReferences.Where(reference => reference.opcode == "callvirt" &&
+                        (scope != "assembly" || index.Assemblies[reference.AssemblyIndex].Id == selected.Id))
+                        .Select(reference => reference with { potentialVirtualDispatch = true }));
         }
         matched.Sort(static (left, right) =>
         {
@@ -152,7 +157,8 @@ public sealed partial class InstalledApiCatalog
     private async Task<NavigationQueryScan> ScanNavigationOverflowAsync(CatalogSnapshot snapshot,
         NavigationAssembly[] assemblies, ResolvedNavigationTarget target, string mode, CancellationToken cancellationToken)
     {
-        var targetTokens = target.Tokens.Select(token => new NavigationTargetKey(target.AssemblyId, token)).ToHashSet();
+        var directTargetKeys = target.Tokens.Select(token => new NavigationTargetKey(target.AssemblyId, token)).ToHashSet();
+        var potentialTargetKeys = target.PotentialTargets.ToHashSet();
         var edges = new List<NavigationEdge>();
         var searched = new List<string>();
         var diagnostics = snapshot.Diagnostics.ToList();
@@ -192,10 +198,13 @@ public sealed partial class InstalledApiCatalog
                             continue;
                         var resolved = ResolveReference(snapshot, typeSystem.MainModule, reference.Token);
                         if (resolved is null) { unresolved++; continue; }
-                        if (!targetTokens.Contains(new NavigationTargetKey(resolved.AssemblyId, resolved.Token))) continue;
+                        var targetKey = new NavigationTargetKey(resolved.AssemblyId, resolved.Token);
+                        var isDirect = directTargetKeys.Contains(targetKey);
+                        var isPotentialVirtualDispatch = !isDirect && mode == "usages" && reference.Kind == "method" &&
+                            reference.opcode == "callvirt" && potentialTargetKeys.Contains(targetKey);
+                        if (!isDirect && !isPotentialVirtualDispatch) continue;
                         edges.Add(new NavigationEdge(assemblyIndex, MetadataTokens.GetToken(methodHandle),
-                            reference.opcode, reference.ilOffset, reference.operandKind));
-                        if (edges.Count > NavigationMaxResults) { limited = true; break; }
+                            reference.opcode, reference.ilOffset, reference.operandKind, isPotentialVirtualDispatch));
                     }
                     if (budget.Exhausted) limited = true;
                     if (limited) break;
@@ -268,7 +277,8 @@ public sealed partial class InstalledApiCatalog
                 }
                 results[index] = new NavigationResult(sourceAssembly.Id, sourceAssembly.Name, sourceAssembly.Origin,
                     sourceAssembly.RelativePath, methodInfo.SymbolId, methodInfo.Display,
-                    edge.opcode, edge.ilOffset, edge.operandKind.ToString());
+                    edge.opcode, edge.ilOffset, edge.operandKind.ToString(),
+                    edge.potentialVirtualDispatch ? "potentialVirtualDispatch" : "direct");
             }
         }
         finally
@@ -418,7 +428,7 @@ public sealed partial class InstalledApiCatalog
             var entry = FindEntry(snapshot, definition?.ParentModule?.MetadataFile?.FileName);
             if (entry is null || definition is null || definition.MetadataToken.IsNil) return null;
             var token = MetadataTokens.GetToken(definition.MetadataToken);
-            return new ResolvedNavigationTarget(entry.Id, token, new[] { token });
+            return new ResolvedNavigationTarget(entry.Id, token, new[] { token }, Array.Empty<NavigationTargetKey>());
         }
         catch (Exception exception) when (exception is BadImageFormatException or ArgumentException or InvalidOperationException) { return null; }
     }
@@ -432,7 +442,8 @@ public sealed partial class InstalledApiCatalog
         public void Dispose() { PeReader.Dispose(); _stream.Dispose(); }
     }
 
-    private async Task<ResolvedNavigationTarget> ResolveApiEntityAsync(CatalogSnapshot snapshot, AssemblyEntry entry, string symbolId, bool requireMethod, CancellationToken cancellationToken)
+    private async Task<ResolvedNavigationTarget> ResolveApiEntityAsync(CatalogSnapshot snapshot, AssemblyEntry entry,
+        string symbolId, bool requireMethod, bool includePotentialVirtualDispatch, CancellationToken cancellationToken)
     {
         using var pe = await LoadPeAsync(entry, cancellationToken);
         using var resolver = new RootedAssemblyResolver(snapshot, entry, pe);
@@ -450,9 +461,39 @@ public sealed partial class InstalledApiCatalog
             IMember member => new[] { member.MemberDefinition },
             _ => Array.Empty<IMember>(),
         };
-        var tokens = definitions.Select(member => MetadataTokens.GetToken(member.MetadataToken)).Distinct().ToArray();
+        var members = definitions.ToArray();
+        var tokens = members.Select(member => MetadataTokens.GetToken(member.MetadataToken)).Distinct().ToArray();
         if (tokens.Length == 0) tokens = new[] { MetadataTokens.GetToken(entity.MetadataToken) };
-        return new(entry.Id, tokens[0], tokens);
+        var directTargets = tokens.Select(token => new NavigationTargetKey(entry.Id, token)).ToHashSet();
+        var potentialTargets = includePotentialVirtualDispatch
+            ? ResolvePotentialVirtualDispatchTargets(snapshot, members.OfType<IMethod>(), directTargets)
+            : Array.Empty<NavigationTargetKey>();
+        return new(entry.Id, tokens[0], tokens, potentialTargets);
+    }
+    private static NavigationTargetKey[] ResolvePotentialVirtualDispatchTargets(CatalogSnapshot snapshot,
+        IEnumerable<IMethod> methods, HashSet<NavigationTargetKey> directTargets)
+    {
+        var targets = new HashSet<NavigationTargetKey>();
+        foreach (var method in methods)
+        {
+            var current = method.MemberDefinition;
+            var visited = new HashSet<IMember>();
+            while (current.IsOverride && visited.Add(current))
+            {
+                if (InheritanceHelper.GetBaseMember(current) is not IMethod baseMethod)
+                    break;
+                var definition = baseMethod.MemberDefinition;
+                var entry = FindEntry(snapshot, definition.ParentModule?.MetadataFile?.FileName);
+                if (entry is not null && !definition.MetadataToken.IsNil)
+                {
+                    var target = new NavigationTargetKey(entry.Id, MetadataTokens.GetToken(definition.MetadataToken));
+                    if (!directTargets.Contains(target))
+                        targets.Add(target);
+                }
+                current = definition;
+            }
+        }
+        return targets.ToArray();
     }
     private async Task ThrowNavigationWrongKindAsync(CatalogSnapshot snapshot, AssemblyEntry entry, string symbolId,
         string expectedTool, CancellationToken cancellationToken)
@@ -669,10 +710,11 @@ public sealed partial class InstalledApiCatalog
         NavigationAssembly[] Assemblies, string[] SearchedAssemblies, string[] Diagnostics, int UnresolvedReferences,
         bool LimitReached, bool Complete);
     private readonly record struct NavigationTargetKey(string AssemblyId, int Token);
-    private sealed record ResolvedNavigationTarget(string AssemblyId, int Token, int[] Tokens);
+    private sealed record ResolvedNavigationTarget(string AssemblyId, int Token, int[] Tokens, NavigationTargetKey[] PotentialTargets);
     private sealed record NavigationResult(string assemblyId, string assemblyName, string origin, string relativePath,
-        string symbolId, string method, string opcode, int ilOffset, string operandKind);
-    private readonly record struct NavigationEdge(int AssemblyIndex, int MethodToken, string opcode, int ilOffset, IlOperandType operandKind);
+        string symbolId, string method, string opcode, int ilOffset, string operandKind, string matchKind);
+    private readonly record struct NavigationEdge(int AssemblyIndex, int MethodToken, string opcode, int ilOffset,
+        IlOperandType operandKind, bool potentialVirtualDispatch = false);
     private readonly record struct DecodedReference(EntityHandle Token, string Kind, string opcode, int ilOffset, IlOperandType operandKind);
     private sealed record NavigationAssembly(string Id, string Name, string Origin, string RelativePath);
     private sealed record CalleeResult(string target, int referenceToken, string referenceHandleKind,

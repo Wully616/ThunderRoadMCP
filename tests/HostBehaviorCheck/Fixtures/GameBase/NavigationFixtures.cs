@@ -21,3 +21,12 @@ public abstract class AbstractNavigationTarget
 {
     public abstract void NoBody();
 }
+public class VirtualNavigationBase
+{
+    public virtual void Dispatch() { }
+}
+
+public class VirtualNavigationOverride : VirtualNavigationBase
+{
+    public override void Dispatch() { }
+}

@@ -131,6 +131,46 @@ public static class ApiNavigationCheck
                     "field usage caller representing the property getter hands off to api_decompile");
             }
         }
+        using var virtualOverrideSearch = await apiToolJsonAsync("api_search", new
+        {
+            query = "VirtualNavigationOverride.Dispatch", assemblyId = baseId, kind = "method",
+        });
+        var virtualOverrideId = virtualOverrideSearch.RootElement.GetProperty("results").EnumerateArray()
+            .Single().GetProperty("symbolId").GetString()!;
+        using var virtualOverrideUsages = await apiToolJsonAsync("api_find_usages", new
+        {
+            assemblyId = baseId, symbolId = virtualOverrideId, scope = "snapshot",
+        });
+        var virtualOverrideUsageResults = virtualOverrideUsages.RootElement.GetProperty("results").EnumerateArray().ToArray();
+        assert(virtualOverrideUsageResults.Length == 2 &&
+               virtualOverrideUsageResults.Any(item => item.GetProperty("method").GetString() == "NavigationCaller.VirtualBaseCall" &&
+                   item.GetProperty("opcode").GetString() == "callvirt" &&
+                   item.GetProperty("matchKind").GetString() == "potentialVirtualDispatch") &&
+               virtualOverrideUsageResults.Any(item => item.GetProperty("method").GetString() == "NavigationCaller.VirtualOverrideCall" &&
+                   item.GetProperty("opcode").GetString() == "callvirt" &&
+                   item.GetProperty("matchKind").GetString() == "potentialVirtualDispatch"),
+            "override usages mark base-slot callvirt references as potential dispatches");
+        using var virtualBaseSearch = await apiToolJsonAsync("api_search", new
+        {
+            query = "VirtualNavigationBase.Dispatch", assemblyId = baseId, kind = "method",
+        });
+        var virtualBaseId = virtualBaseSearch.RootElement.GetProperty("results").EnumerateArray()
+            .Single().GetProperty("symbolId").GetString()!;
+        using var virtualBaseUsages = await apiToolJsonAsync("api_find_usages", new
+        {
+            assemblyId = baseId, symbolId = virtualBaseId, scope = "snapshot",
+        });
+        var virtualBaseUsageResults = virtualBaseUsages.RootElement.GetProperty("results").EnumerateArray().ToArray();
+        using var virtualOverrideCallers = await apiToolJsonAsync("api_find_callers", new
+        {
+            assemblyId = baseId, symbolId = virtualOverrideId, scope = "snapshot",
+        });
+        assert(virtualBaseUsageResults.Length == 2 &&
+               virtualBaseUsageResults.All(item => item.GetProperty("matchKind").GetString() == "direct") &&
+               virtualBaseUsageResults.Any(item => item.GetProperty("method").GetString() == "NavigationCaller.VirtualBaseCall") &&
+               virtualBaseUsageResults.Any(item => item.GetProperty("method").GetString() == "NavigationCaller.VirtualOverrideCall") &&
+               virtualOverrideCallers.RootElement.GetProperty("total").GetInt32() == 0,
+            "base usages remain direct and callers keep exact-token semantics");
         using var callbackSearch = await apiToolJsonAsync("api_search", new { query = "CallbackWork", assemblyId = baseId, kind = "method" });
         var callbackId = callbackSearch.RootElement.GetProperty("results").EnumerateArray().Single().GetProperty("symbolId").GetString()!;
         using var callbackCallers = await apiToolJsonAsync("api_find_callers", new { assemblyId = baseId, symbolId = callbackId, scope = "snapshot" });
