@@ -36,7 +36,7 @@ internal static class HostApplication
                 Name = "ThunderRoadMcp",
                 Version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
             };
-            options.ServerInstructions = ServerInstructions + " Unknown argument names are rejected; use the exact parameter names from each tool schema.";
+            options.ServerInstructions = ServerInstructions + " Unknown argument names are rejected; use the exact parameter names from each tool schema. Detailed timing diagnostics require THUNDERROAD_MCP_DIAGNOSTICS=1 in the MCP host process environment before startup; they are not an MCP tool and changing the setting requires restarting the host.";
         }).WithStdioServerTransport().WithToolsFromAssembly()
           .WithRequestFilters(filters => filters.AddCallToolFilter(ToolInvocation.RejectUnknownArguments));
         await builder.Build().RunAsync();

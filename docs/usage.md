@@ -39,6 +39,8 @@ Bridge-backed tools require the game, an installed bridge mod, an enabled bridge
 - `game_logs` with the `bridge` source reads the authenticated in-game log ring.
 Detailed timings are opt-in with `THUNDERROAD_MCP_DIAGNOSTICS=1` in the host environment; the host passes an explicit opt-in flag to the bridge request. Direct authenticated bridge clients may set the request's optional `diagnostics:true` field, and setting the variable in the game process also enables bridge diagnostics. Normal MCP responses omit detailed timing text and `_meta.timings` when disabled. When enabled, `hostTotalMs` measures host tool execution, `bridgeRoundTripMs` covers the host bridge-client path, and `bridgeRequestTotalMs` measures bridge dispatch. Evaluate stages include `compilerQueueWaitMs`, aggregate `compilationMs`, `referenceInitializationMs`, `parseMs`, `emitMs`, `assemblyLoadMs`, `mainThreadQueueWaitMs`, `invocationMs`, and `serializationMs`. Only observed stages are reported. These server-side values are not client-observed MCP latency.
 
+To enable host timings for an MCP session, set `THUNDERROAD_MCP_DIAGNOSTICS=1` in the MCP client's server-launch environment, then restart the MCP host. This is not an MCP tool or runtime setting, so a connected LLM cannot turn it on during a session. Setting the variable in the game process is a separate bridge-side opt-in.
+
 
 ## Live game runtime
 
