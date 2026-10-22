@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using ModelContextProtocol.Protocol;
@@ -10,6 +11,9 @@ public sealed record ApiDecompileBatchItem(
     [property: Description("One-based source line.")] int StartLine = 1,
     [property: Description("Source lines for this member, 1 to 500.")] int LineCount = 200);
 
+internal sealed record ResolvedApiScope(string Requested, string Effective,
+    IReadOnlySet<InstalledApiCatalog.LoadedAssemblyIdentity>? LoadedAssemblies, string Diagnostic,
+    bool InventoryTruncated, string ScopeSnapshotId);
 
 [McpServerToolType]
 public static class ApiDiscoveryTools
@@ -37,26 +41,28 @@ public static class ApiDiscoveryTools
         [Description("Maximum results in this page.")] int limit = 50,
         [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
         [Description("Assembly scope: auto (default), installed (game plus enabled mods; offline modding), or loaded (only what the running game loaded; for evaluate_csharp).")] string? scope = null,
+        [Description("Pagination contract version: 1 is legacy best-effort; 2 requires scopeSnapshotId for offset pages.")] int paginationVersion = 1,
+        [Description("Scope identity from the first page; required for offset>0 when paginationVersion=2.")] string? scopeSnapshotId = null,
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(async () =>
         {
-            var (loadedModAssemblies, scopeDiagnostic) = await ResolveScopeAsync(gameProcess, scope, cancellationToken);
+            var resolvedScope = await ResolveScopeAsync(gameProcess, scope, cancellationToken);
             return await catalog.SearchAsync(query, assemblyId, kind, includeNonPublic, offset, limit, snapshotId,
-                cancellationToken, loadedModAssemblies, scopeDiagnostic, origin);
+                paginationVersion, scopeSnapshotId, cancellationToken, resolvedScope, origin);
         });
 
     /// <summary>
     /// Resolves the assembly scope. Returns the bridge's loaded mod set for loaded scope, or null for installed scope
     /// (game assemblies plus every enabled mod on disk), plus a diagnostic naming the scope applied.
     /// </summary>
-    internal static async Task<(IReadOnlySet<InstalledApiCatalog.LoadedAssemblyIdentity>? Loaded, string Diagnostic)> ResolveScopeAsync(
+    internal static async Task<ResolvedApiScope> ResolveScopeAsync(
         GameProcess gameProcess, string? scope, CancellationToken cancellationToken)
     {
         var requested = (scope ?? "auto").Trim().ToLowerInvariant();
         if (requested is not ("auto" or "installed" or "loaded"))
             throw new ArgumentException("scope must be auto, installed, or loaded.", nameof(scope));
         if (requested == "installed")
-            return (null, "Assembly scope: installed (game assemblies and enabled mods on disk).");
+            return CreateScope(requested, null, false, "Assembly scope: installed (game assemblies and enabled mods on disk).");
         string? unavailable = null;
         using var status = JsonDocument.Parse(await gameProcess.StatusAsync(true, cancellationToken));
         var root = status.RootElement;
@@ -89,15 +95,41 @@ public static class ApiDiscoveryTools
                                  truncated.ValueKind == JsonValueKind.True;
         }
         if (unavailable is null)
-            return (loaded, truncatedInventory
+        {
+            var diagnostic = truncatedInventory
                 ? "Assembly scope: loaded (mods reported by the running game); the bridge inventory was truncated, so some loaded mods may be missing."
-                : "Assembly scope: loaded (mods reported by the running game).");
+                : "Assembly scope: loaded (mods reported by the running game).";
+            return CreateScope(requested, loaded, truncatedInventory, diagnostic);
+        }
         if (requested == "loaded")
             throw new ApiDiscoveryException("scope.unavailable",
                 $"scope=\"loaded\" needs the running game's assembly inventory, but {unavailable}. Start the game and call game_wait_ready, or use scope=\"installed\".",
                 new { tool = "game_wait_ready", arguments = new { timeoutMs = 30000 } });
-        return (null, $"Assembly scope: installed because {unavailable}; enabled mods on disk are included even if the game would not load them. Use scope=\"loaded\" with a running game before writing evaluate_csharp code.");
+        return CreateScope(requested, null, false,
+            $"Assembly scope: installed because {unavailable}; enabled mods on disk are included even if the game would not load them. Use scope=\"loaded\" with a running game before writing evaluate_csharp code.");
     }
+
+    private static ResolvedApiScope CreateScope(string requested,
+        IReadOnlySet<InstalledApiCatalog.LoadedAssemblyIdentity>? loaded, bool inventoryTruncated, string diagnostic)
+    {
+        var effective = loaded is null ? "installed" : "loaded";
+        var assemblies = loaded is null
+            ? Array.Empty<ScopeAssembly>()
+            : loaded.Select(identity => new ScopeAssembly(
+                    OperatingSystem.IsWindows() ? identity.RelativePath.ToUpperInvariant() : identity.RelativePath,
+                    identity.ModuleVersionId))
+                .OrderBy(identity => identity.RelativePath, StringComparer.Ordinal)
+                .ThenBy(identity => identity.ModuleVersionId)
+                .ToArray();
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(
+            new ScopeFingerprint(requested, effective, inventoryTruncated, assemblies));
+        var scopeSnapshotId = "scope1." + Convert.ToHexString(SHA256.HashData(bytes));
+        return new ResolvedApiScope(requested, effective, loaded, diagnostic, inventoryTruncated, scopeSnapshotId);
+    }
+
+    private sealed record ScopeFingerprint(string Requested, string Effective, bool InventoryTruncated,
+        ScopeAssembly[] LoadedAssemblies);
+    private sealed record ScopeAssembly(string RelativePath, Guid ModuleVersionId);
 
     [McpServerTool(Name = "api_type", Title = "Inspect an installed API type", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
     [Description("Inspect a discovered type's declaration, bases, interfaces, generic constraints, and paged members. Use the type symbolId and assemblyId from api_search; inherited members report their declaring assembly and type. Carry snapshotId and nextOffset to continue. Members omit fields identical to the type's own provenance; inherited members from other assemblies keep assemblyId and declaringType.")]
@@ -132,14 +164,12 @@ public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCa
     CancellationToken cancellationToken = default) =>
     ToolInvocation.Run(async () =>
     {
-        var (loadedModAssemblies, scopeDiagnostic) = query is null
-            ? (null, null)
+        var resolvedScope = query is null
+            ? null
             : await ResolveScopeAsync(gameProcess, scope, cancellationToken);
         return await catalog.LookupAsync(query, assemblyId, symbolId, kind, mode, startLine, lineCount, snapshotId,
-            maxResults, maxChars, includeExamples, continuation, baseCatalog, cancellationToken, loadedModAssemblies, scopeDiagnostic);
+            maxResults, maxChars, includeExamples, continuation, baseCatalog, cancellationToken, resolvedScope);
     });
-
-
     [McpServerTool(Name = "api_decompile", Title = "Read reconstructed API source", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
     [Description("Reconstruct C# for a catalogued type or exact member symbolId, including a selected overload. Output is bounded and paged reconstructed source, not original source, and installed code is never executed. Carry snapshotId and nextLine to continue.")]
     public static Task<CallToolResult> ApiDecompile(InstalledApiCatalog catalog,

@@ -75,10 +75,12 @@ public sealed partial class InstalledApiCatalog
     }
 
     internal async Task<string> SearchAsync(string query, string? assemblyId, string? kind, bool includeNonPublic,
-        int offset, int limit, string? snapshotId, CancellationToken cancellationToken,
-        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies, string? loadedAssemblyDiagnostic, string? origin = null)
+        int offset, int limit, string? snapshotId, int paginationVersion, string? scopeSnapshotId,
+        CancellationToken cancellationToken, ResolvedApiScope scope, string? origin = null)
     {
         ValidatePage(offset, limit, MaxPageSize);
+        if (paginationVersion is not (1 or 2))
+            throw new ArgumentOutOfRangeException(nameof(paginationVersion), "paginationVersion must be 1 or 2.");
         if (string.IsNullOrWhiteSpace(query) || query.Length > 128)
             throw new ArgumentException("query must contain 1 to 128 characters.", nameof(query));
         var kindFilter = ParseKind(kind);
@@ -87,8 +89,35 @@ public sealed partial class InstalledApiCatalog
         origin = origin?.ToLowerInvariant();
         using var snapshot = await ScanAsync(cancellationToken);
         CheckSnapshot(snapshot, snapshotId);
+        if (offset > 0)
+        {
+            if (paginationVersion == 2 && string.IsNullOrWhiteSpace(scopeSnapshotId))
+                throw new ApiDiscoveryException("scope.snapshot_required",
+                    "paginationVersion=2 requires scopeSnapshotId for offset pages; restart api_search at offset 0.",
+                    new
+                    {
+                        tool = "api_search",
+                        arguments = new
+                        {
+                            query, assemblyId, kind = kindFilter, origin, includeNonPublic,
+                            offset = 0, limit, snapshotId = snapshot.Id, scope = scope.Requested, paginationVersion = 2,
+                        },
+                    });
+            if (scopeSnapshotId is not null && !scopeSnapshotId.Equals(scope.ScopeSnapshotId, StringComparison.Ordinal))
+                throw new ApiDiscoveryException("scope.stale",
+                    "scopeSnapshotId does not match the current requested/effective assembly scope; restart api_search at offset 0.",
+                    new
+                    {
+                        tool = "api_search",
+                        arguments = new
+                        {
+                            query, assemblyId, kind = kindFilter, origin, includeNonPublic,
+                            offset = 0, limit, snapshotId = snapshot.Id, scope = scope.Requested, paginationVersion = 2,
+                        },
+                    });
+        }
         var (ordered, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, includeNonPublic,
-            cancellationToken, loadedModAssemblies, loadedAssemblyDiagnostic, origin);
+            cancellationToken, scope.LoadedAssemblies, scope.Diagnostic, origin);
         if (offset > ordered.Length)
             throw new ArgumentOutOfRangeException(nameof(offset), $"offset {offset} exceeds the result count {ordered.Length}.");
         var page = ordered.Skip(offset).Take(limit).ToArray();
@@ -102,6 +131,12 @@ public sealed partial class InstalledApiCatalog
             hasMore,
             nextOffset = hasMore ? offset + page.Length : (int?)null,
             snapshotId = snapshot.Id,
+            scope = scope.Requested,
+            effectiveScope = scope.Effective,
+            scopeSnapshotId = scope.ScopeSnapshotId,
+            paginationVersion,
+            scopeInventoryTruncated = scope.InventoryTruncated,
+            partial = scope.InventoryTruncated,
             diagnostics,
         });
     }
@@ -499,7 +534,7 @@ public sealed partial class InstalledApiCatalog
     internal async Task<string> LookupAsync(string? query, string? assemblyId, string? symbolId, string? kind,
         string? mode, int startLine, int lineCount, string? snapshotId, int maxResults, int maxChars,
         bool includeExamples, string? continuation, BaseCatalogDataCatalog? baseCatalog, CancellationToken cancellationToken,
-        IReadOnlySet<LoadedAssemblyIdentity>? loadedModAssemblies = null, string? loadedAssemblyDiagnostic = null)
+        ResolvedApiScope? resolvedScope = null)
     {
         using var timing = ToolTiming.Measure("apiLookupMs");
         if (query is not null && symbolId is not null)
@@ -535,7 +570,7 @@ public sealed partial class InstalledApiCatalog
                 throw new ArgumentOutOfRangeException(nameof(maxChars), "maxChars must be between 3000 and 32000.");
             return await TaskLookupAsync(snapshot, query, assemblyId, kindFilter, maxResults, maxChars,
                 includeExamples, continuation, baseCatalog, cancellationToken,
-                ExcludedModAssemblyIds(snapshot, loadedModAssemblies), loadedAssemblyDiagnostic);
+                ExcludedModAssemblyIds(snapshot, resolvedScope?.LoadedAssemblies), resolvedScope?.Diagnostic, resolvedScope);
         }
         if (startLine < 1)
             throw new ArgumentOutOfRangeException(nameof(startLine), "startLine must be at least 1.");
@@ -545,7 +580,7 @@ public sealed partial class InstalledApiCatalog
         if (query is not null)
         {
             var (searchHits, diagnostics) = await SearchHitsAsync(snapshot, query, assemblyId, kindFilter, false, cancellationToken,
-                loadedModAssemblies, loadedAssemblyDiagnostic);
+                resolvedScope?.LoadedAssemblies, resolvedScope?.Diagnostic);
             var exactHitCount = searchHits.Count(hit => hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase));
             var hits = exactHitCount > 0
                 ? searchHits.Where(hit => hit.qualifiedName.Equals(query, StringComparison.OrdinalIgnoreCase)).ToArray()
@@ -579,10 +614,17 @@ public sealed partial class InstalledApiCatalog
                                 offset = 20,
                                 limit = 20,
                                 snapshotId = snapshot.Id,
+                                scope = resolvedScope!.Requested,
+                                paginationVersion = 2,
+                                scopeSnapshotId = resolvedScope.ScopeSnapshotId,
                             },
                         }
                         : null,
                     snapshotId = snapshot.Id,
+                    scope = resolvedScope!.Requested,
+                    effectiveScope = resolvedScope.Effective,
+                    scopeInventoryTruncated = resolvedScope.InventoryTruncated,
+                    partial = resolvedScope.InventoryTruncated,
                     diagnostics,
                 });
             }
@@ -590,7 +632,15 @@ public sealed partial class InstalledApiCatalog
             var match = hits[0];
             var entry = SelectAssembly(snapshot, match.assemblyId);
             var (_, source) = await DecompileSnapshotAsync(snapshot, entry, match.symbolId, startLine, lineCount, includeHit: false, cancellationToken);
-            return SerializeResponse(new { mode = "symbol", query, found = true, ambiguous = false, match, source, snapshotId = snapshot.Id, diagnostics });
+            return SerializeResponse(new
+            {
+                mode = "symbol", query, found = true, ambiguous = false, match, source, snapshotId = snapshot.Id,
+                scope = resolvedScope!.Requested,
+                effectiveScope = resolvedScope.Effective,
+                scopeInventoryTruncated = resolvedScope.InventoryTruncated,
+                partial = resolvedScope.InventoryTruncated,
+                diagnostics,
+            });
         }
 
         var exactEntry = SelectAssembly(snapshot, assemblyId!);

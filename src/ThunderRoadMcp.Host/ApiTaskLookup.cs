@@ -15,13 +15,24 @@ public sealed partial class InstalledApiCatalog
     private const int MaxLookupTotalRelatedNames = MaxLookupRelatedNames + MaxLookupRelatedDepth * MaxLookupRelatedTypes;
     private async Task<string> TaskLookupAsync(CatalogSnapshot snapshot, string query, string? assemblyId, string? kindFilter,
         int maxResults, int maxChars, bool includeExamples, string? continuation, BaseCatalogDataCatalog? baseCatalog,
-        CancellationToken cancellationToken, HashSet<string> excludedAssemblyIds, string? loadedAssemblyDiagnostic)
+        CancellationToken cancellationToken, HashSet<string> excludedAssemblyIds, string? loadedAssemblyDiagnostic,
+        ResolvedApiScope? resolvedScope)
     {
+        var scopeSnapshotId = resolvedScope?.ScopeSnapshotId ?? "";
+        var scopePartial = resolvedScope?.InventoryTruncated == true;
         var (offset, continuationError) = ReadLookupContinuation(continuation, snapshot.Id, query, assemblyId,
-            kindFilter, maxResults, maxChars, includeExamples);
+            kindFilter, maxResults, maxChars, includeExamples, scopeSnapshotId);
         if (continuationError is not null)
-            throw new InvalidOperationException(continuationError);
-
+            throw new ApiDiscoveryException("lookup.continuation_stale", continuationError,
+                new
+                {
+                    tool = "api_lookup",
+                    arguments = new
+                    {
+                        query, assemblyId, kind = kindFilter, mode = "task", maxResults, maxChars, includeExamples,
+                        scope = resolvedScope?.Requested ?? "auto", snapshotId = snapshot.Id,
+                    },
+                });
         var candidates = new ApiLookupRanker.CandidateAccumulator(query, ApiLookupRanker.MaxCandidates);
         var declarationsConsidered = 0;
         var exampleNames = includeExamples
@@ -218,6 +229,10 @@ public sealed partial class InstalledApiCatalog
             ["mode"] = "task",
             ["query"] = query,
             ["snapshotId"] = snapshot.Id,
+            ["scope"] = resolvedScope?.Requested,
+            ["effectiveScope"] = resolvedScope?.Effective,
+            ["scopeInventoryTruncated"] = scopePartial,
+            ["partial"] = scopePartial,
             ["rankingVersion"] = ApiLookupRanker.Version,
             ["found"] = candidates.TotalMatches > 0,
             ["ambiguous"] = candidates.ExactMatches > 1,
@@ -247,7 +262,7 @@ public sealed partial class InstalledApiCatalog
             },
             ["warnings"] = new JsonArray(),
             ["missingInformation"] = new JsonArray(),
-            ["complete"] = indexComplete,
+            ["complete"] = indexComplete && !scopePartial,
             ["truncated"] = omittedCandidates > 0,
             ["confidence"] = ranked.Length == 0 ? "none" : page.Length > 0 && page[0].IsLowConfidence ? "low" : "medium",
         };
@@ -737,9 +752,9 @@ public sealed partial class InstalledApiCatalog
         response["hasMore"] = hasMore;
         if (hasMore)
             response["continuation"] = MakeLookupContinuation(snapshot.Id, query, assemblyId, kindFilter,
-                maxResults, maxChars, includeExamples, nextOffset);
+                maxResults, maxChars, includeExamples, scopeSnapshotId, nextOffset);
         response["truncated"] = truncated;
-        response["complete"] = complete && !truncated;
+        response["complete"] = complete && !truncated && !scopePartial;
         response["confidence"] = results.Count == 0 ? "none" :
             results[0]!["relevance"]!["confidence"]!.GetValue<string>() == "low" ? "low" : "supported";
         if (ranked.Length == 0)
@@ -810,7 +825,7 @@ public sealed partial class InstalledApiCatalog
             nextOffset = offset + processedPageCount;
             response["hasMore"] = nextOffset < ranked.Length;
             response["continuation"] = response["hasMore"]!.GetValue<bool>()
-                ? MakeLookupContinuation(snapshot.Id, query, assemblyId, kindFilter, maxResults, maxChars, includeExamples, nextOffset)
+                ? MakeLookupContinuation(snapshot.Id, query, assemblyId, kindFilter, maxResults, maxChars, includeExamples, scopeSnapshotId, nextOffset)
                 : null;
         }
         if (LogicalLength(response) > maxChars)
@@ -1117,15 +1132,15 @@ public sealed partial class InstalledApiCatalog
     }
 
     private static (int Offset, string? Error) ReadLookupContinuation(string? token, string snapshotId, string query,
-        string? assemblyId, string? kind, int maxResults, int maxChars, bool includeExamples)
+        string? assemblyId, string? kind, int maxResults, int maxChars, bool includeExamples, string scopeSnapshotId)
     {
         if (token is null)
             return (0, null);
         try
         {
             var parts = token.Split('.', 3);
-            if (parts.Length != 3 || parts[0] != "lk2")
-                return (0, "continuation is invalid; restart api_lookup without continuation.");
+            if (parts.Length != 3 || parts[0] != "lk3")
+                return (0, "continuation is invalid or predates scope-bound pagination; restart api_lookup without continuation.");
             var encoded = parts[1].Replace('-', '+').Replace('_', '/');
             encoded = encoded.PadRight((encoded.Length + 3) / 4 * 4, '=');
             var bytes = Convert.FromBase64String(encoded);
@@ -1135,12 +1150,15 @@ public sealed partial class InstalledApiCatalog
             var payload = JsonSerializer.Deserialize<LookupContinuationPayload>(bytes);
             if (payload is null)
                 return (0, "continuation is invalid; restart api_lookup without continuation.");
-            if (payload.Version != 2 || payload.RankingVersion != ApiLookupRanker.Version)
+            if (payload.Version != 3 || payload.RankingVersion != ApiLookupRanker.Version)
                 return (0, "continuation version is no longer supported; restart api_lookup without continuation.");
-            if (string.IsNullOrWhiteSpace(payload.SnapshotId) || string.IsNullOrWhiteSpace(payload.QueryFingerprint) || payload.Offset < 0)
+            if (string.IsNullOrWhiteSpace(payload.SnapshotId) || string.IsNullOrWhiteSpace(payload.QueryFingerprint) ||
+                string.IsNullOrWhiteSpace(payload.ScopeSnapshotId) || payload.Offset < 0)
                 return (0, "continuation is invalid; restart api_lookup without continuation.");
             if (!string.Equals(payload.SnapshotId, snapshotId, StringComparison.Ordinal))
                 return (0, "continuation snapshot is stale; restart api_lookup without continuation and use current IDs.");
+            if (!string.Equals(payload.ScopeSnapshotId, scopeSnapshotId, StringComparison.Ordinal))
+                return (0, "continuation scope is stale; restart api_lookup without continuation using the current scope.");
             if (!string.Equals(payload.QueryFingerprint, QueryFingerprint(query), StringComparison.Ordinal) ||
                 payload.AssemblyId != assemblyId || payload.Kind != kind || payload.MaxResults != maxResults ||
                 payload.MaxChars != maxChars || payload.IncludeExamples != includeExamples)
@@ -1154,19 +1172,19 @@ public sealed partial class InstalledApiCatalog
     }
 
     private static string MakeLookupContinuation(string snapshotId, string query, string? assemblyId, string? kind,
-        int maxResults, int maxChars, bool includeExamples, int offset)
+        int maxResults, int maxChars, bool includeExamples, string scopeSnapshotId, int offset)
     {
-        var payload = new LookupContinuationPayload(2, snapshotId, QueryFingerprint(query), assemblyId, kind, maxResults, maxChars,
-            includeExamples, ApiLookupRanker.Version, offset);
+        var payload = new LookupContinuationPayload(3, snapshotId, QueryFingerprint(query), assemblyId, kind, maxResults, maxChars,
+            includeExamples, ApiLookupRanker.Version, scopeSnapshotId, offset);
         var bytes = JsonSerializer.SerializeToUtf8Bytes(payload);
         var encoded = Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-        return "lk2." + encoded + "." + Convert.ToHexString(SHA256.HashData(bytes))[..16];
+        return "lk3." + encoded + "." + Convert.ToHexString(SHA256.HashData(bytes))[..16];
     }
 
     private static string QueryFingerprint(string query) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(query)));
 
     private sealed record LookupContinuationPayload(int Version, string SnapshotId, string QueryFingerprint, string? AssemblyId,
-        string? Kind, int MaxResults, int MaxChars, bool IncludeExamples, string RankingVersion, int Offset);
+        string? Kind, int MaxResults, int MaxChars, bool IncludeExamples, string RankingVersion, string ScopeSnapshotId, int Offset);
     private async Task ThrowMissingMemberDiagnosticAsync(CatalogSnapshot snapshot, string query, string? assemblyId,
         CancellationToken cancellationToken)
     {

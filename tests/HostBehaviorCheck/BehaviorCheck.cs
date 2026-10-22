@@ -181,6 +181,7 @@ var reloadAlreadyCurrentNext = 0;
 var sameLevelReloadPhase = 0;
 var oldBridgeStatus = false;
 var oldBridgeRuntime = false;
+var loadedInventoryTruncated = false;
 string loadedModMvid;
 using (var loadedModStream = File.OpenRead(apiModSharedPath))
 using (var loadedModPe = new PEReader(loadedModStream))
@@ -895,14 +896,110 @@ async Task CheckApiToolsAsync()
     }
     loadedAssemblyFixture.Add(loadedModFixture);
 
-    using var sharedSearchPage = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", offset = 0, limit = 1 });
-    Assert(sharedSearchPage.RootElement.GetProperty("total").GetInt32() == 2 && sharedSearchPage.RootElement.GetProperty("hasMore").GetBoolean(),
-        "search result pagination reports remaining hits");
-    var nextSearchOffset = sharedSearchPage.RootElement.GetProperty("nextOffset").GetInt32();
-    using var nextSharedSearchPage = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", offset = nextSearchOffset, limit = 1 });
-    Assert(sharedSearchPage.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() !=
-           nextSharedSearchPage.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString(), "search pages expose both duplicate assemblies");
-
+    using var sharedSearchPage = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", offset = 0, limit = 1, paginationVersion = 2, scope = "loaded" });
+    var searchRoot = sharedSearchPage.RootElement;
+    var searchDigest = searchRoot.GetProperty("scopeSnapshotId").GetString()!;
+    Assert(searchRoot.GetProperty("paginationVersion").GetInt32() == 2 &&
+           searchRoot.GetProperty("scope").GetString() == "loaded" &&
+           searchRoot.GetProperty("effectiveScope").GetString() == "loaded" &&
+           searchRoot.GetProperty("scopeInventoryTruncated").GetBoolean() == false &&
+           searchRoot.GetProperty("partial").GetBoolean() == false &&
+           searchRoot.GetProperty("total").GetInt32() == 2 && searchRoot.GetProperty("hasMore").GetBoolean(),
+        "strict search reports its normalized scope and complete pagination state");
+    var nextSearchOffset = searchRoot.GetProperty("nextOffset").GetInt32();
+    using var nextSharedSearchPage = await ApiToolJsonAsync("api_search", new
+    {
+        query = "SharedSurface", kind = "type", offset = nextSearchOffset, limit = 1,
+        paginationVersion = 2, scope = "loaded", scopeSnapshotId = searchDigest,
+    });
+    var strictPageIds = new[]
+    {
+        searchRoot.GetProperty("results")[0].GetProperty("symbolId").GetString(),
+        nextSharedSearchPage.RootElement.GetProperty("results")[0].GetProperty("symbolId").GetString(),
+    };
+    Assert(nextSharedSearchPage.RootElement.GetProperty("scopeSnapshotId").GetString() == searchDigest &&
+           strictPageIds.Distinct(StringComparer.Ordinal).Count() == 2 &&
+           strictPageIds.ToHashSet(StringComparer.Ordinal).SetEquals(sharedHits.Select(hit => hit.GetProperty("symbolId").GetString()!)),
+        "unchanged strict search pages return every matching record once without shifting");
+    var mismatchedLoadedMod = new
+    {
+        name = "Fixture.Shared",
+        version = "1.0.0.0",
+        moduleVersionId = Guid.Empty.ToString("D"),
+        origin = "mod",
+        relativePath = "FixtureMod/Fixture.Shared.dll",
+    };
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(mismatchedLoadedMod);
+    using (var mismatchedLoadedSearch = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(mismatchedLoadedSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
+               mismatchedLoadedSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == gameAssemblyId,
+            "loaded scope excludes a disk assembly with an MVID mismatch but retains game assemblies");
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(loadedModFixture);
+    using (var missingScopeToken = await ToolAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", offset = nextSearchOffset, limit = 1,
+               paginationVersion = 2, scope = "loaded",
+           }))
+    {
+        var error = missingScopeToken.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error");
+        Assert(IsError(missingScopeToken) && error.GetProperty("code").GetString() == "scope.snapshot_required" &&
+               error.GetProperty("recovery").GetProperty("arguments").GetProperty("offset").GetInt32() == 0,
+            "strict offset pages require a scope token and provide an offset-zero recovery");
+    }
+    var extraLoadedIdentity = new
+    {
+        name = "Unmatched.Fixture",
+        version = "1.0.0.0",
+        moduleVersionId = Guid.NewGuid().ToString("D"),
+        origin = "mod",
+        relativePath = "Unmatched/Fixture.dll",
+    };
+    loadedAssemblyFixture.Add(extraLoadedIdentity);
+    using (var staleScopePage = await ToolAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", offset = nextSearchOffset, limit = 1,
+               paginationVersion = 2, scope = "loaded", scopeSnapshotId = searchDigest,
+           }))
+    {
+        var error = staleScopePage.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error");
+        Assert(IsError(staleScopePage) && error.GetProperty("code").GetString() == "scope.stale" &&
+               error.GetProperty("recovery").GetProperty("arguments").GetProperty("offset").GetInt32() == 0,
+            "changed loaded inventory rejects strict continuation with a restart recovery");
+    }
+    using (var legacySearchPage = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", offset = nextSearchOffset, limit = 1, scope = "loaded",
+           }))
+        Assert(legacySearchPage.RootElement.GetProperty("paginationVersion").GetInt32() == 1 &&
+               legacySearchPage.RootElement.GetProperty("scopeSnapshotId").GetString() != searchDigest &&
+               legacySearchPage.RootElement.GetProperty("results").GetArrayLength() == 1,
+            "legacy v1 pagination remains unprotected when unmatched loaded inventory changes");
+    loadedAssemblyFixture.Remove(extraLoadedIdentity);
+    loadedInventoryTruncated = true;
+    using (var truncatedInventorySearch = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", offset = 0, limit = 1, paginationVersion = 2, scope = "loaded",
+           }))
+    {
+        Assert(truncatedInventorySearch.RootElement.GetProperty("partial").GetBoolean() &&
+               truncatedInventorySearch.RootElement.GetProperty("scopeInventoryTruncated").GetBoolean() &&
+               truncatedInventorySearch.RootElement.GetProperty("scopeSnapshotId").GetString() != searchDigest,
+            "truncated loaded inventory is reported partial and contributes to the scope digest");
+        using var truncatedLookup = await ApiToolJsonAsync("api_lookup", new
+        {
+            query = "SharedSurface", kind = "type", includeExamples = false, scope = "loaded",
+        });
+        Assert(truncatedLookup.RootElement.GetProperty("partial").GetBoolean() &&
+               truncatedLookup.RootElement.GetProperty("scopeInventoryTruncated").GetBoolean() &&
+               !truncatedLookup.RootElement.GetProperty("complete").GetBoolean(),
+            "truncated loaded inventory marks task lookup incomplete");
+    }
+    loadedInventoryTruncated = false;
     using var overloadSearch = await ApiToolJsonAsync("api_search", new { query = "overload", assemblyId = modAssemblyId });
     var overloads = overloadSearch.RootElement.GetProperty("results").EnumerateArray().ToArray();
     Assert(overloads.Length == 2 && overloads.Select(hit => hit.GetProperty("symbolId").GetString()).Distinct().Count() == 2,
@@ -926,6 +1023,7 @@ async Task CheckApiToolsAsync()
         assemblyId = modAssemblyId,
         kind = "method",
         maxResults = 1,
+        scope = "loaded",
         includeExamples = false,
     });
     var taskLookupRoot = taskLookup.RootElement;
@@ -945,12 +1043,31 @@ async Task CheckApiToolsAsync()
         kind = "method",
         maxResults = 1,
         includeExamples = false,
+        scope = "loaded",
         continuation = taskContinuation,
     });
     Assert(nextTaskLookup.RootElement.GetProperty("offset").GetInt32() == 1 &&
            nextTaskLookup.RootElement.GetProperty("results")[0].GetProperty("symbolId").GetString() != firstTaskId &&
            nextTaskLookup.RootElement.GetProperty("snapshotId").GetString() == taskLookupRoot.GetProperty("snapshotId").GetString(),
-        "task lookup continuation is stable and bound to the installed API snapshot");
+        "task lookup continuation advances within the installed API snapshot");
+    loadedAssemblyFixture.Add(extraLoadedIdentity);
+    using (var staleTaskContinuation = await ToolAsync("api_lookup", new
+           {
+               query = "overload", assemblyId = modAssemblyId, kind = "method", maxResults = 1,
+               includeExamples = false, continuation = taskContinuation,
+               scope = "loaded",
+           }))
+    {
+        var error = staleTaskContinuation.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error");
+        var recovery = error.GetProperty("recovery");
+        Assert(IsError(staleTaskContinuation) && error.GetProperty("code").GetString() == "lookup.continuation_stale" &&
+               recovery.GetProperty("tool").GetString() == "api_lookup" &&
+               recovery.GetProperty("arguments").GetProperty("query").GetString() == "overload" &&
+               recovery.GetProperty("arguments").GetProperty("mode").GetString() == "task" &&
+               recovery.GetProperty("arguments").GetProperty("scope").GetString() == "loaded",
+            "task continuation rejects a changed loaded set with structured api_lookup restart recovery");
+    }
+    loadedAssemblyFixture.Remove(extraLoadedIdentity);
     const string exactQualifiedQuery = "Fixture.Shared.ExactLookupSurface.Resolve";
     using var exactQualifiedLookup = await ApiToolJsonAsync("api_lookup", new
     {
@@ -968,7 +1085,7 @@ async Task CheckApiToolsAsync()
            exactQualifiedSource.Contains("Resolve()", StringComparison.Ordinal) &&
            !exactQualifiedSource.Contains("ResolveHelper", StringComparison.Ordinal),
         "fully qualified api_lookup prefers exact names over longer substring matches");
-    using var boundedLookup = await ApiToolJsonAsync("api_lookup", new { query = "Page", mode = "symbol", assemblyId = gameAssemblyId, kind = "method" });
+    using var boundedLookup = await ApiToolJsonAsync("api_lookup", new { query = "Page", mode = "symbol", assemblyId = gameAssemblyId, kind = "method", scope = "loaded" });
     var boundedRoot = boundedLookup.RootElement;
     var nextSearch = boundedRoot.GetProperty("nextSearch");
     var nextSearchArguments = nextSearch.GetProperty("arguments");
@@ -981,11 +1098,16 @@ async Task CheckApiToolsAsync()
            nextSearchArguments.GetProperty("offset").GetInt32() == 20 &&
            nextSearchArguments.GetProperty("assemblyId").GetString() == gameAssemblyId &&
            nextSearchArguments.GetProperty("kind").GetString() == "method" &&
-           nextSearchArguments.GetProperty("snapshotId").GetString() == boundedRoot.GetProperty("snapshotId").GetString(),
-        "bounded ambiguous lookup provides an actionable api_search continuation");
+           nextSearchArguments.GetProperty("scope").GetString() == "loaded" &&
+           nextSearchArguments.GetProperty("paginationVersion").GetInt32() == 2 &&
+           !string.IsNullOrEmpty(nextSearchArguments.GetProperty("scopeSnapshotId").GetString()),
+        "bounded ambiguous lookup provides an actionable v2 api_search continuation bound to loaded scope");
     using var remainingSearch = await ApiToolJsonAsync("api_search", nextSearchArguments);
     Assert(remainingSearch.RootElement.GetProperty("offset").GetInt32() == 20 &&
            remainingSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
+           remainingSearch.RootElement.GetProperty("scope").GetString() == "loaded" &&
+           remainingSearch.RootElement.GetProperty("paginationVersion").GetInt32() == 2 &&
+           remainingSearch.RootElement.GetProperty("scopeSnapshotId").GetString() == nextSearchArguments.GetProperty("scopeSnapshotId").GetString() &&
            !firstCandidateIds.Contains(remainingSearch.RootElement.GetProperty("results")[0].GetProperty("symbolId").GetString()!),
         "nextSearch retrieves candidates omitted from bounded lookup results");
     foreach (var overload in overloads)
@@ -1335,7 +1457,7 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                     sceneReady = true,
                     loadedAssemblies = loadedAssemblyFixture,
                     loadedAssemblyCount = loadedAssemblyFixture.Count,
-                    loadedAssembliesTruncated = false,
+                    loadedAssembliesTruncated = loadedInventoryTruncated,
                 };
             else
                 statusResult = new { processId = 123, bridgeReady = true, currentLevel = "Arena", levelState = "Loaded", sceneReady = true };
