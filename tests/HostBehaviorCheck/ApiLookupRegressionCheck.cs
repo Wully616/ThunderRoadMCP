@@ -230,9 +230,9 @@ public static class ApiLookupRegressionCheck
             var root = first.RootElement;
             var token = root.GetProperty("continuation").GetString();
             assert(root.GetProperty("logicalChars").GetInt32() == root.GetRawText().Length &&
-                   root.GetProperty("logicalChars").GetInt32() <= 12000 &&
+                   root.GetProperty("logicalChars").GetInt32() <= 12000 && Results(first).Length == 2 &&
                    root.GetProperty("hasMore").GetBoolean() && !string.IsNullOrEmpty(token),
-                "paged task response includes its own logicalChars and supplies a continuation");
+                "paged task response emits multiple results and supplies a continuation");
             if (!string.IsNullOrEmpty(token))
             {
                 using var next = await apiToolJsonAsync("api_lookup", new
@@ -281,6 +281,87 @@ public static class ApiLookupRegressionCheck
                 }
             }
         }
+        async Task<string[]> CollectPages(int maxResults, int maxChars)
+        {
+            var symbolIds = new List<string>();
+            string? continuation = null;
+            string? snapshotId = null;
+            var previousOffset = -1;
+            for (var pageIndex = 0; pageIndex < 32; pageIndex++)
+            {
+                using var page = await apiToolJsonAsync("api_lookup", new
+                {
+                    query = "Page", assemblyId, maxResults, maxChars, includeExamples = false, continuation, snapshotId,
+                });
+                var root = page.RootElement;
+                assert(root.GetProperty("offset").GetInt32() > previousOffset,
+                    "task lookup continuation advances beyond the previous page offset");
+                previousOffset = root.GetProperty("offset").GetInt32();
+                symbolIds.AddRange(Results(page).Select(item => item.GetProperty("symbolId").GetString()!));
+                if (!root.GetProperty("hasMore").GetBoolean())
+                    return symbolIds.ToArray();
+                var previousContinuation = continuation;
+                continuation = root.GetProperty("continuation").GetString();
+                snapshotId = root.GetProperty("snapshotId").GetString();
+                assert(!string.IsNullOrEmpty(continuation) &&
+                       !StringComparer.Ordinal.Equals(previousContinuation, continuation),
+                    "task lookup supplies an advancing continuation whenever ranked results remain");
+                if (string.IsNullOrEmpty(continuation))
+                    break;
+            }
+            assert(false, "task lookup pagination terminates within the ranked candidate bound");
+            return symbolIds.ToArray();
+        }
+
+        var referencePageIds = await CollectPages(20, 32000);
+        var budgetPageIds = await CollectPages(3, 3000);
+        var fallbackPageIds = await CollectPages(20, 3000);
+        assert(referencePageIds.Length >= 5 && budgetPageIds.SequenceEqual(referencePageIds) &&
+               fallbackPageIds.SequenceEqual(referencePageIds),
+            "tight and fallback-pruned task lookup pages preserve every ranked candidate in order without skips or duplicates");
+
+        using (var unfit = await apiToolJsonAsync("api_lookup", new
+               {
+                   query = "OverBudget", assemblyId, maxResults = 3, maxChars = 3000, includeExamples = false
+               }))
+        {
+            var root = unfit.RootElement;
+            var recoveryMessage = root.GetProperty("missingInformation").EnumerateArray()
+                .Select(item => item.GetString())
+                .FirstOrDefault(message => message?.Contains("api_lookup arguments ", StringComparison.Ordinal) == true);
+            var recoveryStart = recoveryMessage?.IndexOf('{') ?? -1;
+            var recoveryEnd = recoveryMessage?.LastIndexOf('}') ?? -1;
+            assert(Results(unfit).Length == 0 && root.GetProperty("hasMore").GetBoolean() &&
+                   !string.IsNullOrEmpty(root.GetProperty("continuation").GetString()) &&
+                   recoveryMessage is not null && recoveryStart >= 0 && recoveryEnd > recoveryStart,
+                "an individually unfit first candidate advances with explicit exact-ID recovery arguments");
+            if (recoveryMessage is not null && recoveryStart >= 0 && recoveryEnd > recoveryStart)
+            {
+                using var recoveryArgs = JsonDocument.Parse(recoveryMessage[recoveryStart..(recoveryEnd + 1)]);
+                var args = recoveryArgs.RootElement;
+                var recoveredAssemblyId = args.GetProperty("assemblyId").GetString()!;
+                var recoveredSymbolId = args.GetProperty("symbolId").GetString()!;
+                var recoveredSnapshotId = args.GetProperty("snapshotId").GetString()!;
+                assert(recoveredAssemblyId == assemblyId && args.GetProperty("mode").GetString() == "symbol",
+                    "unfit recovery includes usable api_lookup assemblyId, symbolId, mode, and snapshotId");
+                using var exact = await apiToolJsonAsync("api_lookup", new
+                {
+                    assemblyId = recoveredAssemblyId, symbolId = recoveredSymbolId, mode = "symbol", snapshotId = recoveredSnapshotId
+                });
+                assert(exact.RootElement.GetProperty("source").GetProperty("symbolId").GetString() == recoveredSymbolId,
+                    "exact recovery arguments retrieve the omitted declaration");
+                using var next = await apiToolJsonAsync("api_lookup", new
+                {
+                    query = "OverBudget", assemblyId, maxResults = 3, maxChars = 3000, includeExamples = false,
+                    continuation = root.GetProperty("continuation").GetString(), snapshotId = root.GetProperty("snapshotId").GetString()
+                });
+                assert(next.RootElement.GetProperty("offset").GetInt32() == 1 &&
+                       Results(next).Any(item => item.GetProperty("qualifiedName").GetString()!.EndsWith(".OverBudgetB", StringComparison.Ordinal)),
+                    "continuation after exact recovery begins at the next ranked candidate");
+            }
+        }
+
+
 
         async Task<bool> OversizedQueryRejected()
         {

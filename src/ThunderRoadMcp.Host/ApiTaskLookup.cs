@@ -273,11 +273,50 @@ public sealed partial class InstalledApiCatalog
         var truncated = warningsOmitted || omittedCandidates > 0;
         var complete = indexComplete && !warningsOmitted && omittedCandidates == 0;
         var processedPageCount = 0;
+        var exactRecoveryMessages = new List<string>();
+        string ExactRecoveryMessage(string assemblyId, string symbolId) =>
+            $"Recover this declaration with api_lookup arguments {JsonSerializer.Serialize(new { assemblyId, symbolId, mode = "symbol", snapshotId = snapshot.Id })}.";
+        void AddExactRecovery(string assemblyId, string symbolId)
+        {
+            var message = ExactRecoveryMessage(assemblyId, symbolId);
+            exactRecoveryMessages.Add(message);
+            AddJsonString(missing, message);
+        }
+
+        static void PruneLower(JsonObject node)
+        {
+            node.Remove("attributes");
+            node.Remove("attributesTruncated");
+            node.Remove("typeContext");
+        }
+
+        static void PruneTopOptional(JsonObject node)
+        {
+            node.Remove("attributes");
+            node.Remove("attributesTruncated");
+            if (node["typeContext"] is JsonObject context)
+            {
+                context.Remove("attributes");
+                context.Remove("attributesTruncated");
+                context.Remove("relatedTypeNames");
+                context.Remove("relatedTypeIds");
+                context.Remove("unresolvedTypeNames");
+            }
+        }
+
         foreach (var rankedResult in page)
         {
-            processedPageCount++;
             if (!selectedSymbols.TryGetValue(rankedResult.Hit.symbolId, out var symbol))
-                continue;
+            {
+                truncated = true;
+                complete = false;
+                if (results.Count == 0)
+                {
+                    AddExactRecovery(rankedResult.Hit.assemblyId, rankedResult.Hit.symbolId);
+                    processedPageCount++;
+                }
+                break;
+            }
             var node = JsonSerializer.SerializeToNode(symbol.Hit)!.AsObject();
             node["relevance"] = new JsonObject
             {
@@ -305,13 +344,33 @@ public sealed partial class InstalledApiCatalog
             results.Add(node);
             if (LogicalLength(response) > maxChars)
             {
-                results.RemoveAt(results.Count - 1);
-                truncated = true;
-                complete = false;
-                AddJsonString(missing, "A complete result signature did not fit maxChars; request fewer results or use api_search for the exact declaration.");
-                continue;
+                if (results.Count == 1)
+                {
+                    PruneTopOptional(node);
+                    if (LogicalLength(response) > maxChars)
+                    {
+                        results.RemoveAt(results.Count - 1);
+                        AddExactRecovery(rankedResult.Hit.assemblyId, rankedResult.Hit.symbolId);
+                        processedPageCount++;
+                        truncated = true;
+                        complete = false;
+                        break;
+                    }
+                }
+                else
+                {
+                    PruneLower(node);
+                    if (LogicalLength(response) > maxChars)
+                    {
+                        results.RemoveAt(results.Count - 1);
+                        truncated = true;
+                        complete = false;
+                        break;
+                    }
+                }
             }
             resultNodes.Add(rankedResult.Hit.symbolId, node);
+            processedPageCount++;
             if (rankedResult.IsLowConfidence)
             {
                 complete = false;
@@ -321,27 +380,6 @@ public sealed partial class InstalledApiCatalog
             {
                 truncated = true;
                 complete = false;
-            }
-        }
-
-        static void PruneLower(JsonObject node)
-        {
-            node.Remove("attributes");
-            node.Remove("attributesTruncated");
-            node.Remove("typeContext");
-        }
-
-        static void PruneTopOptional(JsonObject node)
-        {
-            node.Remove("attributes");
-            node.Remove("attributesTruncated");
-            if (node["typeContext"] is JsonObject context)
-            {
-                context.Remove("attributes");
-                context.Remove("attributesTruncated");
-                context.Remove("relatedTypeNames");
-                context.Remove("relatedTypeIds");
-                context.Remove("unresolvedTypeNames");
             }
         }
 
@@ -629,6 +667,7 @@ public sealed partial class InstalledApiCatalog
             {
                 var removed = results[^1]!.AsObject();
                 results.RemoveAt(results.Count - 1);
+                processedPageCount--;
                 if (removed["symbolId"]?.GetValue<string>() is { } removedId)
                     resultNodes.Remove(removedId);
                 trimmedAny = true;
@@ -693,11 +732,12 @@ public sealed partial class InstalledApiCatalog
             complete = false;
             AddJsonString(missing, $"Catalog `$type` '{record.DeclaredApiType}' has no exact installed API type match; inspect catalog and installed APIs separately.");
         }
-        var hasMore = offset + processedPageCount < ranked.Length;
+        var nextOffset = offset + processedPageCount;
+        var hasMore = nextOffset < ranked.Length;
         response["hasMore"] = hasMore;
         if (hasMore)
             response["continuation"] = MakeLookupContinuation(snapshot.Id, query, assemblyId, kindFilter,
-                maxResults, maxChars, includeExamples, offset + processedPageCount);
+                maxResults, maxChars, includeExamples, nextOffset);
         response["truncated"] = truncated;
         response["complete"] = complete && !truncated;
         response["confidence"] = results.Count == 0 ? "none" :
@@ -718,9 +758,13 @@ public sealed partial class InstalledApiCatalog
                 fallbackMissing.Add("Base catalog omitted search terms: " + string.Join(", ", catalogOmittedTerms));
             if (omittedCandidates > 0)
                 fallbackMissing.Add($"Retained the top {ApiLookupRanker.MaxCandidates} ranked declarations; {omittedCandidates} lower-ranked matches were omitted.");
+            if (exactRecoveryMessages.Count > 0)
+                foreach (var recovery in exactRecoveryMessages)
+                    AddJsonString(fallbackMissing, recovery);
             if (fallbackMissing.Count == 0)
                 fallbackMissing.Add("Optional context was omitted to stay within maxChars; use the stable continuation or raise the budget.");
             response["missingInformation"] = fallbackMissing;
+            missing = fallbackMissing;
             var fallbackRelatedArray = (JsonArray)response["relatedTypes"]!;
             while (LogicalLength(response) > maxChars && fallbackRelatedArray.Count > 1)
                 fallbackRelatedArray.RemoveAt(fallbackRelatedArray.Count - 1);
@@ -739,29 +783,32 @@ public sealed partial class InstalledApiCatalog
             var exampleArray = (JsonArray)response["examples"]!;
             while (LogicalLength(response) > maxChars && exampleArray.Count > 1)
                 exampleArray.RemoveAt(exampleArray.Count - 1);
-            var removedResults = false;
             while (LogicalLength(response) > maxChars && results.Count > 1)
             {
                 results.RemoveAt(results.Count - 1);
-                removedResults = true;
+                processedPageCount--;
             }
             if (LogicalLength(response) > maxChars && exampleArray.Count > 0)
-            {
                 exampleArray.Clear();
-                removedResults = true;
-            }
             while (LogicalLength(response) > maxChars && catalogResultArray.Count > 1)
                 catalogResultArray.RemoveAt(catalogResultArray.Count - 1);
             if (LogicalLength(response) > maxChars)
             {
                 fallbackRelatedArray.Clear();
+                if (results.LastOrDefault() is JsonObject removedResult &&
+                    removedResult["assemblyId"]?.GetValue<string>() is { } removedAssemblyId &&
+                    removedResult["symbolId"]?.GetValue<string>() is { } removedSymbolId)
+                {
+                    var recovery = ExactRecoveryMessage(removedAssemblyId, removedSymbolId);
+                    exactRecoveryMessages.Add(recovery);
+                    AddJsonString(missing, recovery);
+                }
                 results.Clear();
-                removedResults = true;
             }
             response["truncated"] = true;
             response["complete"] = false;
-            var nextOffset = removedResults ? offset + results.Count : offset + processedPageCount;
-            response["hasMore"] = removedResults || nextOffset < ranked.Length;
+            nextOffset = offset + processedPageCount;
+            response["hasMore"] = nextOffset < ranked.Length;
             response["continuation"] = response["hasMore"]!.GetValue<bool>()
                 ? MakeLookupContinuation(snapshot.Id, query, assemblyId, kindFilter, maxResults, maxChars, includeExamples, nextOffset)
                 : null;
