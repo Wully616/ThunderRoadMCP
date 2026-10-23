@@ -264,21 +264,16 @@ public static class ApiLookupRegressionCheck
                     catch (Exception exception) { return exception.Message; }
                 }
                 var currentSnapshotId = root.GetProperty("snapshotId").GetString();
-                foreach (var malformed in new[]
-                         {
-                             MalformedContinuation("Page", assemblyId, 2, 12000, false, null, includeSnapshotId: false),
-                             MalformedContinuation("Page", assemblyId, 2, 12000, false, null, includeSnapshotId: true),
-                         })
+                var oldToken = MalformedContinuation("Page", assemblyId, 2, 12000, false, currentSnapshotId, includeSnapshotId: true);
+                var restartError = await ErrorMessage(new
                 {
-                    var error = await ErrorMessage(new
-                    {
-                        query = "Page", assemblyId, maxResults = 2, maxChars = 12000, includeExamples = false,
-                        continuation = malformed, snapshotId = currentSnapshotId
-                    });
-                    assert(error is not null && error.Contains("continuation is invalid", StringComparison.OrdinalIgnoreCase) &&
-                           !error.Contains("NullReferenceException", StringComparison.OrdinalIgnoreCase),
-                        "continuations with missing or null SnapshotId return compact actionable errors");
-                }
+                    query = "Page", assemblyId, maxResults = 2, maxChars = 12000, includeExamples = false,
+                    scope = "loaded", continuation = oldToken, snapshotId = currentSnapshotId,
+                });
+                assert(restartError is not null &&
+                       restartError.Contains("lookup.continuation_stale", StringComparison.Ordinal) &&
+                       restartError.Contains("\"tool\":\"api_lookup\"", StringComparison.Ordinal),
+                    "legacy lk2 continuation returns a structured scope-bound restart error");
             }
         }
         async Task<string[]> CollectPages(int maxResults, int maxChars)
