@@ -393,12 +393,12 @@ try
                waitedRoot.GetProperty("elapsedMs").GetInt64() >= 90,
             "game_load_level waits for readiness and measures elapsed time from before the delayed load request");
     }
-    using (var timedOutLevel = await ApiToolJsonAsync("game_load_level", new { levelId = "Missing", mode = "Sandbox", waitUntilReady = true, timeoutMs = 100 }))
+    using (var timedOutLevel = await ApiToolJsonAsync("game_load_level", new { levelId = "Missing", mode = "Sandbox", waitUntilReady = true, timeoutMs = 1000 }))
         Assert(timedOutLevel.RootElement.GetProperty("requestAcknowledged").GetBoolean() &&
                timedOutLevel.RootElement.GetProperty("currentLevelBefore").GetString() == "Home" &&
                !timedOutLevel.RootElement.GetProperty("completed").GetBoolean() &&
                timedOutLevel.RootElement.GetProperty("timedOut").GetBoolean() &&
-               timedOutLevel.RootElement.GetProperty("elapsedMs").GetInt64() >= 100,
+               timedOutLevel.RootElement.GetProperty("elapsedMs").GetInt64() >= 1000,
             "game_load_level reports an acknowledged readiness timeout with its pre-request snapshot");
     Interlocked.Exchange(ref delayNextLevelRequest, 1);
     using (var unacknowledgedLevel = await ApiToolJsonAsync("game_load_level", new { levelId = "Arena", mode = "Sandbox", waitUntilReady = true, timeoutMs = 40 }))
