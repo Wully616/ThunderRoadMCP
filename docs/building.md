@@ -95,7 +95,7 @@ $env:THUNDERROAD_MANAGED_DIR = $managed
 dotnet run --project src/ThunderRoadMcp.Bridge.SelfTest -c Release -p:GameManagedDir="$managed" -- "$bridgePackage/runtime"
 ```
 
-The self-test also compile-checks the bundled C# gameplay examples with the actual evaluator wrapper and installed reference set, without loading an evaluation assembly. To save an identity-bound evidence report separately:
+The self-test also compile-checks the bundled C# gameplay examples with the actual evaluator wrapper and installed reference set, without loading an evaluation assembly. It verifies nested iterator disposal and cycle rejection, spawn rollback, and queued-disconnect cancellation.
 
 ```powershell
 dotnet run --project src/ThunderRoadMcp.Bridge.SelfTest -c Release -- --validate-examples "$bridgePackage/runtime" "$packageOutput/example-validation.json"
@@ -116,7 +116,7 @@ The isolated host boundary check runs against a published host DLL:
 dotnet run --project tests/HostBehaviorCheck -c Release -- "$env:LOCALAPPDATA/ThunderRoadMcp/host/ThunderRoadMcp.Host.dll"
 ```
 
-The installer behavior check uses a real installed game's `Managed` directory. It copies the bridge's actual game reference assemblies into temporary synthetic game trees, covers source and release-layout installs, host-only `-SkipBridge`, a missing `Mods` directory, starts the exact generated stdio command, verifies initialize and `tools/list`, and confirms refused installs leave existing data untouched. It does not change the live game:
+The installer behavior check uses a real installed game's `Managed` directory. It copies the bridge's actual game reference assemblies into temporary synthetic game trees, covers source and release-layout installs, host-only `-SkipBridge`, a missing `Mods` directory, explicit game-path persistence and nested custom configs, starts the exact generated stdio command, verifies initialize and `tools/list`, and confirms refused installs leave existing data untouched. It does not change the live game:
 
 ```powershell
 .\tests\InstallerBehaviorCheck.ps1 -GameManagedDir $managed
@@ -124,7 +124,7 @@ The installer behavior check uses a real installed game's `Managed` directory. I
 
 Installer checks use isolated synthetic game trees and do not claim a live Unity run.
 
-The isolated installer behavior check also upgrades source and release-layout installs using real installed game `Managed` assemblies copied into synthetic games. It verifies byte-preserved configs, replacement of obsolete host/mod files, MCP initialize and `tools/list`, host-only mode, and untouched unrelated mods; it never touches the live installation:
+The isolated installer behavior check also upgrades source and release-layout installs using real installed game `Managed` assemblies copied into synthetic games. It verifies byte-preserved existing configs, creation of a missing selected-game launch config, replacement of obsolete host/mod files, MCP initialize and `tools/list`, host-only mode, and untouched unrelated mods; it never touches the live installation:
 
 ```powershell
 .\tests\InstallerBehaviorCheck.ps1 -GameManagedDir $managed

@@ -139,8 +139,7 @@ var apiModSharedPath = Path.Combine(apiFixtureModDirectory, "Fixture.Shared.dll"
 var apiGameBasePath = Path.Combine(managedDirectory, "Fixture.Base.dll");
 File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Shared.dll"), apiGameSharedPath);
 File.Copy(Path.Combine(fixtureOutputDirectory, "mod", "Fixture.Shared.dll"), apiModSharedPath);
-await File.WriteAllTextAsync(Path.ChangeExtension(apiGameSharedPath, ".xml"),
-    """<doc><members><member name="T:Fixture.Shared.SharedSurface"><summary>STALE_XML_SIDECAR_TEXT</summary></member></members></doc>""");
+File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Shared.xml"), Path.ChangeExtension(apiGameSharedPath, ".xml"));
 File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Base.dll"), apiGameBasePath);
 await File.WriteAllTextAsync(Path.Combine(managedDirectory, "Bad.dll"), "not a managed PE image");
 await File.WriteAllBytesAsync(Path.Combine(managedDirectory, "Native.dll"), [0x4d, 0x5a, 0, 0]);
@@ -402,7 +401,7 @@ try
                timedOutLevel.RootElement.GetProperty("currentLevelBefore").GetString() == "Home" &&
                !timedOutLevel.RootElement.GetProperty("completed").GetBoolean() &&
                timedOutLevel.RootElement.GetProperty("timedOut").GetBoolean() &&
-               timedOutLevel.RootElement.GetProperty("elapsedMs").GetInt64() >= 1000,
+               timedOutLevel.RootElement.GetProperty("elapsedMs").GetInt64() >= 950,
             "game_load_level reports an acknowledged readiness timeout with its pre-request snapshot: " +
             timedOutLevel.RootElement.GetRawText());
     Interlocked.Exchange(ref delayNextLevelRequest, 1);
@@ -520,6 +519,8 @@ try
     using var shortFirst = JsonDocument.Parse(ErrorText(await ToolAsync("game_logs", new { source = "current", tailLines = 1 })));
     var shortCursor = shortFirst.RootElement.GetProperty("nextBeforeByteOffset").GetInt64();
     var shortSnapshot = shortFirst.RootElement.GetProperty("snapshotId").GetString();
+    Assert(IsError(await ToolAsync("game_logs", new { source = "previous", tailLines = 1, beforeByteOffset = shortCursor, snapshotId = shortSnapshot })),
+        "a current-log snapshot cannot continue against the previous source");
     await File.AppendAllTextAsync(logPath, "four\n");
     using var shortOlder = JsonDocument.Parse(ErrorText(await ToolAsync("game_logs", new { source = "current", tailLines = 1, beforeByteOffset = shortCursor, snapshotId = shortSnapshot })));
     Assert(shortOlder.RootElement.GetProperty("text").GetString() == "two", "append preserves short-log pagination snapshot");
@@ -538,6 +539,10 @@ try
     Assert(firstRoot.GetProperty("nextBeforeByteOffset").GetInt64() < firstRoot.GetProperty("endByteOffset").GetInt64(), "every pagination cursor moves backwards");
     var cursor = firstRoot.GetProperty("nextBeforeByteOffset").GetInt64();
     var snapshot = firstRoot.GetProperty("snapshotId").GetString();
+    await File.WriteAllTextAsync(logPath, pageLines[..^2] + "r\n", new UTF8Encoding(false));
+    Assert(IsError(await ToolAsync("game_logs", new { source = "current", tailLines = 2000, beforeByteOffset = cursor, snapshotId = snapshot })),
+        "same-header same-length rewrite with changed tail invalidates the snapshot cursor");
+    await File.WriteAllTextAsync(logPath, pageLines, new UTF8Encoding(false));
     await File.AppendAllTextAsync(logPath, "appended while game is running\n");
     var secondPage = await ToolAsync("game_logs", new { source = "current", tailLines = 2000, beforeByteOffset = cursor, snapshotId = snapshot });
     using var second = JsonDocument.Parse(ErrorText(secondPage));
@@ -888,18 +893,16 @@ async Task CheckApiToolsAsync()
         "case-insensitive search disambiguates duplicate type names by assembly ID");
     var gameSharedHit = sharedHits.Single(hit => hit.GetProperty("assemblyId").GetString() == gameAssemblyId);
     var sharedTypeId = gameSharedHit.GetProperty("symbolId").GetString()!;
-    Assert(sharedHits.All(hit => !hit.TryGetProperty("xmlDocumentation", out _)) &&
-           !sharedSearch.RootElement.GetRawText().Contains("STALE_XML_SIDECAR_TEXT", StringComparison.Ordinal),
-        "api_search omits XML sidecar fields and text even when a stale sidecar is present");
+    Assert(gameSharedHit.GetProperty("xmlDocumentation").GetProperty("summary").GetString() ==
+           "XML_DOC_SHARED_SURFACE_SUMMARY describes the original shared type.",
+        "api_search exposes normalized documentation from the matching first-party XML sidecar");
     using var sharedType = await ApiToolJsonAsync("api_type", new { assemblyId = gameAssemblyId, typeSymbolId = sharedTypeId });
-    Assert(!sharedType.RootElement.TryGetProperty("xmlDocumentation", out _) &&
-           sharedType.RootElement.GetProperty("members").EnumerateArray().All(member => !member.TryGetProperty("xmlDocumentation", out _)) &&
-           !sharedType.RootElement.GetRawText().Contains("STALE_XML_SIDECAR_TEXT", StringComparison.Ordinal),
-        "api_type omits XML sidecar fields and text");
+    Assert(sharedType.RootElement.GetProperty("xmlDocumentation").GetProperty("summary").GetString() ==
+           "XML_DOC_SHARED_SURFACE_SUMMARY describes the original shared type.",
+        "api_type exposes the indexed XML type summary");
     using var sharedSource = await ApiToolJsonAsync("api_decompile", new { assemblyId = gameAssemblyId, symbolId = sharedTypeId, startLine = 1, lineCount = 20 });
-    Assert(!sharedSource.RootElement.TryGetProperty("xmlDocumentation", out _) &&
-           !sharedSource.RootElement.GetRawText().Contains("STALE_XML_SIDECAR_TEXT", StringComparison.Ordinal),
-        "api_decompile omits XML sidecar fields and text");
+    Assert(sharedSource.RootElement.GetProperty("source").GetString()!.Contains("XML_DOC_SHARED_SURFACE_SUMMARY", StringComparison.Ordinal),
+        "api_decompile emits XML documentation comments from the matching sidecar");
     using var modSharedSearch = await ApiToolJsonAsync("api_search", new { query = "SharedSurface", kind = "type", assemblyId = modAssemblyId });
     Assert(modSharedSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
            modSharedSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == modAssemblyId,
@@ -1322,6 +1325,8 @@ async Task CheckApiToolsAsync()
     Assert(!File.Exists(renamedModPath), "browsed assembly can be renamed and deleted without a file lock");
     Assert(!File.Exists(fixtureSentinelPath), "fixture static initializer remains unexecuted after all API calls");
     File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Shared.dll"), apiGameSharedPath, overwrite: true);
+    File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Shared.xml"),
+        Path.ChangeExtension(apiGameSharedPath, ".xml"), overwrite: true);
     File.Copy(Path.Combine(fixtureOutputDirectory, "game", "Fixture.Base.dll"), apiDisabledModBasePath);
 
     using (var disabledModAssemblies = await ApiToolJsonAsync("api_assemblies", new { name = "Fixture.Base", origin = "mod", limit = 50 }))

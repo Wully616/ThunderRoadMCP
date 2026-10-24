@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<doc>
+  <assembly>
+    <name>Fixture.Shared</name>
+  </assembly>
+  <members>
+    <member name="T:Fixture.Shared.SharedSurface">
+      <summary>XML_DOC_SHARED_SURFACE_SUMMARY describes the original shared type.</summary>
+    </member>
+    <member name="T:Fixture.Shared.XmlDocumentationSurface">
+      <inheritdoc/>
+      <summary>XML_DOC_TYPE_SUMMARY describes the moonstone fixture surface.</summary>
+      <remarks>XML_DOC_TYPE_REMARKS remain separate from the summary.</remarks>
+      <example>XML_DOC_TYPE_EXAMPLE demonstrates normalized example text.</example>
+    </member>
+    <member name="M:Fixture.Shared.XmlDocumentationSurface.DocumentedOperation(System.String)">
+      <summary>XML_DOC_MEMBER_SUMMARY describes the documented operation.</summary>
+      <param name="target">XML_DOC_PARAMETER_DESCRIPTION identifies the operation target.</param>
+      <returns>XML_DOC_RETURN_DESCRIPTION returns the documented target.</returns>
+      <example>XML_DOC_MEMBER_EXAMPLE shows a member example.</example>
+    </member>
+  </members>
+</doc>

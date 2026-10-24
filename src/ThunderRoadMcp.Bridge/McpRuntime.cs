@@ -19,9 +19,126 @@ namespace ThunderRoadMcp.Bridge
         private sealed class ManagedCoroutine
         {
             public Coroutine Handle;
+            public IEnumerator Tracked;
             public string Routine;
             public DateTime StartedUtc;
             public int Steps;
+        }
+
+        private sealed class ManagedRoutine : IEnumerator, IDisposable
+        {
+            private readonly McpRuntime runtime;
+            private readonly string key;
+            private readonly ManagedCoroutine entry;
+            private readonly List<IEnumerator> iterators = new List<IEnumerator>();
+            private bool disposed;
+            private bool failureRecorded;
+
+            public ManagedRoutine(McpRuntime runtime, string key, ManagedCoroutine entry, IEnumerator routine)
+            {
+                this.runtime = runtime;
+                this.key = key;
+                this.entry = entry;
+                iterators.Add(routine);
+            }
+
+            public object Current { get; private set; }
+
+            public bool MoveNext()
+            {
+                if (disposed) return false;
+                try
+                {
+                    while (iterators.Count > 0)
+                    {
+                        IEnumerator iterator = iterators[iterators.Count - 1];
+                        if (!iterator.MoveNext())
+                        {
+                            iterators.RemoveAt(iterators.Count - 1);
+                            (iterator as IDisposable)?.Dispose();
+                            continue;
+                        }
+
+                        object yielded = iterator.Current;
+                        entry.Steps++;
+                        if (yielded is IEnumerator nested &&
+                            !(yielded is YieldInstruction) &&
+                            !(yielded is CustomYieldInstruction))
+                        {
+                            for (int index = 0; index < iterators.Count; index++)
+                            {
+                                if (ReferenceEquals(iterators[index], nested))
+                                    throw new InvalidOperationException("A managed coroutine cannot yield an IEnumerator already active in its nested iterator chain.");
+                            }
+                            iterators.Add(nested);
+                            continue;
+                        }
+
+                        Current = yielded;
+                        return true;
+                    }
+
+                    Exception disposalFailure = DisposeOwned();
+                    Complete();
+                    if (disposalFailure != null) throw disposalFailure;
+                    return false;
+                }
+                catch (Exception exception)
+                {
+                    DisposeOwned();
+                    Complete();
+                    RecordFailure(exception);
+                    throw;
+                }
+            }
+
+            public void Dispose()
+            {
+                if (disposed) return;
+                Exception disposalFailure = DisposeOwned();
+                Complete();
+                if (disposalFailure != null) RecordFailure(disposalFailure);
+            }
+
+            public void Reset()
+            {
+                throw new NotSupportedException();
+            }
+
+            private Exception DisposeOwned()
+            {
+                if (disposed) return null;
+                disposed = true;
+                Current = null;
+                Exception failure = null;
+                for (int index = iterators.Count - 1; index >= 0; index--)
+                {
+                    IEnumerator iterator = iterators[index];
+                    try
+                    {
+                        (iterator as IDisposable)?.Dispose();
+                    }
+                    catch (Exception exception)
+                    {
+                        if (failure == null) failure = exception;
+                    }
+                }
+                iterators.Clear();
+                return failure;
+            }
+
+            private void RecordFailure(Exception exception)
+            {
+                if (failureRecorded) return;
+                failureRecorded = true;
+                runtime.RecordCoroutineFailure(key, entry, exception);
+            }
+
+            private void Complete()
+            {
+                if (runtime.coroutines.TryGetValue(key, out ManagedCoroutine tracked) && ReferenceEquals(tracked, entry))
+                    runtime.coroutines.Remove(key);
+            }
         }
 
         private sealed class CoroutineFailure
@@ -84,7 +201,7 @@ namespace ThunderRoadMcp.Bridge
             if (coroutines.TryGetValue(key, out ManagedCoroutine previous))
             {
                 coroutines.Remove(key);
-                if (previous.Handle != null) StopCoroutine(previous.Handle);
+                StopEntry(previous);
             }
             else if (coroutines.Count >= MaxEntries)
             {
@@ -99,12 +216,15 @@ namespace ThunderRoadMcp.Bridge
             coroutines.Add(key, entry);
             try
             {
-                entry.Handle = StartCoroutine(Track(key, entry, routine));
+                entry.Tracked = Track(key, entry, routine);
+                entry.Handle = StartCoroutine(entry.Tracked);
                 return entry.Handle;
             }
             catch
             {
-                coroutines.Remove(key);
+                if (coroutines.TryGetValue(key, out ManagedCoroutine tracked) && ReferenceEquals(tracked, entry))
+                    coroutines.Remove(key);
+                StopEntry(entry);
                 throw;
             }
         }
@@ -115,7 +235,7 @@ namespace ThunderRoadMcp.Bridge
             ValidateKey(key);
             if (!coroutines.TryGetValue(key, out ManagedCoroutine entry)) return false;
             coroutines.Remove(key);
-            if (entry.Handle != null) StopCoroutine(entry.Handle);
+            StopEntry(entry);
             return true;
         }
 
@@ -123,13 +243,35 @@ namespace ThunderRoadMcp.Bridge
         {
             EnsureMainThread();
             if (coroutines.Count == 0) return;
-            var handles = new List<Coroutine>(coroutines.Count);
-            foreach (ManagedCoroutine entry in coroutines.Values)
-                if (entry.Handle != null) handles.Add(entry.Handle);
+            var entries = new List<ManagedCoroutine>(coroutines.Values);
             coroutines.Clear();
-            foreach (Coroutine handle in handles)
-                StopCoroutine(handle);
+            Exception failure = null;
+            foreach (ManagedCoroutine entry in entries)
+            {
+                try
+                {
+                    StopEntry(entry);
+                }
+                catch (Exception exception)
+                {
+                    if (failure == null) failure = exception;
+                }
+            }
+            if (failure != null) throw failure;
         }
+
+        private void StopEntry(ManagedCoroutine entry)
+        {
+            try
+            {
+                if (entry.Handle != null) StopCoroutine(entry.Handle);
+            }
+            finally
+            {
+                (entry.Tracked as IDisposable)?.Dispose();
+            }
+        }
+
 
         public void Set(string key, object value)
         {
@@ -519,30 +661,7 @@ namespace ThunderRoadMcp.Bridge
 
         private IEnumerator Track(string key, ManagedCoroutine entry, IEnumerator routine)
         {
-            try
-            {
-                while (true)
-                {
-                    bool moved;
-                    try
-                    {
-                        moved = routine.MoveNext();
-                    }
-                    catch (Exception exception)
-                    {
-                        RecordCoroutineFailure(key, entry, exception);
-                        throw;
-                    }
-                    if (!moved) break;
-                    entry.Steps++;
-                    yield return routine.Current;
-                }
-            }
-            finally
-            {
-                if (coroutines.TryGetValue(key, out ManagedCoroutine tracked) && ReferenceEquals(tracked, entry))
-                    coroutines.Remove(key);
-            }
+            return new ManagedRoutine(this, key, entry, routine);
         }
 
         private void RecordCoroutineFailure(string key, ManagedCoroutine entry, Exception exception)

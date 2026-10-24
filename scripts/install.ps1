@@ -326,6 +326,11 @@ foreach ($configPath in @($launchConfigPath, $bridgeConfigPath)) {
         Stop-Install "Config path exists but is not a file; preserving it: $configPath"
     }
 }
+foreach ($configPath in @($launchConfigPath, $bridgeConfigPath)) {
+    if (Test-PathWithin $configPath $installDirectory) {
+        Stop-Install "A launch or bridge config is inside the host install directory, which is replaced as a unit; choose a path outside it: $configPath"
+    }
+}
 
 $launchConfigExists = Test-Path -LiteralPath $launchConfigPath -PathType Leaf
 $launchOptions = $null
@@ -487,11 +492,9 @@ try {
             Stop-Install "Upgrade paths overlap the source checkout, host install, StreamingAssets, or Mods directory; refusing unsafe replacement: host=$installDirectory; mods=$modsDirectory"
         }
         $modDirectory = Join-Path $modsDirectory 'ThunderRoadMcp'
-        if ($Upgrade -and ((Test-PathWithin $launchConfigPath $installDirectory) -or
-            (Test-PathWithin $bridgeConfigPath $installDirectory) -or
-            (Test-PathWithin $launchConfigPath $modDirectory) -or
-            (Test-PathWithin $bridgeConfigPath $modDirectory))) {
-            Stop-Install 'A launch or bridge config is inside a directory being replaced; move the config outside the host or mod directory first.'
+        if ((Test-PathWithin $launchConfigPath $modDirectory) -or
+            (Test-PathWithin $bridgeConfigPath $modDirectory)) {
+            Stop-Install 'A launch or bridge config is inside the bridge mod directory, which is replaced as a unit; move the config outside it first.'
         }
         if (Test-Path -LiteralPath $modDirectory) {
             if (-not $Upgrade -or -not (Test-Path -LiteralPath $modDirectory -PathType Container) -or
@@ -558,7 +561,7 @@ try {
         if ($selectedPath -and -not [string]::Equals([IO.Path]::GetFullPath([string]$launchOptions.executablePath), $selectedPath, [StringComparison]::OrdinalIgnoreCase)) {
             Stop-Install "Selected game conflicts with the existing launch config; preserving it: $launchConfigPath"
         }
-    } elseif (-not $Upgrade -and $selectedPath -and ($GameExecutablePath -or $env:THUNDERROAD_MCP_LAUNCH_CONFIG)) {
+    } elseif ($selectedPath) {
         $newLaunchConfig = [ordered]@{ executablePath = $selectedPath; arguments = @() }
     }
 
@@ -570,14 +573,19 @@ try {
         $newBridgeConfig = [ordered]@{ enabled = $true; host = '127.0.0.1'; port = 47831; token = $token }
     }
 
-    $configId = [Guid]::NewGuid().ToString('N')
+    $stageConfig = {
+        param([string]$Target, [string]$Text, [string]$Id)
+        $configuration = Write-StagedText $Target $Text $Id $createdDirectories
+        $configuration.Target = $Target
+        return $configuration
+    }
     if ($newLaunchConfig) {
         if (Test-Path -LiteralPath $launchConfigPath) { Stop-Install "Launch config appeared during installation; preserving it: $launchConfigPath" }
-        $stagedConfigs.Add((Write-StagedText $launchConfigPath ($newLaunchConfig | ConvertTo-Json -Depth 4) $configId $createdDirectories))
+        $stagedConfigs.Add((& $stageConfig $launchConfigPath ($newLaunchConfig | ConvertTo-Json -Depth 4) $configId))
     }
     if ($newBridgeConfig) {
         if (Test-Path -LiteralPath $bridgeConfigPath) { Stop-Install "Bridge config appeared during installation; preserving it: $bridgeConfigPath" }
-        $stagedConfigs.Add((Write-StagedText $bridgeConfigPath ($newBridgeConfig | ConvertTo-Json -Depth 4) $configId $createdDirectories))
+        $stagedConfigs.Add((& $stageConfig $bridgeConfigPath ($newBridgeConfig | ConvertTo-Json -Depth 4) $configId))
     }
 
     $publishedExe = Join-Path $installDirectory 'ThunderRoadMcp.Host.exe'
@@ -655,6 +663,13 @@ try {
         $hostNewMoved = $false
         $bridgeNewMoved = $false
         try {
+            foreach ($configuration in $stagedConfigs) {
+                if (Test-Path -LiteralPath $configuration.Target) {
+                    Stop-Install "Config appeared during installation; preserving it: $($configuration.Target)"
+                }
+                [IO.File]::Move($configuration.Stage, $configuration.Target)
+                $configuration.Committed = $true
+            }
             [void][IO.Directory]::CreateDirectory((Split-Path -Parent $hostBackup))
             if (Test-Path -LiteralPath $hostBackup) { Stop-Install "Backup path already exists: $hostBackup" }
             [IO.Directory]::Move($installDirectory, $hostBackup)

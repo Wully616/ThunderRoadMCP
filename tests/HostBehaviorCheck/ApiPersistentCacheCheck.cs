@@ -114,7 +114,7 @@ public static class ApiPersistentCacheCheck
 
     private static string FindApiIndexPath(string cacheDirectory, string assemblyId, Action<bool, string> assert)
     {
-        var directory = Path.Combine(cacheDirectory, "api-index-v5");
+        var directory = Path.Combine(cacheDirectory, "api-index-v6");
         var matches = Directory.Exists(directory)
             ? Directory.GetFiles(directory, "*.json", SearchOption.TopDirectoryOnly).Where(path =>
             {
@@ -127,7 +127,7 @@ public static class ApiPersistentCacheCheck
                 catch (JsonException) { return false; }
             }).ToArray()
             : Array.Empty<string>();
-        assert(matches.Length == 1, "one api-index-v5 JSON entry exists for Fixture.Shared game assembly");
+        assert(matches.Length == 1, "one api-index-v6 JSON entry exists for Fixture.Shared game assembly");
         return matches.Single();
     }
 
@@ -140,12 +140,17 @@ public static class ApiPersistentCacheCheck
         var omitted = root.GetProperty("OmittedDeclarations").GetInt32();
         var omittedPublic = root.GetProperty("OmittedPublicDeclarations").GetInt32();
         var limitReached = root.GetProperty("LimitReached").GetBoolean();
-        assert(root.GetProperty("Schema").GetInt32() == 5 &&
+        assert(root.GetProperty("Schema").GetInt32() == 6 &&
                root.GetProperty("AssemblyId").GetString() == assemblyId &&
                root.GetProperty("Complete").GetBoolean() == (omittedPublic == 0 && !limitReached) &&
                omittedPublic == 0 && omittedPublic <= omitted &&
                symbols.Length > 0 && types.Length > 0,
-            "cache entry uses the complete api-index-v5 JSON schema with honest public-completeness flags");
+            "cache entry uses the complete api-index-v6 JSON schema with honest public-completeness flags");
+        assert(symbols.Any(symbol =>
+                   symbol.GetProperty("Hit").TryGetProperty("xmlDocumentation", out var documentation) &&
+                   documentation.TryGetProperty("summary", out var summary) &&
+                   summary.GetString()!.StartsWith("XML_DOC_", StringComparison.Ordinal)),
+            "persistent API index retains normalized XML documentation");
         assert(!symbols.Any(symbol => symbol.GetProperty("Hit").GetProperty("qualifiedName").GetString()!
                    .Contains("PrivateIndexFallbackMarker", StringComparison.Ordinal)),
             "private member declarations are omitted from the persistent common index");

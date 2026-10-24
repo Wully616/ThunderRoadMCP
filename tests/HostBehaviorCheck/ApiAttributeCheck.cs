@@ -73,7 +73,7 @@ public static class ApiAttributeCheck
         assert(FixedString(Attribute(attributedParameter, "Fixture.Shared.FixtureMarkerAttribute", "parameter:0:value")) == "parameter",
             "parameter attribute metadata includes its parameter target");
         var extension = await Search("Extend", "method", "Fixture.Shared.ApiAttributeExtensions.Extend");
-        assert(extension.GetProperty("signature").GetString()!.Contains("this Fixture.Shared.ApiAttributeSurface value", StringComparison.Ordinal),
+        assert(extension.GetProperty("signature").GetString()!.Contains("this Fixture.Shared.ApiAttributeSurface receiver", StringComparison.Ordinal),
             "extension receiver modifier is preserved in the callable signature");
 
         _ = await Search("StaticInitializerProbe", "type", "Fixture.Shared.StaticInitializerProbe");

@@ -233,6 +233,41 @@ try {
         throw 'Saved and printed MCP configs do not use the absolute installed host EXE, empty args, and required environment overrides.'
     }
     Test-GeneratedStdioServer $agentServer
+    $gameNestedConfig = New-Game (Join-Path $root 'nested-config')
+    $hostNestedConfig = Join-Path $root 'nested-config-host'
+    $nestedConfigRoot = Join-Path $root 'nested-config-files\custom'
+    $nestedLaunchPath = Join-Path $nestedConfigRoot 'deep\launch.json'
+    $nestedBridgePath = Join-Path $nestedConfigRoot 'private\config\bridge.json'
+    $nested = Invoke-Installer $gameNestedConfig $hostNestedConfig (Join-Path $root 'nested-config-unused') -EnvironmentOverride @{
+        THUNDERROAD_MCP_LAUNCH_CONFIG = $nestedLaunchPath
+        THUNDERROAD_MCP_CONFIG = $nestedBridgePath
+    }
+    if ($nested.ExitCode -ne 0 -or
+        -not (Test-Path -LiteralPath $nestedLaunchPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $nestedBridgePath -PathType Leaf)) {
+        throw "Fresh install did not atomically place custom configs in nested, initially absent external directories: $($nested.Output)`n$($nested.Error)"
+    }
+    $nestedAgent = Get-Content -LiteralPath (Join-Path $hostNestedConfig 'mcp-config.json') -Raw | ConvertFrom-Json
+    $nestedServer = $nestedAgent.mcpServers.ThunderRoadMcp
+    if ([IO.Path]::GetFullPath([string]$nestedServer.env.THUNDERROAD_MCP_LAUNCH_CONFIG) -ne [IO.Path]::GetFullPath($nestedLaunchPath) -or
+        [IO.Path]::GetFullPath([string]$nestedServer.env.THUNDERROAD_MCP_CONFIG) -ne [IO.Path]::GetFullPath($nestedBridgePath) -or
+        [IO.Path]::GetFullPath([string]((Get-Content -LiteralPath $nestedLaunchPath -Raw | ConvertFrom-Json).executablePath)) -ne [IO.Path]::GetFullPath($gameNestedConfig.Executable)) {
+        throw 'Nested custom config paths were not retained in MCP config or launch config.'
+    }
+
+    $gameConfigCollision = New-Game (Join-Path $root 'host-config-collision')
+    $collisionHost = Join-Path $root 'host-config-collision-host'
+    $collisionExecutable = Join-Path $collisionHost 'ThunderRoadMcp.Host.exe'
+    $collision = Invoke-Installer $gameConfigCollision $collisionHost (Join-Path $root 'host-config-collision-files') -EnvironmentOverride @{
+        THUNDERROAD_MCP_LAUNCH_CONFIG = $collisionExecutable
+    }
+    if ($collision.ExitCode -eq 0 -or
+        ($collision.Output + $collision.Error) -notmatch 'host install directory' -or
+        (Test-Path -LiteralPath $collisionHost) -or
+        (Test-Path -LiteralPath (Join-Path $gameConfigCollision.Mods 'ThunderRoadMcp'))) {
+        throw 'Config path colliding with the host install was not refused before publishing host or bridge.'
+    }
+
 
     $gameNoConfig = New-Game (Join-Path $root 'no-bridge-config') -WithoutMods
     $hostNoConfig = Join-Path $root 'no-bridge-config-host'
@@ -299,6 +334,10 @@ try {
             -not (Test-Path -LiteralPath $discoverDll -PathType Leaf) -or
             -not (Test-Path -LiteralPath $discoverAgent -PathType Leaf)) {
             throw 'User-local SDK discovery install did not produce the host EXE, DLL, and MCP config.'
+        }
+        if ((Test-Path -LiteralPath (Join-Path $configDiscover 'launch.json')) -or
+            (Test-Path -LiteralPath (Join-Path $configDiscover 'bridge.json'))) {
+            throw 'Host-only install without a selected game created launch or bridge config files.'
         }
     } else {
         Write-Warning 'Skipping user-local SDK discovery check: the machine-wide dotnet or %USERPROFILE%\.dotnet 10.x SDK is absent.'
@@ -514,6 +553,23 @@ try {
         -not (Test-ByteEqual $savedNoConfigLaunch ([IO.File]::ReadAllBytes($noLaunchConfigPath)))) {
         throw "Upgrade changed absent config state or existing host/launch config: $($absentConfigUpgrade.Output)`n$($absentConfigUpgrade.Error)"
     }
+    $upgradeLaunchPath = Join-Path $root 'upgrade-configs\custom\deep\launch.json'
+    $upgradeBridgePath = Join-Path $root 'upgrade-configs\custom\deep\bridge.json'
+    $persistUpgrade = Invoke-Upgrader $gameNoConfig $hostNoConfig -DotnetPath $testDotnet -NoBridgeConfig -EnvironmentOverride @{
+        THUNDERROAD_MCP_CONFIG = $upgradeBridgePath
+        THUNDERROAD_MCP_LAUNCH_CONFIG = $upgradeLaunchPath
+    }
+    if ($persistUpgrade.ExitCode -ne 0 -or
+        -not (Test-Path -LiteralPath $upgradeLaunchPath -PathType Leaf) -or
+        (Test-Path -LiteralPath $upgradeBridgePath)) {
+        throw "Bridge upgrade did not persist a resolved game selection into a nested custom launch config while preserving host-only bridge-config behavior: $($persistUpgrade.Output)`n$($persistUpgrade.Error)"
+    }
+    $persistedUpgradeLaunch = Get-Content -LiteralPath $upgradeLaunchPath -Raw | ConvertFrom-Json
+    if ([IO.Path]::GetFullPath([string]$persistedUpgradeLaunch.executablePath) -ne [IO.Path]::GetFullPath($gameNoConfig.Executable) -or
+        -not (Test-ByteEqual $savedNoConfigMcp ([IO.File]::ReadAllBytes($hostNoConfigMcp)))) {
+        throw 'Bridge upgrade did not persist the selected executable or changed its existing MCP config.'
+    }
+
 
     $hostSkipMcp = Join-Path $hostSkip 'mcp-config.json'
     $savedSkipMcp = [IO.File]::ReadAllBytes($hostSkipMcp)
@@ -648,17 +704,11 @@ try {
     $gameE = New-Game (Join-Path $root 'missing-sdk')
     $hostE = Join-Path $root 'missing-sdk-host'
     $configE = Join-Path $root 'missing-sdk-config'
-    $emptyRoot = Join-Path $root 'empty-dotnet'
-    New-Item -ItemType Directory -Path $emptyRoot | Out-Null
+    $noComponentsDotnet = Join-Path $root 'dotnet-without-net10.cmd'
+    [IO.File]::WriteAllText($noComponentsDotnet, "@echo off`r`nexit /b 0`r`n", [Text.Encoding]::ASCII)
     $sdkSentinel = Join-Path $gameE.Mods 'keep.txt'
     Set-Content -LiteralPath $sdkSentinel -Value 'preserve game files' -Encoding ASCII
-    $missingSdk = Invoke-Installer $gameE $hostE $configE -PathOverride $emptyRoot -EnvironmentOverride @{
-        USERPROFILE = $emptyRoot
-        ProgramFiles = $emptyRoot
-        'ProgramFiles(x86)' = $emptyRoot
-        DOTNET_ROOT = $emptyRoot
-        'DOTNET_ROOT(x86)' = $emptyRoot
-    }
+    $missingSdk = Invoke-Installer $gameE $hostE $configE -DotnetPath $noComponentsDotnet
     $combinedError = $missingSdk.Output + $missingSdk.Error
     if ($missingSdk.ExitCode -eq 0 -or
         $combinedError -notmatch 'dotnet\.microsoft\.com/download/dotnet/10\.0' -or

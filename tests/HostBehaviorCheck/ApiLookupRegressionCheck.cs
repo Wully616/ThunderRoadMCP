@@ -15,6 +15,23 @@ public static class ApiLookupRegressionCheck
             .Single(item => item.GetProperty("name").GetString() == "Fixture.Shared")
             .GetProperty("assemblyId").GetString()!;
 
+        foreach (var (name, expected) in new[]
+                 {
+                     ("Extend", "this Fixture.Shared.ApiAttributeSurface receiver"),
+                     ("ExtendRef", "this ref int receiver"),
+                     ("ExtendIn", "this in int receiver"),
+                     ("ExtendRefReadonly", "this ref readonly int receiver"),
+                     ("KeywordParameters", "string @class, string @event"),
+                 })
+        {
+            using var signature = await apiToolJsonAsync("api_search", new { query = name, assemblyId });
+            var declaration = signature.RootElement.GetProperty("results").EnumerateArray()
+                .Single(item => item.GetProperty("qualifiedName").GetString() == "Fixture.Shared.ApiAttributeExtensions." + name)
+                .GetProperty("signature").GetString()!;
+            assert(declaration.Contains(expected, StringComparison.Ordinal),
+                $"formatted {name} signature preserves receiver modifiers and escapes keyword parameter names; got: {declaration}");
+        }
+
 
         using (var publicPrivateSearch = await apiToolJsonAsync("api_search", new
         {
@@ -49,9 +66,16 @@ public static class ApiLookupRegressionCheck
 
         static JsonElement[] Results(JsonDocument document) =>
             document.RootElement.GetProperty("results").EnumerateArray().ToArray();
-        static InstalledApiCatalog.ApiHit Hit(string symbolId, string qualifiedName, string signature) =>
-            new("fixture-assembly", "Fixture.Shared", "game", "Fixture.Shared.dll", symbolId, "method",
-                qualifiedName, "Fixture.Shared", signature, "public", false, Array.Empty<string>());
+        static InstalledApiCatalog.ApiHit Hit(string symbolId, string qualifiedName, string signature,
+            InstalledApiCatalog.ApiXmlDocumentation? documentation = null, string kind = "method",
+            string? declaringType = "Fixture.Shared") =>
+            new("fixture-assembly", "Fixture.Shared", "game", "Fixture.Shared.dll", symbolId, kind,
+                qualifiedName, declaringType, signature, "public", false, Array.Empty<string>(),
+                xmlDocumentation: documentation);
+
+        static InstalledApiCatalog.ApiXmlDocumentation Documentation(string summary) =>
+            new(summary, null, null, null, null, null, null);
+
 
         using (var compact = await apiToolJsonAsync("api_lookup", new { query = "generic nested dictionary", assemblyId }))
         {
@@ -94,9 +118,51 @@ public static class ApiLookupRegressionCheck
         var synonymOnly = ApiLookupRanker.Rank("summon", new[] { spawnHit }, 1);
         var partial = ApiLookupRanker.Rank("spawn item", new[] { spawnHit }, 1);
         var vague = ApiLookupRanker.Rank("spawn impossible phrase", new[] { spawnHit }, 1);
-        assert(synonymOnly.Count == 1 && synonymOnly[0].IsLowConfidence &&
-               partial.Count == 1 && partial[0].IsLowConfidence && vague.Count == 1 && vague[0].IsLowConfidence,
-            "synonym-only, partial-coverage, and low-coverage matches remain low-confidence");
+        assert(synonymOnly.Count == 0 && partial.Count == 0 && vague.Count == 0,
+            "action/synonym-only queries and unsupported partial matches do not retain unrelated declarations");
+
+        var attachmentFalsePositive = Hit("mail-attachment", "System.Net.Mail.Attachment.CreateAttachmentFromString",
+            "public static System.Net.Mail.Attachment CreateAttachmentFromString(string value)");
+        var itemLifecycle = Hit("item-lifecycle", "ThunderRoad.ItemModule.OnItemLoaded",
+            "public virtual void OnItemLoaded(ThunderRoad.Item item)",
+            Documentation("Called after an item spawned from its owning data has loaded, to attach a MonoBehaviour and runtime behaviour to it."));
+        var intentMatches = ApiLookupRanker.Rank("Create an ItemModule that attaches a MonoBehaviour to an item",
+            new[] { attachmentFalsePositive, itemLifecycle }, 2);
+        assert(intentMatches.Count == 1 &&
+               intentMatches[0].Hit.qualifiedName == "ThunderRoad.ItemModule.OnItemLoaded" &&
+               intentMatches[0].HasDocumentationMatch,
+            "meaningful identifier and XML evidence ranks the item lifecycle hook while rejecting generic Create false positives");
+        assert(ApiLookupRanker.Rank("Create", new[] { attachmentFalsePositive }, 1).Count == 0,
+            "a generic action verb alone cannot promote a method with a longer unrelated name");
+
+
+        var partialSpawnMatch = Hit("partial-spawn", "ThunderRoad.BowString.SpawnAndAttachArrow",
+            "public void SpawnAndAttachArrow()", Documentation("Spawns an arrow of the given item ID."));
+        var documentedItemLifecycle = Hit("documented-item-lifecycle", "ThunderRoad.ItemModule.OnItemLoaded",
+            "public virtual void OnItemLoaded(ThunderRoad.Item item)",
+            Documentation("Called once an item spawned from the owning data has loaded, to attach runtime behaviour to it."));
+        var lifecycleRanking = ApiLookupRanker.Rank("attach runtime behaviour to a spawned sword",
+            new[] { partialSpawnMatch, documentedItemLifecycle }, 2);
+        assert(lifecycleRanking.Count == 2 &&
+               lifecycleRanking[0].Hit.symbolId == "documented-item-lifecycle" &&
+               !lifecycleRanking[0].IsLowConfidence &&
+               lifecycleRanking[0].CoveragePercent > lifecycleRanking[1].CoveragePercent,
+            "complete XML-documentation evidence outranks a partial direct-name spawn/attach match");
+        var catalogBackedType = Hit("catalog-backed-type", "Fixture.Shared.CatalogBackedType",
+            "public class CatalogBackedType", kind: "class", declaringType: null);
+        var catalogRanker = new ApiLookupRanker.CandidateAccumulator("moonstone", 1,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Fixture.Shared.CatalogBackedType" });
+        catalogRanker.Add(catalogBackedType);
+        var catalogRank = catalogRanker.GetSortedResults();
+        assert(catalogRank.Length == 1 && catalogRank[0].HasCatalogMatch && !catalogRank[0].IsLowConfidence,
+            "an indexed API type is supported and ranked when catalog $type evidence matches it");
+
+        var aliases = ApiLookupRanker.MatchedConceptAliases("weapons swords props NPCs");
+        assert(aliases.Select(alias => alias.Term).ToHashSet(StringComparer.Ordinal)
+                   .SetEquals(new[] { "weapon", "sword", "prop", "npc" }) &&
+               aliases.Where(alias => alias.CanonicalConcept == "item").All(alias => alias.CatalogTypeName == "ItemData") &&
+               aliases.Where(alias => alias.CanonicalConcept == "creature").All(alias => alias.CatalogTypeName == "CreatureData"),
+            "curated singular and plural aliases nominate only the item and creature catalog concepts");
 
         var boundedCandidates = new ApiLookupRanker.CandidateAccumulator("target", ApiLookupRanker.MaxCandidates);
         for (var index = 0; index < ApiLookupRanker.MaxCandidates; index++)
@@ -192,6 +258,30 @@ public static class ApiLookupRegressionCheck
         using (var absent = await Lookup("quantum teleportation warp drive"))
             assert(!absent.RootElement.GetProperty("found").GetBoolean() && Results(absent).Length == 0,
                 "nonexistent task query returns no declarations");
+
+        using (var unsupportedConcept = await Lookup("sword"))
+        {
+            var hint = unsupportedConcept.RootElement.GetProperty("conceptHints").EnumerateArray().Single();
+            assert(hint.GetProperty("term").GetString() == "sword" &&
+                   hint.GetProperty("concept").GetString() == "item" &&
+                   hint.GetProperty("dataApiType").ValueKind == JsonValueKind.Null &&
+                   hint.GetProperty("runtimeApiType").ValueKind == JsonValueKind.Null,
+                "an alias may name the item concept but cannot invent API types absent from the selected assembly");
+        }
+
+        using (var documentationSearch = await apiToolJsonAsync("api_search", new
+        {
+            query = "moonstone fixture surface", assemblyId, scope = "installed", limit = 20,
+        }))
+        {
+            var documentedType = documentationSearch.RootElement.GetProperty("results").EnumerateArray()
+                .FirstOrDefault(item => item.GetProperty("qualifiedName").GetString() == "Fixture.Shared.XmlDocumentationSurface");
+            assert(documentedType.ValueKind != JsonValueKind.Undefined &&
+                   documentedType.GetProperty("xmlDocumentation").GetProperty("summary").GetString()!
+                       .Contains("moonstone fixture surface", StringComparison.OrdinalIgnoreCase),
+                "api_search discovers a distinctive XML-only phrase and returns its documentation snippet");
+        }
+
         using (var examples = await apiToolJsonAsync("api_lookup", new
         {
             query = "spawn an item near the player", assemblyId, maxResults = 5, maxChars = 16000, includeExamples = true
@@ -217,19 +307,44 @@ public static class ApiLookupRegressionCheck
             assert(context.RootElement.GetProperty("relatedTypes").EnumerateArray()
                        .Any(type => type.GetProperty("qualifiedName").GetString() == "Fixture.Shared.SignatureParent`1"),
                 "generic fixture context resolves its related base type");
+            var returnedRelatedIds = context.RootElement.GetProperty("relatedTypes").EnumerateArray()
+                .Select(type => type.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
+            var resultRelatedIds = result.ValueKind == JsonValueKind.Undefined ? Array.Empty<string>() :
+                result.GetProperty("typeContext").GetProperty("relatedTypeIds").EnumerateArray()
+                    .Select(id => id.GetString()!).ToArray();
+            assert(resultRelatedIds.Length > 0 && resultRelatedIds.All(returnedRelatedIds.Contains),
+                "result relatedTypeIds resolve to returned related type records");
         }
 
         using (var budget = await apiToolJsonAsync("api_lookup", new
         {
-            query = "Page", assemblyId, maxResults = 20, maxChars = 3000, includeExamples = false
+            query = "Signature", assemblyId, maxResults = 20, maxChars = 6000, includeExamples = false
         }))
         {
             var root = budget.RootElement;
             assert(root.GetProperty("logicalChars").GetInt32() == root.GetRawText().Length &&
-                   root.GetProperty("logicalChars").GetInt32() <= 3000,
-                "budget-limited task logicalChars includes itself and the JSON stays within 3000 characters");
+                   root.GetProperty("logicalChars").GetInt32() <= 6000,
+                "budget-limited task logicalChars includes itself and the JSON stays within 6000 characters");
             assert(root.GetProperty("truncated").GetBoolean() && !root.GetProperty("complete").GetBoolean(),
                 "budget-limited task response reports truncated and incomplete");
+            var resultIds = root.GetProperty("results").EnumerateArray()
+                .Select(item => item.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
+            var relatedTypes = root.GetProperty("relatedTypes").EnumerateArray().ToArray();
+            var relatedIds = relatedTypes.Select(item => item.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
+            var catalogOwners = root.GetProperty("catalog").GetProperty("records").EnumerateArray()
+                .Select(item => "catalog:" + item.GetProperty("entryId").GetString()).ToHashSet(StringComparer.Ordinal);
+            var hasRelatedLinks = relatedTypes.Any(item => item.GetProperty("relatedTo").GetArrayLength() > 0);
+            var resultEdgesResolve = root.GetProperty("results").EnumerateArray().All(item =>
+                !item.TryGetProperty("typeContext", out var context) ||
+                !context.TryGetProperty("relatedTypeIds", out var ids) ||
+                ids.EnumerateArray().All(id => relatedIds.Contains(id.GetString()!)));
+            var relatedEdgesResolve = relatedTypes.All(item =>
+                item.GetProperty("relatedTo").EnumerateArray().All(owner =>
+                    resultIds.Contains(owner.GetString()!) || catalogOwners.Contains(owner.GetString()!)));
+            assert(resultIds.Count > 0 && relatedIds.Count > 0 &&
+                   resultIds.Count < root.GetProperty("total").GetInt32() &&
+                   hasRelatedLinks && resultEdgesResolve && relatedEdgesResolve,
+                $"budget trimming leaves only relationship IDs for returned nodes; results={resultIds.Count}, related={relatedIds.Count}");
         }
 
         using (var first = await apiToolJsonAsync("api_lookup", new

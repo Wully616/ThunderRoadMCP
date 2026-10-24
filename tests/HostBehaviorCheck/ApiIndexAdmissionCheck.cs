@@ -233,6 +233,9 @@ public static class ApiIndexAdmissionCheck
         Directory.CreateDirectory(directory);
         var destination = Path.Combine(directory, Path.GetFileName(sourcePath));
         File.Copy(sourcePath, destination);
+        var sourceDocumentation = Path.ChangeExtension(sourcePath, ".xml");
+        if (File.Exists(sourceDocumentation))
+            File.Copy(sourceDocumentation, Path.ChangeExtension(destination, ".xml"));
         return Path.GetFullPath(destination);
     }
 
@@ -240,20 +243,28 @@ public static class ApiIndexAdmissionCheck
     {
         var assemblyName = AssemblyName.GetAssemblyName(sourcePath);
         var root = Path.GetDirectoryName(fullPath)!;
-        var entryType = typeof(InstalledApiCatalog).GetNestedType("AssemblyEntry", BindingFlags.NonPublic)!;
-        var constructor = entryType.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            .Single(candidate => candidate.GetParameters().Length == 10);
-        var parameters = constructor.GetParameters();
-        var arguments = new object?[parameters.Length];
-        arguments[0] = id;
-        arguments[1] = assemblyName.Name!;
-        arguments[2] = assemblyName.Version?.ToString() ?? "0.0.0.0";
-        arguments[3] = "00000000-0000-0000-0000-000000000001";
-        arguments[4] = origin;
-        arguments[5] = root;
-        arguments[6] = Path.GetFileName(fullPath);
-        arguments[7] = fullPath;
-        arguments[8] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(sourcePath)));
+        var documentationPath = Path.ChangeExtension(fullPath, ".xml");
+        var hasDocumentation = origin == "game" && File.Exists(documentationPath);
+        var constructor = typeof(InstalledApiCatalog).GetNestedType("AssemblyEntry", BindingFlags.NonPublic)!
+            .GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Single(candidate => candidate.GetParameters().Length == 14);
+        var arguments = new object?[]
+        {
+            id,
+            assemblyName.Name!,
+            assemblyName.Version?.ToString() ?? "0.0.0.0",
+            "00000000-0000-0000-0000-000000000001",
+            origin,
+            root,
+            Path.GetFileName(fullPath),
+            fullPath,
+            Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(sourcePath))),
+            hasDocumentation ? documentationPath : null,
+            hasDocumentation ? "available" : "missing",
+            null,
+            hasDocumentation ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(documentationPath))) : null,
+            null,
+        };
         return constructor.Invoke(arguments);
     }
 

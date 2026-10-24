@@ -1,11 +1,17 @@
 using System.Text;
 using System.Text.Json;
 using ModelContextProtocol.Protocol;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 
 internal static class EvaluationContractCheck
 {
     public static async Task RunAsync()
     {
+        await VerifyTransportOutcomesAsync();
+
         foreach (var depth in new[] { 20, 60, 61, 62 })
         {
             var result = BridgeClient.ParseResponse(Encoding.UTF8.GetBytes(SuccessResponse(depth)), "depth-check");
@@ -72,6 +78,54 @@ internal static class EvaluationContractCheck
                success.Content.OfType<TextContentBlock>().Single().Text == "{\"value\":42}",
             "successful evaluations preserve their structured and text result shapes");
     }
+    private static async Task VerifyTransportOutcomesAsync()
+    {
+        var previousConfigPath = Environment.GetEnvironmentVariable("THUNDERROAD_MCP_CONFIG");
+        var configPath = Path.Combine(Path.GetTempPath(), "thunderroad-mcp-evaluation-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            using var reservation = new TcpListener(IPAddress.Loopback, 0);
+            reservation.Start();
+            var refusedPort = ((IPEndPoint)reservation.LocalEndpoint).Port;
+            reservation.Stop();
+            await File.WriteAllTextAsync(configPath, BridgeConfig(refusedPort));
+            Environment.SetEnvironmentVariable("THUNDERROAD_MCP_CONFIG", configPath);
+
+            var refused = await ToolInvocation.RunEvaluation(() =>
+                new BridgeClient().RequestAsync("evaluate", new { code = "return 1;" }, CancellationToken.None));
+            AssertOutcome(refused, "not_started", "evaluation.failed");
+
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            await File.WriteAllTextAsync(configPath, BridgeConfig(port));
+            var server = Task.Run(async () =>
+            {
+                using var accepted = await listener.AcceptTcpClientAsync();
+                var stream = accepted.GetStream();
+                var buffer = new byte[1024];
+                int read;
+                while ((read = await stream.ReadAsync(buffer)) > 0)
+                {
+                    if (Array.IndexOf(buffer, (byte)'\n', 0, read) >= 0)
+                        break;
+                }
+            });
+            var disconnected = await ToolInvocation.RunEvaluation(() =>
+                new BridgeClient().RequestAsync("evaluate", new { code = "return 1;" }, CancellationToken.None));
+            await server;
+            AssertOutcome(disconnected, "unknown", "evaluation.failed");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("THUNDERROAD_MCP_CONFIG", previousConfigPath);
+            if (File.Exists(configPath))
+                File.Delete(configPath);
+        }
+    }
+
+    private static string BridgeConfig(int port) =>
+        $$"""{"enabled":true,"host":"127.0.0.1","port":{{port}},"token":"{{new string('0', 64)}}" }""";
 
     private static string SuccessResponse(int resultDepth)
     {

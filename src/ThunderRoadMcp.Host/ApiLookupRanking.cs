@@ -1,6 +1,6 @@
 internal static class ApiLookupRanker
 {
-    internal const string Version = "lexical-v3";
+    internal const string Version = "evidence-v7-xml-catalog-concepts";
     internal const int MaxCandidates = 50_000;
     internal const int MinimumConfidenceScore = 500;
     internal const int MinimumCoveragePercent = 75;
@@ -13,18 +13,54 @@ internal static class ApiLookupRanker
         bool IsExact,
         int CoveragePercent,
         bool HasDirectMatch,
-        bool IsLowConfidence);
+        bool IsLowConfidence,
+        bool HasDocumentationMatch,
+        bool HasCatalogMatch);
     private static readonly IComparer<RankedResult> WorstFirstComparer =
         Comparer<RankedResult>.Create(static (left, right) => CompareRankedResults(right, left));
+
+    internal sealed record ConceptAlias(string Term, string CanonicalConcept, string CatalogTypeName,
+        string DataTypeSimpleName, string RuntimeTypeSimpleName);
+
+    private static readonly ConceptAlias[] ConceptAliases =
+    [
+        new("weapon", "item", "ItemData", "ItemData", "Item"),
+        new("sword", "item", "ItemData", "ItemData", "Item"),
+        new("prop", "item", "ItemData", "ItemData", "Item"),
+        new("npc", "creature", "CreatureData", "CreatureData", "Creature"),
+    ];
+
+    internal static IReadOnlyList<ConceptAlias> MatchedConceptAliases(string query)
+    {
+        var aliases = new List<ConceptAlias>();
+        foreach (var token in QueryTokens(query))
+        {
+            var alias = FindConceptAlias(token);
+            if (alias is not null && !aliases.Any(existing => existing.Term == alias.Term))
+                aliases.Add(alias);
+        }
+        return aliases;
+    }
+
+    private static ConceptAlias? FindConceptAlias(string token) =>
+        ConceptAliases.FirstOrDefault(alias => alias.Term.Equals(token, StringComparison.Ordinal));
+
+    internal static bool IsActionToken(string token) =>
+        ActionTokens.Contains(token) ||
+        ActionTokens.Contains(NormalizeInflection(token.ToLowerInvariant()));
+
+    private static bool IsApiTypeKind(string kind) =>
+        kind is "class" or "struct" or "interface" or "enum" or "delegate" or "type";
 
     internal sealed class CandidateAccumulator
     {
         private readonly string _exactQuery;
         private readonly List<string> _queryTokens;
         private readonly int _maxCandidates;
+        private readonly IReadOnlySet<string> _catalogApiTypes;
         private readonly PriorityQueue<RankedResult, RankedResult> _candidates;
 
-        internal CandidateAccumulator(string query, int maxCandidates)
+        internal CandidateAccumulator(string query, int maxCandidates, IReadOnlySet<string>? catalogApiTypes = null)
         {
             ArgumentNullException.ThrowIfNull(query);
             if (maxCandidates < 1)
@@ -32,6 +68,7 @@ internal static class ApiLookupRanker
             _exactQuery = query.Trim();
             _queryTokens = QueryTokens(query);
             _maxCandidates = maxCandidates;
+            _catalogApiTypes = catalogApiTypes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _candidates = new PriorityQueue<RankedResult, RankedResult>(WorstFirstComparer);
         }
 
@@ -41,7 +78,7 @@ internal static class ApiLookupRanker
 
         internal void Add(InstalledApiCatalog.ApiHit hit)
         {
-            var result = RankHit(_exactQuery, _queryTokens, hit);
+            var result = RankHit(_exactQuery, _queryTokens, hit, _catalogApiTypes);
             if (!result.HasValue)
                 return;
             var candidate = result.Value;
@@ -73,7 +110,8 @@ internal static class ApiLookupRanker
         }
     }
 
-    private static RankedResult? RankHit(string exactQuery, IReadOnlyList<string> queryTokens, InstalledApiCatalog.ApiHit hit)
+    private static RankedResult? RankHit(string exactQuery, IReadOnlyList<string> queryTokens,
+        InstalledApiCatalog.ApiHit hit, IReadOnlySet<string>? catalogApiTypes = null)
     {
         if (queryTokens.Count == 0)
             return null;
@@ -88,8 +126,19 @@ internal static class ApiLookupRanker
         var exactSimple = simpleName.Equals(exactQuery, StringComparison.OrdinalIgnoreCase);
         var actionQuery = queryTokens.Any(token => ActionTokens.Contains(token));
         var matched = 0;
+        var meaningfulMatched = 0;
+        var meaningfulQueryTokens = queryTokens.Count(token => !ActionTokens.Contains(token));
         var direct = false;
+        var documentationMatch = false;
+        var catalogTypeName = IsApiTypeKind(hit.kind) ? hit.qualifiedName : null;
+        var conceptSpawnMatch = queryTokens.Count == 1 && FindConceptAlias(queryTokens[0]) is not null &&
+            hit.kind == "method" && hit.qualifiedName.EndsWith(".SpawnAsync", StringComparison.Ordinal) &&
+            hit.declaringType is not null && catalogApiTypes?.Contains(hit.declaringType) == true;
+        var catalogTypeMatch = catalogTypeName is not null && catalogApiTypes?.Contains(catalogTypeName) == true;
+        var catalogMatch = catalogTypeMatch || conceptSpawnMatch;
         var score = exactQualified ? 12000 : exactSimple ? 11000 : 0;
+        if (!exactQualified && !exactSimple)
+            score += conceptSpawnMatch ? 1900 : catalogTypeMatch ? 900 : 0;
 
         foreach (var token in queryTokens)
         {
@@ -98,15 +147,28 @@ internal static class ApiLookupRanker
             var inSignature = Contains(signatureTokens, token);
             var synonymInSimple = !inSimple && SynonymMatches(token, simpleTokens);
             var synonymInDeclaring = !inDeclaring && SynonymMatches(token, declaringTokens);
-            if (!inSimple && !inDeclaring && !inSignature && !synonymInSimple && !synonymInDeclaring)
+            var inDocumentation = DocumentationMatchesToken(hit.xmlDocumentation, token);
+            var concept = FindConceptAlias(token);
+            var inConcept = concept is not null &&
+                (Contains(simpleTokens, concept.CanonicalConcept) ||
+                 Contains(declaringTokens, concept.CanonicalConcept) ||
+                 Contains(signatureTokens, concept.CanonicalConcept) ||
+                 DocumentationContains(hit.xmlDocumentation, concept.CanonicalConcept));
+            if (!inSimple && !inDeclaring && !inSignature && !synonymInSimple && !synonymInDeclaring &&
+                !inDocumentation && !inConcept)
                 continue;
             matched++;
+            if (!ActionTokens.Contains(token))
+                meaningfulMatched++;
             if (inSimple || inDeclaring || inSignature)
                 direct = true;
+            documentationMatch |= inDocumentation ||
+                concept is not null && inConcept && DocumentationContains(hit.xmlDocumentation, concept.CanonicalConcept);
             if (!exactQualified && !exactSimple)
             {
                 score += inSimple ? 600 : inSignature ? 180 : inDeclaring ? 120 :
-                    synonymInSimple ? 180 : 40;
+                    synonymInSimple ? 180 : synonymInDeclaring ? 40 :
+                    inConcept ? 240 : inDocumentation ? 140 : 0;
                 if (actionQuery && inSimple && ActionTokens.Contains(token))
                     score += 400;
             }
@@ -118,20 +180,46 @@ internal static class ApiLookupRanker
             intentBonus = GameplayIntentBonus(queryTokens, hit.qualifiedName);
             score += KindPreference(hit.kind, actionQuery) + intentBonus;
         }
-        var coverage = matched * 100 / queryTokens.Count;
         var exact = exactQualified || exactSimple;
-        if (!exact && matched == 0)
+        if (!exact && matched == 0 && !catalogMatch)
+            return null;
+        if (!exact && meaningfulQueryTokens > 0 && meaningfulMatched == 0 && !catalogMatch)
+            return null;
+        if (!exact && meaningfulQueryTokens == 0 && !catalogMatch &&
+            (queryTokens.Count != 1 || !simpleName.Equals(queryTokens[0], StringComparison.OrdinalIgnoreCase)))
             return null;
         var structuredQuery = exactQuery.Contains('.') && !exactQuery.Any(char.IsWhiteSpace) &&
             !exactQuery.Contains('<') && !exactQuery.Contains('>') &&
             !exactQuery.Contains('(') && !exactQuery.Contains(')');
         if (!exact && structuredQuery && (matched != queryTokens.Count || !direct))
             return null;
+        var coverage = matched * 100 / queryTokens.Count;
         return new RankedResult(hit, score, matched, queryTokens.Count, exact, coverage, direct,
-            !exact && intentBonus == 0 && (!direct || coverage < MinimumCoveragePercent ||
-                       (score < MinimumConfidenceScore && coverage < 100)));
+            !exact && !catalogMatch && intentBonus == 0 &&
+            ((!direct && !documentationMatch) || coverage < MinimumCoveragePercent ||
+             (score < MinimumConfidenceScore && coverage < 100)),
+            documentationMatch, catalogMatch);
     }
 
+    private static bool DocumentationContains(InstalledApiCatalog.ApiXmlDocumentation? documentation, string token)
+    {
+        if (documentation is null)
+            return false;
+        bool ContainsText(string? text) => text?.Contains(token, StringComparison.OrdinalIgnoreCase) == true;
+        return ContainsText(documentation.Summary) || ContainsText(documentation.Remarks) ||
+            ContainsText(documentation.Returns) || ContainsText(documentation.Value) ||
+            (documentation.Parameters?.Any(parameter =>
+                ContainsText(parameter.Name) || ContainsText(parameter.Description)) ?? false) ||
+            (documentation.Examples?.Any(ContainsText) ?? false);
+    }
+    private static bool DocumentationMatchesToken(InstalledApiCatalog.ApiXmlDocumentation? documentation, string token)
+    {
+        if (DocumentationContains(documentation, token))
+            return true;
+        return SynonymGroups.Any(group => group.Contains(token, StringComparer.Ordinal) &&
+            group.Any(candidate => !candidate.Equals(token, StringComparison.Ordinal) &&
+                                   DocumentationContains(documentation, candidate)));
+    }
     private static int KindPreference(string kind, bool actionQuery)
     {
         if (!actionQuery)
@@ -169,7 +257,7 @@ internal static class ApiLookupRanker
         (["player", "local"], "ThunderRoad.Player.local", 700),
     ];
 
-    private static readonly HashSet<string> ActionTokens = new(StringComparer.Ordinal)
+    private static readonly HashSet<string> ActionTokens = new(StringComparer.OrdinalIgnoreCase)
     {
         "spawn", "summon", "create", "instantiate", "add", "remove", "destroy", "despawn", "dispose",
         "give", "equip", "set", "get", "find", "load", "save", "start", "stop", "open", "close",
@@ -184,7 +272,8 @@ internal static class ApiLookupRanker
     };
 
     private static List<string> QueryTokens(string query) =>
-        Tokenize(query).Select(NormalizeInflection).Where(token => !StopWords.Contains(token))
+        Tokenize(query.Replace("NPCs", "NPC", StringComparison.OrdinalIgnoreCase))
+            .Select(NormalizeInflection).Where(token => !StopWords.Contains(token))
             .Distinct(StringComparer.Ordinal).ToList();
 
 
@@ -200,7 +289,8 @@ internal static class ApiLookupRanker
         ["event", "callback", "handler", "listener", "subscribe"],
         ["cleanup", "clean", "remove", "destroy", "despawn", "dispose"],
         ["runtime", "live", "current", "active", "session"],
-        ["counter", "count", "total", "number", "metric", "statistics"]
+        ["counter", "count", "total", "number", "metric", "statistics"],
+        ["behavior", "behaviour"],
     ];
 
     private static bool Contains(IReadOnlyList<string> tokens, string token)
@@ -226,7 +316,7 @@ internal static class ApiLookupRanker
     }
 
     internal static RankedResult ContextResult(InstalledApiCatalog.ApiHit hit) =>
-        new(hit, 0, 0, 0, false, 0, false, true);
+        new(hit, 0, 0, 0, false, 0, false, true, false, false);
 
     internal static IReadOnlyList<RankedResult> Rank(
         string query, IReadOnlyList<InstalledApiCatalog.ApiHit> hits, int maxResults)
@@ -255,6 +345,10 @@ internal static class ApiLookupRanker
     private static int CompareRankedResults(RankedResult left, RankedResult right)
     {
         var order = right.IsExact.CompareTo(left.IsExact);
+        if (order != 0) return order;
+        order = left.IsLowConfidence.CompareTo(right.IsLowConfidence);
+        if (order != 0) return order;
+        order = right.CoveragePercent.CompareTo(left.CoveragePercent);
         if (order != 0) return order;
         order = right.Score.CompareTo(left.Score);
         if (order != 0) return order;

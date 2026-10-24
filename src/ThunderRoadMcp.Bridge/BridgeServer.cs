@@ -93,7 +93,14 @@ namespace ThunderRoadMcp.Bridge
                 }
 
                 timings = BridgeRequestTimings.Create(request.diagnostics);
-                object result = await requestHandler.DispatchAsync(request, shutdown.Token, timings).ConfigureAwait(false);
+                object result;
+                using (var requestLifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token))
+                {
+                    // A pending NetworkStream read cannot be canceled portably; disposing the client
+                    // after the response ends the monitor, so it must not be awaited here.
+                    _ = MonitorClientDisconnect(stream, requestLifetime);
+                    result = await requestHandler.DispatchAsync(request, requestLifetime.Token, timings).ConfigureAwait(false);
+                }
                 timings.Complete();
                 await WriteSuccess(stream, request.id, result, timings.Snapshot(), client, request.method == "evaluate").ConfigureAwait(false);
             }
@@ -143,6 +150,22 @@ namespace ThunderRoadMcp.Bridge
             }
         }
 
+        private static async Task MonitorClientDisconnect(Stream stream, CancellationTokenSource requestLifetime)
+        {
+            var buffer = new byte[1];
+            try
+            {
+                while (await stream.ReadAsync(buffer, 0, 1).ConfigureAwait(false) != 0) { }
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+            catch (SocketException) { }
+            try
+            {
+                requestLifetime.Cancel();
+            }
+            catch (ObjectDisposedException) { }
+        }
 
         private static async Task<string> ReadLine(Stream stream, CancellationToken token)
         {

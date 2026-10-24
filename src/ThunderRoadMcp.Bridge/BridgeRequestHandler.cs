@@ -264,21 +264,44 @@ namespace ThunderRoadMcp.Bridge
             string requestedKey = GetOptionalString(args, "key", McpRuntime.MaxKeyLength);
             Vector3? position = ReadOptionalPosition(args, "spawn_effect");
             return new BridgeJsonResult(await AwaitWithCancellation(
-                MainThreadQueue.Enqueue(() => SerializeResult(SpawnEffect(effectId, requestedKey, position)), token), token).ConfigureAwait(false));
+                MainThreadQueue.Enqueue(() => SpawnEffect(effectId, requestedKey, position, token).Json, token), token).ConfigureAwait(false));
         }
 
-        private static object SpawnEffect(string effectId, string requestedKey, Vector3? position)
+        private static BridgeJsonResult SpawnEffect(string effectId, string requestedKey, Vector3? position, CancellationToken token)
         {
             McpRuntime runtime = Runtime();
             EffectData data = Catalog.GetData<EffectData>(effectId);
             if (data == null) throw new InvalidDataException("Catalog effect not found: " + effectId);
             Vector3 spawnPosition = position ?? DefaultSpawnPosition(EffectSpawnDistance);
             string key = requestedKey ?? GenerateKey(runtime, "effect-");
-            EffectInstance instance = data.Spawn(spawnPosition, Quaternion.identity, null, null, true, null, false, 1f, 1f, new Type[0]);
-            if (instance == null) throw new InvalidOperationException("EffectData.Spawn returned no EffectInstance.");
-            instance.Play();
-            runtime.Set(key, instance);
-            return new { key, effectId, position = new { x = spawnPosition.x, y = spawnPosition.y, z = spawnPosition.z } };
+            token.ThrowIfCancellationRequested();
+
+            EffectInstance instance = null;
+            bool committed = false;
+            try
+            {
+                instance = data.Spawn(spawnPosition, Quaternion.identity, null, null, true, null, false, 1f, 1f, new Type[0]);
+                if (instance == null) throw new InvalidOperationException("EffectData.Spawn returned no EffectInstance.");
+                token.ThrowIfCancellationRequested();
+                instance.Play();
+                token.ThrowIfCancellationRequested();
+
+                var result = new BridgeJsonResult(SerializeResult(new
+                {
+                    key,
+                    effectId,
+                    position = new { x = spawnPosition.x, y = spawnPosition.y, z = spawnPosition.z }
+                }));
+                token.ThrowIfCancellationRequested();
+                runtime.Set(key, instance);
+                committed = true;
+                return result;
+            }
+            catch
+            {
+                RollbackSpawnIfUncommitted(instance, committed, EndEffectSafely);
+                throw;
+            }
         }
 
         // Runs a spawn on the main thread inside a bridge-managed coroutine and waits for its completion source.
@@ -343,131 +366,235 @@ namespace ThunderRoadMcp.Bridge
             throw new InvalidOperationException("Could not allocate a unique runtime key.");
         }
 
+        internal static void RollbackSpawnIfUncommitted<T>(T spawned, bool committed, Action<T> rollback) where T : class
+        {
+            if (committed || ReferenceEquals(spawned, null)) return;
+            try { rollback(spawned); } catch { }
+        }
+
+        internal static void SettleAbandonedSpawn(TaskCompletionSource<object> completion)
+        {
+            if (!completion.Task.IsCompleted) completion.TrySetCanceled();
+        }
+        private static void DespawnItemSafely(Item item)
+        {
+            if (item == null) return;
+            try { item.Despawn(); } catch { }
+        }
+
+        private static void DespawnCreatureSafely(Creature creature)
+        {
+            if (creature == null) return;
+            try { creature.Despawn(); } catch { }
+        }
+
+        private static void EndEffectSafely(EffectInstance instance)
+        {
+            if (instance == null) return;
+            try { instance.End(); } catch { }
+        }
+
         private static IEnumerator SpawnItemRoutine(McpRuntime runtime, ItemData data, string itemId, Vector3 position,
             string key, bool disallowDespawn, CancellationToken abort, TaskCompletionSource<object> completion)
         {
+            object callbackGate = new object();
             Item spawned = null;
             bool called = false;
             bool abandoned = false;
+            bool committed = false;
             try
             {
-                data.SpawnAsync(item =>
+                try
                 {
-                    // An item that arrives after the request gave up must not be left orphaned in the scene.
-                    if (abandoned)
+                    data.SpawnAsync(item =>
                     {
-                        if (item != null) item.Despawn();
-                        return;
-                    }
-                    spawned = item;
-                    called = true;
-                }, position, Quaternion.identity, null, false);
-            }
-            catch (Exception exception)
-            {
-                completion.TrySetException(exception);
-                yield break;
-            }
-
-            float deadline = Time.realtimeSinceStartup + SpawnCompletionTimeoutSeconds;
-            while (!called && !abort.IsCancellationRequested && Time.realtimeSinceStartup < deadline)
-                yield return null;
-            if (abort.IsCancellationRequested || !called)
-            {
-                abandoned = true;
-                if (spawned != null) spawned.Despawn();
-                if (!abort.IsCancellationRequested)
-                    completion.TrySetException(new TimeoutException(
-                        "spawn_item did not complete within " + SpawnCompletionTimeoutSeconds.ToString("0") + " seconds."));
-                yield break;
-            }
-            if (spawned == null)
-            {
-                completion.TrySetException(new InvalidOperationException("Item spawn completed without an Item."));
-                yield break;
-            }
-
-            try
-            {
-                spawned.DisallowDespawn = disallowDespawn;
-                runtime.Set(key, spawned);
-                Vector3 actual = spawned.transform.position;
-                completion.TrySetResult(new
+                        bool despawn;
+                        lock (callbackGate)
+                        {
+                            despawn = abandoned
+                                ? !ReferenceEquals(item, spawned)
+                                : called && !ReferenceEquals(item, spawned);
+                            if (!abandoned && !called)
+                            {
+                                spawned = item;
+                                called = true;
+                            }
+                        }
+                        if (despawn) DespawnItemSafely(item);
+                    }, position, Quaternion.identity, null, false);
+                }
+                catch (Exception exception)
                 {
-                    key,
-                    itemId,
-                    position = new { x = actual.x, y = actual.y, z = actual.z },
-                    instanceId = spawned.GetInstanceID(),
-                    name = spawned.name
-                });
+                    completion.TrySetException(exception);
+                    yield break;
+                }
+
+                float deadline = Time.realtimeSinceStartup + SpawnCompletionTimeoutSeconds;
+                while (true)
+                {
+                    lock (callbackGate)
+                        if (called) break;
+                    if (abort.IsCancellationRequested || Time.realtimeSinceStartup >= deadline) break;
+                    yield return null;
+                }
+
+                Item completedItem;
+                bool callbackCompleted;
+                lock (callbackGate)
+                {
+                    callbackCompleted = called;
+                    completedItem = spawned;
+                }
+                if (abort.IsCancellationRequested || !callbackCompleted)
+                {
+                    if (!abort.IsCancellationRequested)
+                        completion.TrySetException(new TimeoutException(
+                            "spawn_item did not complete within " + SpawnCompletionTimeoutSeconds.ToString("0") + " seconds."));
+                    yield break;
+                }
+                if (completedItem == null)
+                {
+                    completion.TrySetException(new InvalidOperationException("Item spawn completed without an Item."));
+                    yield break;
+                }
+
+                try
+                {
+                    completedItem.DisallowDespawn = disallowDespawn;
+                    Vector3 actual = completedItem.transform.position;
+                    var result = new BridgeJsonResult(SerializeResult(new
+                    {
+                        key,
+                        itemId,
+                        position = new { x = actual.x, y = actual.y, z = actual.z },
+                        instanceId = completedItem.GetInstanceID(),
+                        name = completedItem.name
+                    }));
+                    abort.ThrowIfCancellationRequested();
+                    lock (callbackGate)
+                    {
+                        runtime.Set(key, completedItem);
+                        committed = true;
+                    }
+                    completion.TrySetResult(result);
+                }
+                catch (Exception exception)
+                {
+                    completion.TrySetException(exception);
+                }
             }
-            catch (Exception exception)
+            finally
             {
-                completion.TrySetException(exception);
+                Item uncommitted = null;
+                lock (callbackGate)
+                {
+                    abandoned = true;
+                    if (!committed) uncommitted = spawned;
+                }
+                RollbackSpawnIfUncommitted(uncommitted, false, DespawnItemSafely);
+                SettleAbandonedSpawn(completion);
             }
         }
 
         private static IEnumerator SpawnCreatureRoutine(McpRuntime runtime, CreatureData data, string creatureId,
             Vector3 position, float rotationY, string key, CancellationToken abort, TaskCompletionSource<object> completion)
         {
+            object callbackGate = new object();
             Creature spawned = null;
             bool called = false;
             bool abandoned = false;
+            bool committed = false;
             try
             {
-                data.SpawnAsync(position, rotationY, null, true, null, creature =>
+                try
                 {
-                    // A creature that arrives after the request gave up must not be left orphaned in the scene.
-                    if (abandoned)
+                    data.SpawnAsync(position, rotationY, null, true, null, creature =>
                     {
-                        if (creature != null) creature.Despawn();
-                        return;
-                    }
-                    spawned = creature;
-                    called = true;
-                });
-            }
-            catch (Exception exception)
-            {
-                completion.TrySetException(exception);
-                yield break;
-            }
-
-            float deadline = Time.realtimeSinceStartup + CreatureSpawnCompletionTimeoutSeconds;
-            while (!called && !abort.IsCancellationRequested && Time.realtimeSinceStartup < deadline)
-                yield return null;
-            if (abort.IsCancellationRequested || !called)
-            {
-                abandoned = true;
-                if (spawned != null) spawned.Despawn();
-                if (!abort.IsCancellationRequested)
-                    completion.TrySetException(new TimeoutException(
-                        "spawn_creature did not complete within " + CreatureSpawnCompletionTimeoutSeconds.ToString("0") + " seconds."));
-                yield break;
-            }
-            if (spawned == null)
-            {
-                completion.TrySetException(new InvalidOperationException("Creature spawn completed without a Creature."));
-                yield break;
-            }
-
-            try
-            {
-                runtime.Set(key, spawned);
-                Vector3 actual = spawned.transform.position;
-                completion.TrySetResult(new
+                        bool despawn;
+                        lock (callbackGate)
+                        {
+                            despawn = abandoned
+                                ? !ReferenceEquals(creature, spawned)
+                                : called && !ReferenceEquals(creature, spawned);
+                            if (!abandoned && !called)
+                            {
+                                spawned = creature;
+                                called = true;
+                            }
+                        }
+                        if (despawn) DespawnCreatureSafely(creature);
+                    });
+                }
+                catch (Exception exception)
                 {
-                    key,
-                    creatureId,
-                    position = new { x = actual.x, y = actual.y, z = actual.z },
-                    rotationY = spawned.transform.eulerAngles.y,
-                    instanceId = spawned.GetInstanceID(),
-                    name = spawned.name
-                });
+                    completion.TrySetException(exception);
+                    yield break;
+                }
+
+                float deadline = Time.realtimeSinceStartup + CreatureSpawnCompletionTimeoutSeconds;
+                while (true)
+                {
+                    lock (callbackGate)
+                        if (called) break;
+                    if (abort.IsCancellationRequested || Time.realtimeSinceStartup >= deadline) break;
+                    yield return null;
+                }
+
+                Creature completedCreature;
+                bool callbackCompleted;
+                lock (callbackGate)
+                {
+                    callbackCompleted = called;
+                    completedCreature = spawned;
+                }
+                if (abort.IsCancellationRequested || !callbackCompleted)
+                {
+                    if (!abort.IsCancellationRequested)
+                        completion.TrySetException(new TimeoutException(
+                            "spawn_creature did not complete within " + CreatureSpawnCompletionTimeoutSeconds.ToString("0") + " seconds."));
+                    yield break;
+                }
+                if (completedCreature == null)
+                {
+                    completion.TrySetException(new InvalidOperationException("Creature spawn completed without a Creature."));
+                    yield break;
+                }
+
+                try
+                {
+                    Vector3 actual = completedCreature.transform.position;
+                    var result = new BridgeJsonResult(SerializeResult(new
+                    {
+                        key,
+                        creatureId,
+                        position = new { x = actual.x, y = actual.y, z = actual.z },
+                        rotationY = completedCreature.transform.eulerAngles.y,
+                        instanceId = completedCreature.GetInstanceID(),
+                        name = completedCreature.name
+                    }));
+                    abort.ThrowIfCancellationRequested();
+                    lock (callbackGate)
+                    {
+                        runtime.Set(key, completedCreature);
+                        committed = true;
+                    }
+                    completion.TrySetResult(result);
+                }
+                catch (Exception exception)
+                {
+                    completion.TrySetException(exception);
+                }
             }
-            catch (Exception exception)
+            finally
             {
-                completion.TrySetException(exception);
+                Creature uncommitted = null;
+                lock (callbackGate)
+                {
+                    abandoned = true;
+                    if (!committed) uncommitted = spawned;
+                }
+                RollbackSpawnIfUncommitted(uncommitted, false, DespawnCreatureSafely);
+                SettleAbandonedSpawn(completion);
             }
         }
 

@@ -17,6 +17,7 @@
     <MakeDir Directories="$(OutDir)api-fixtures/game;$(OutDir)api-fixtures/mod;$(OutDir)api-fixtures/changed" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/GameBase/bin/$(Configuration)/net10.0/Fixture.Base.dll" DestinationFiles="$(OutDir)api-fixtures/game/Fixture.Base.dll" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/GameShared/bin/$(Configuration)/net10.0/Fixture.Shared.dll" DestinationFiles="$(OutDir)api-fixtures/game/Fixture.Shared.dll" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/GameShared/Fixture.Shared.xml" DestinationFiles="$(OutDir)api-fixtures/game/Fixture.Shared.xml" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/ModShared/bin/$(Configuration)/net10.0/Fixture.Shared.dll" DestinationFiles="$(OutDir)api-fixtures/mod/Fixture.Shared.dll" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)Fixtures/ChangedShared/bin/$(Configuration)/net10.0/Fixture.Shared.dll" DestinationFiles="$(OutDir)api-fixtures/changed/Fixture.Shared.dll" />
   </Target>

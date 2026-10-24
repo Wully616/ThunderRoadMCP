@@ -104,7 +104,7 @@ A launch config selects a game explicitly:
 }
 ```
 
-`launch.json` is created only when an explicit `-GameExecutablePath` or a `THUNDERROAD_MCP_LAUNCH_CONFIG` path is supplied and the config does not already exist. Arguments are passed as an array, never through a shell.
+If no launch config exists, installation writes the selected executable path and an empty argument array to the default or overridden launch-config path. Selection may be explicit (`-GameExecutablePath`), the sole detected install, or an interactive choice. A host-only install without a selected game writes no launch config. Existing launch configs are preserved. Arguments are passed as an array, never through a shell.
 
 ## Prebuilt bridge compatibility
 
@@ -138,7 +138,7 @@ The default host path is `%LOCALAPPDATA%\ThunderRoadMcp\host`. Select a custom e
 .\scripts\upgrade.ps1 -InstallDirectory 'D:\Tools\ThunderRoadMcp\host' -GameExecutablePath 'D:\Games\BladeAndSorcery\BladeAndSorcery.exe'
 ```
 
-Source upgrades require the .NET 10 SDK; release ZIP upgrades use the prebuilt host and bridge and require the .NET 10 runtime. `-DotnetPath` selects an SDK explicitly, `-NonInteractive` disables game-selection prompts, and `-SkipBridge` upgrades only the host and leaves the bridge mod unchanged. A full upgrade requires the selected game's existing ThunderRoadMcp mod. Set `THUNDERROAD_MCP_LAUNCH_CONFIG` and `THUNDERROAD_MCP_CONFIG` as needed to select custom config paths; those files are preserved byte-for-byte, including disabled bridge state and token. Existing `mcp-config.json` and unrelated game mods/files are also retained.
+Source upgrades require the .NET 10 SDK; release ZIP upgrades use the prebuilt host and bridge and require the .NET 10 runtime. `-DotnetPath` selects an SDK explicitly, `-NonInteractive` disables game-selection prompts, and `-SkipBridge` upgrades only the host and leaves the bridge mod unchanged. A full upgrade requires the selected game's existing ThunderRoadMcp mod. Set `THUNDERROAD_MCP_LAUNCH_CONFIG` and `THUNDERROAD_MCP_CONFIG` as needed to select custom config paths; existing configs are preserved byte-for-byte, including disabled bridge state and token. If a game is selected and no launch config exists, the selected executable path is persisted. Existing `mcp-config.json` and unrelated game mods/files are also retained.
 `-NoBridgeConfig` is accepted for command-line symmetry with installation but never creates or changes config during an upgrade. Full upgrades retain an existing bridge config exactly as-is, including disabled state; if it is absent, it remains absent.
 
 The upgrader validates inputs before replacement. Host backups are written to `.ThunderRoadMcp-backups` next to the host directory; bridge backups are written to `StreamingAssets\.ThunderRoadMcp-backups`, outside `Mods`. The command prints both retained backup paths. If replacement fails, it attempts to restore the old installation; if restoration is blocked, it reports that and leaves the backups for manual recovery. Retain the reported backup until the updated host and mod have been confirmed. Rollback cannot recover from external disk/device failure or user deletion of the backup.

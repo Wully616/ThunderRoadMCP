@@ -7,9 +7,10 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using ICSharpCode.Decompiler;
-using ICSharpCode.Decompiler.CSharp;
+using ICSharpCode.Decompiler.Documentation;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
+using System.Xml;
 
 public sealed partial class InstalledApiCatalog
 {
@@ -58,6 +59,7 @@ public sealed partial class InstalledApiCatalog
             moduleVersionId = a.ModuleVersionId,
             origin = a.Origin,
             relativePath = a.RelativePath,
+            xmlDocumentation = new { status = a.XmlDocumentationStatus, diagnostic = a.XmlDocumentationDiagnostic },
         }).ToArray();
         var hasMore = offset + page.Length < assemblies.Length;
         return SerializeResponse(new
@@ -146,6 +148,7 @@ public sealed partial class InstalledApiCatalog
     {
         using var timing = ToolTiming.Measure("apiSearchMs");
         var hits = new List<ApiHit>();
+        var documentationQueryTokens = ApiLookupRanker.Tokenize(query);
         var diagnostics = new List<string>(snapshot.Diagnostics);
         if (loadedAssemblyDiagnostic is not null)
             AddDiagnostic(diagnostics, loadedAssemblyDiagnostic);
@@ -173,7 +176,8 @@ public sealed partial class InstalledApiCatalog
                         !isType && (kindFilter is null || kindFilter is "member" || kindFilter == hit.kind))
                     {
                         var name = hit.qualifiedName[(hit.qualifiedName.LastIndexOf('.') + 1)..];
-                        if (Matches(query, name, hit.qualifiedName))
+                        if (Matches(query, name, hit.qualifiedName) ||
+                            MatchesDocumentation(documentationQueryTokens, hit.xmlDocumentation))
                             AddHit(hits, hit);
                     }
                 }
@@ -237,7 +241,11 @@ public sealed partial class InstalledApiCatalog
             return 1;
         if (name.StartsWith(query, StringComparison.OrdinalIgnoreCase))
             return 2;
-        return name.Contains(query, StringComparison.OrdinalIgnoreCase) ? 3 : 4;
+        if (name.Contains(query, StringComparison.OrdinalIgnoreCase))
+            return 3;
+        if (qualified.Contains(query, StringComparison.OrdinalIgnoreCase))
+            return 4;
+        return 5;
     }
 
     private async Task AddOverflowSearchHitsAsync(CatalogSnapshot snapshot, AssemblyEntry entry, string query,
@@ -247,6 +255,7 @@ public sealed partial class InstalledApiCatalog
         using var main = await LoadPeAsync(entry, cancellationToken);
         using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
+        var documentationProvider = CreateXmlDocumentationProvider(entry);
         foreach (var type in typeSystem.MainModule.TypeDefinitions)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -265,7 +274,10 @@ public sealed partial class InstalledApiCatalog
                 {
                     var hit = CreateHit(entry, type, TypeKindName(type.Kind), typeName,
                         type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName),
-                        FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type));
+                        FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type)) with
+                    {
+                        xmlDocumentation = ReadXmlDocumentation(type, documentationProvider),
+                    };
                     if ((includeNonPublic || hit.accessibility == "public") && !index.SymbolsById.ContainsKey(hit.symbolId))
                         AddHit(hits, hit);
                 }
@@ -285,7 +297,7 @@ public sealed partial class InstalledApiCatalog
                     continue;
                 var hit = CreateMemberHit(snapshot, entry, type, member, new List<string>());
                 if (hit is not null && !index.SymbolsById.ContainsKey(hit.symbolId))
-                    AddHit(hits, hit);
+                    AddHit(hits, hit with { xmlDocumentation = ReadXmlDocumentation(member.MemberDefinition, documentationProvider) });
             }
         }
     }
@@ -296,6 +308,7 @@ public sealed partial class InstalledApiCatalog
         using var main = await LoadPeAsync(entry, cancellationToken);
         using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
+        var documentationProvider = CreateXmlDocumentationProvider(entry);
         foreach (var type in typeSystem.MainModule.TypeDefinitions)
         foreach (var member in DeclaredSearchMembers(type, includeConstructors: true))
         {
@@ -314,7 +327,7 @@ public sealed partial class InstalledApiCatalog
                 continue;
             var hit = CreateMemberHit(snapshot, entry, type, member, new List<string>());
             if (hit is not null)
-                AddHit(hits, hit);
+                AddHit(hits, hit with { xmlDocumentation = ReadXmlDocumentation(member.MemberDefinition, documentationProvider) });
         }
     }
 
@@ -364,6 +377,11 @@ public sealed partial class InstalledApiCatalog
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
         var type = FindType(typeSystem.MainModule, typeSymbol.MetadataToken)
             ?? throw MissingSymbol("typeSymbolId", entry.Id, typeSymbolId, "type");
+        var documentationProvider = indexedType is not null && !includeInherited && !includeNonPublic &&
+                                    !apiIndexLease.Index.LimitReached
+            ? null
+            : CreateXmlDocumentationProvider(entry);
+        var typeDocumentation = typeSymbol.Hit.xmlDocumentation ?? ReadXmlDocumentation(type, documentationProvider);
         var typeWarnings = ObsoleteWarnings(type);
         if (!apiIndexLease.Index.Complete)
             AddWarnings(typeWarnings, new[] { IndexOmissionMessage(entry, apiIndexLease.Index) });
@@ -390,7 +408,11 @@ public sealed partial class InstalledApiCatalog
                     continue;
                 var hit = CreateMemberHit(snapshot, entry, type, member, typeWarnings);
                 if (hit is not null)
+                {
+                    if (hit.assemblyId == entry.Id)
+                        hit = hit with { xmlDocumentation = ReadXmlDocumentation(member.MemberDefinition, documentationProvider) };
                     members.Add(hit);
+                }
                 if (members.Count > MaxResults)
                     throw new InvalidOperationException($"Type has more than {MaxResults} members; request a narrower non-public/inherited surface.");
             }
@@ -422,6 +444,7 @@ public sealed partial class InstalledApiCatalog
             typeDeclaration = FormatTypeDeclaration(type),
             attributes = typeSymbol.Hit.attributes,
             attributesTruncated = typeSymbol.Hit.attributesTruncated,
+            xmlDocumentation = typeDocumentation,
             baseType = baseType is null ? null : FormatType(baseType),
             interfaces,
             genericConstraints = FormatConstraints(OwnTypeParameters(type)),
@@ -495,6 +518,7 @@ public sealed partial class InstalledApiCatalog
         using var main = await LoadPeAsync(entry, cancellationToken);
         using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
+        var documentationProvider = CreateXmlDocumentationProvider(entry);
         foreach (var methodHandle in main.File.Metadata.MethodDefinitions)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -505,7 +529,9 @@ public sealed partial class InstalledApiCatalog
             if (method is null || declaringType is null)
                 return null;
             var hit = CreateMemberHit(snapshot, entry, declaringType, method, new List<string>());
-            return hit is null ? null : CreateIndexedSymbol(hit, MetadataTokens.GetToken(methodHandle), method);
+            return hit is null ? null : CreateIndexedSymbol(
+                hit with { xmlDocumentation = ReadXmlDocumentation(method.MemberDefinition, documentationProvider) },
+                MetadataTokens.GetToken(methodHandle), method);
         }
         foreach (var type in typeSystem.MainModule.TypeDefinitions)
         {
@@ -517,7 +543,10 @@ public sealed partial class InstalledApiCatalog
                 var typeName = FormatTypeName(type.FullTypeName.FullName);
                 var hit = CreateHit(entry, type, TypeKindName(type.Kind), typeName,
                     type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName),
-                    FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type));
+                    FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type)) with
+                {
+                    xmlDocumentation = ReadXmlDocumentation(type, documentationProvider),
+                };
                 return CreateIndexedSymbol(hit, MetadataTokens.GetToken(type.MetadataToken), type);
             }
             foreach (var member in type.Members.Concat(type.Methods))
@@ -526,7 +555,9 @@ public sealed partial class InstalledApiCatalog
                 if (member.MetadataToken.IsNil || !SymbolId(entry.Id, member.MetadataToken).Equals(symbolId, StringComparison.Ordinal))
                     continue;
                 var hit = CreateMemberHit(snapshot, entry, type, member, new List<string>());
-                return hit is null ? null : CreateIndexedSymbol(hit, MetadataTokens.GetToken(member.MetadataToken), member);
+                return hit is null ? null : CreateIndexedSymbol(
+                    hit with { xmlDocumentation = ReadXmlDocumentation(member.MemberDefinition, documentationProvider) },
+                    MetadataTokens.GetToken(member.MetadataToken), member);
             }
         }
         return null;
@@ -670,6 +701,7 @@ public sealed partial class InstalledApiCatalog
     {
         LoadInMemory = true,
         ThrowOnAssemblyResolveErrors = false,
+        ShowXmlDocumentation = true,
     };
 
     private async Task<CatalogSnapshot> ScanAsync(CancellationToken cancellationToken)
@@ -757,11 +789,19 @@ public sealed partial class InstalledApiCatalog
                     var version = definition.Version.ToString();
                     var moduleVersionId = metadata.GetGuid(metadata.GetModuleDefinition().Mvid).ToString("D");
                     var id = MakeAssemblyId(configuredRoot.Origin, root, relativePath, contentHash);
+                    var xmlDocumentation = await InspectXmlDocumentationAsync(configuredRoot.Origin, root, file,
+                        assemblyName, cancellationToken);
+                    fingerprints.Add($"{configuredRoot.Origin}|{relativePath}|xml|{xmlDocumentation.Status}|{xmlDocumentation.ContentHash ?? ""}");
+                    if (xmlDocumentation.Status == "invalid")
+                        AddDiagnostic(diagnostics, $"Invalid XML documentation for {configuredRoot.Origin}/{relativePath}: {xmlDocumentation.Diagnostic}");
                     var retainedBytes = bytes.LongLength <= MaxSnapshotRetainedBytes - retainedScanBytes ? bytes : null;
                     if (retainedBytes is not null)
                         retainedScanBytes += bytes.LongLength;
-                    entries.Add(new AssemblyEntry(id, assemblyName, version, moduleVersionId, configuredRoot.Origin, root, relativePath, file, contentHash, retainedBytes));
+                    entries.Add(new AssemblyEntry(id, assemblyName, version, moduleVersionId, configuredRoot.Origin, root,
+                        relativePath, file, contentHash, xmlDocumentation.Path, xmlDocumentation.Status,
+                        xmlDocumentation.Diagnostic, xmlDocumentation.ContentHash, retainedBytes));
                 }
+
                 catch (OperationCanceledException) { throw; }
                 catch (AssemblyChangedException) { throw; }
                 catch (BadImageFormatException)
@@ -786,6 +826,105 @@ public sealed partial class InstalledApiCatalog
         return new CatalogSnapshot(snapshotId, entries, diagnostics, truncated,
             new SnapshotBufferLifetime(() => SnapshotLifetimeSlots.Release()));
     }
+    private static async Task<XmlDocumentationScan> InspectXmlDocumentationAsync(string origin, string root,
+        string assemblyPath, string assemblyName, CancellationToken cancellationToken)
+    {
+        if (origin != "game")
+            return new XmlDocumentationScan(null, "missing", null, null);
+
+        try
+        {
+            var path = Path.ChangeExtension(assemblyPath, ".xml");
+            if (!File.Exists(path))
+                return new XmlDocumentationScan(null, "missing", null, null);
+
+            var canonicalAssembly = ResolveCanonicalPath(assemblyPath);
+            var canonicalDocumentation = ResolveCanonicalPath(path);
+            var expectedFileName = Path.GetFileName(Path.ChangeExtension(assemblyPath, ".xml"));
+            if (!PathComparer.Equals(Path.GetDirectoryName(canonicalDocumentation), Path.GetDirectoryName(canonicalAssembly)) ||
+                !PathComparer.Equals(Path.GetFileName(canonicalDocumentation), expectedFileName))
+                return new XmlDocumentationScan(null, "missing", null, null);
+            if (!IsUnderRoot(canonicalDocumentation, root))
+                return new XmlDocumentationScan(null, "invalid", "The XML documentation sidecar resolves outside the game Managed directory.", null);
+
+            var contentHash = await HashXmlDocumentationAsync(root, canonicalDocumentation, cancellationToken);
+            var diagnostic = ValidateXmlDocumentation(canonicalDocumentation, assemblyName);
+            return diagnostic is null
+                ? new XmlDocumentationScan(canonicalDocumentation, "available", null, contentHash)
+                : new XmlDocumentationScan(canonicalDocumentation, "invalid", diagnostic, contentHash);
+        }
+        catch (AssemblyChangedException) { throw; }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or
+                                          InvalidOperationException or NotSupportedException or XmlException)
+        {
+            return new XmlDocumentationScan(null, "invalid",
+                BoundXmlDocumentationDiagnostic($"Could not read XML documentation: {exception.Message}"), null);
+        }
+    }
+
+    private static async Task<string> HashXmlDocumentationAsync(string root, string path, CancellationToken cancellationToken)
+    {
+        var canonical = ResolveCanonicalPath(path);
+        if (!IsUnderRoot(canonical, root))
+            throw new IOException("Resolved XML documentation path leaves its configured installation root.");
+        await using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read, FileShare.Read,
+            65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var length = stream.Length;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[65536];
+        long bytesRead = 0;
+        int count;
+        while ((count = await stream.ReadAsync(buffer.AsMemory(), cancellationToken)) != 0)
+        {
+            hash.AppendData(buffer, 0, count);
+            bytesRead += count;
+        }
+        if (bytesRead != length || stream.Length != length)
+            throw new AssemblyChangedException("XML documentation changed while it was being hashed.");
+        VerifyEntryPath(root, path, canonical);
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    private static string? ValidateXmlDocumentation(string path, string assemblyName)
+    {
+        using var reader = XmlReader.Create(path, new XmlReaderSettings
+        {
+            DtdProcessing = DtdProcessing.Prohibit,
+            XmlResolver = null,
+        });
+        if (reader.MoveToContent() != XmlNodeType.Element || reader.LocalName != "doc" || reader.NamespaceURI.Length != 0)
+            return "The XML documentation root element must be <doc>.";
+
+        var rootDepth = reader.Depth;
+        var assemblyDepth = -1;
+        string? documentedAssemblyName = null;
+        while (reader.Read())
+        {
+            if (reader.NodeType == XmlNodeType.Element && reader.Depth == rootDepth + 1 &&
+                reader.LocalName == "assembly" && reader.NamespaceURI.Length == 0)
+            {
+                assemblyDepth = reader.Depth;
+                continue;
+            }
+            if (assemblyDepth >= 0 && reader.NodeType == XmlNodeType.Element &&
+                reader.Depth == assemblyDepth + 1 && reader.LocalName == "name" && reader.NamespaceURI.Length == 0)
+            {
+                documentedAssemblyName = reader.ReadElementContentAsString().Trim();
+                assemblyDepth = -1;
+            }
+        }
+
+        if (string.IsNullOrEmpty(documentedAssemblyName))
+            return "The XML documentation has no <assembly><name> value.";
+        return documentedAssemblyName.Equals(assemblyName, StringComparison.OrdinalIgnoreCase)
+            ? null
+            : $"The XML documentation assembly name '{BoundXmlDocumentationDiagnostic(documentedAssemblyName)}' does not match '{BoundXmlDocumentationDiagnostic(assemblyName)}'.";
+    }
+
+    private const int MaxXmlDocumentationDiagnosticChars = 300;
+    private static string BoundXmlDocumentationDiagnostic(string value) =>
+        value.Length <= MaxXmlDocumentationDiagnosticChars ? value : value[..MaxXmlDocumentationDiagnosticChars] + "…";
     private static IEnumerable<string> EnumerateDllFiles(string root, string origin, List<string> diagnostics,
         CancellationToken cancellationToken, ref bool truncated)
     {
@@ -1286,6 +1425,23 @@ public sealed partial class InstalledApiCatalog
     private static bool Matches(string query, string name, string qualifiedName) =>
         name.Contains(query, StringComparison.OrdinalIgnoreCase) || qualifiedName.Contains(query, StringComparison.OrdinalIgnoreCase);
 
+    private static bool MatchesDocumentation(IReadOnlyList<string> queryTokens, ApiXmlDocumentation? documentation)
+    {
+        if (documentation is null || queryTokens.Count == 0)
+            return false;
+        bool Contains(string? text, string token) => text?.Contains(token, StringComparison.OrdinalIgnoreCase) == true;
+        foreach (var token in queryTokens)
+            if (!Contains(documentation.Summary, token) &&
+                !Contains(documentation.Remarks, token) &&
+                !Contains(documentation.Returns, token) &&
+                !Contains(documentation.Value, token) &&
+                !(documentation.Parameters?.Any(parameter =>
+                    Contains(parameter.Name, token) || Contains(parameter.Description, token)) ?? false) &&
+                !(documentation.Examples?.Any(example => Contains(example, token)) ?? false))
+                return false;
+        return true;
+    }
+
     private static string MakeAssemblyId(string origin, string root, string relativePath, string contentHash)
     {
         var value = JsonSerializer.Serialize(new[] { origin, root, relativePath, contentHash });
@@ -1455,18 +1611,35 @@ public sealed partial class InstalledApiCatalog
         {
             ReferenceKind.Ref => "ref ",
             ReferenceKind.Out => "out ",
-            ReferenceKind.In or ReferenceKind.RefReadOnly => "in ",
+            ReferenceKind.In => "in ",
+            ReferenceKind.RefReadOnly => isExtensionReceiver ? "ref readonly " : "in ",
             _ => "",
         };
         if (parameter.IsParams) prefix = "params ";
-        else if (isExtensionReceiver) prefix = "this ";
-        var text = prefix + FormatType(parameter.Type) + " " + parameter.Name;
+        else if (isExtensionReceiver) prefix = "this " + prefix;
+        var name = FormatParameterIdentifier(parameter.Name);
+        var text = prefix + FormatType(parameter.Type) + " " + name;
         if (parameter.IsOptional)
             text += " = " + (parameter.HasConstantValueInSignature
                 ? FormatOptionalConstant(parameter.Type, parameter.GetConstantValue())
                 : "default");
         return text;
     }
+
+    private static string FormatParameterIdentifier(string name) =>
+        ParameterKeywords.Contains(name) ? "@" + name : name;
+
+    private static readonly HashSet<string> ParameterKeywords = new(StringComparer.Ordinal)
+    {
+        "abstract", "as", "base", "bool", "break", "byte", "case", "catch", "char", "checked",
+        "class", "const", "continue", "decimal", "default", "delegate", "do", "double", "else",
+        "enum", "event", "explicit", "extern", "false", "finally", "fixed", "float", "for",
+        "foreach", "goto", "if", "implicit", "in", "int", "interface", "internal", "is", "lock",
+        "long", "namespace", "new", "null", "object", "operator", "out", "override", "params",
+        "private", "protected", "public", "readonly", "ref", "return", "sbyte", "sealed", "short",
+        "sizeof", "stackalloc", "static", "string", "struct", "switch", "this", "throw", "true",
+        "try", "typeof", "uint", "ulong", "unchecked", "unsafe", "ushort", "using", "virtual",
+    };
 
     private static string FormatOptionalConstant(IType type, object? value)
     {
@@ -1915,7 +2088,10 @@ public sealed partial class InstalledApiCatalog
 
     private sealed record InstallRoot(string Origin, string Path);
     private sealed record AssemblyEntry(string Id, string Name, string Version, string ModuleVersionId, string Origin,
-        string Root, string RelativePath, string FullPath, string ContentHash, byte[]? ScanBytes = null);
+        string Root, string RelativePath, string FullPath, string ContentHash, string? XmlDocumentationPath,
+        string XmlDocumentationStatus, string? XmlDocumentationDiagnostic, string? XmlDocumentationContentHash,
+        byte[]? ScanBytes = null);
+    private sealed record XmlDocumentationScan(string? Path, string Status, string? Diagnostic, string? ContentHash);
     private sealed record CatalogSnapshot(string Id, IReadOnlyList<AssemblyEntry> Assemblies, List<string> Diagnostics,
         bool CatalogTruncated, SnapshotBufferLifetime ScanBytesLifetime) : IDisposable
     {
@@ -1974,7 +2150,34 @@ public sealed partial class InstalledApiCatalog
     }
     internal sealed record ApiHit(string assemblyId, string assemblyName, string origin, string relativePath, string symbolId,
         string kind, string qualifiedName, string? declaringType, string signature, string accessibility, bool isStatic,
-        string[] warnings, bool isInherited = false, ApiAttribute[]? attributes = null, bool attributesTruncated = false);
+        string[] warnings, bool isInherited = false, ApiAttribute[]? attributes = null, bool attributesTruncated = false,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        ApiXmlDocumentation? xmlDocumentation = null);
+    internal sealed record ApiXmlDocumentation(
+        [property: System.Text.Json.Serialization.JsonPropertyName("summary")]
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        string? Summary,
+        [property: System.Text.Json.Serialization.JsonPropertyName("remarks")]
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        string? Remarks,
+        [property: System.Text.Json.Serialization.JsonPropertyName("parameters")]
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        ApiXmlDocumentationParameter[]? Parameters,
+        [property: System.Text.Json.Serialization.JsonPropertyName("returns")]
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        string? Returns,
+        [property: System.Text.Json.Serialization.JsonPropertyName("value")]
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        string? Value,
+        [property: System.Text.Json.Serialization.JsonPropertyName("examples")]
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        string[]? Examples,
+        [property: System.Text.Json.Serialization.JsonPropertyName("truncated")]
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        bool? Truncated);
+    internal sealed record ApiXmlDocumentationParameter(
+        [property: System.Text.Json.Serialization.JsonPropertyName("name")] string Name,
+        [property: System.Text.Json.Serialization.JsonPropertyName("description")] string Description);
     private sealed record ApiSourcePage(string assemblyId, string assemblyName, string origin, string relativePath,
         string symbolId, string qualifiedName, string sourceKind, object provenance, string source, int startLine,
         int totalLines, int lineCount, bool hasMore, int? nextLine, string snapshotId, string[] warnings, List<string> diagnostics);

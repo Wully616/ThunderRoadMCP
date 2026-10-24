@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Collections;
 using System.Collections.Generic;
@@ -45,6 +47,7 @@ internal static class BridgeSelfTest
         VerifyStatusAndAssemblyIdentity(thunderRoad, managed);
         VerifyRuntimeValues();
         VerifyRequestTimings();
+        VerifyBridgeServerRoundTrip();
         VerifyCoroutineObservability();
         VerifyComponentTypeResolution();
 
@@ -90,7 +93,7 @@ internal static class BridgeSelfTest
             MainThreadQueue.Drain();
             Assert(!executed && queued.IsCanceled, "canceled queued work is skipped");
         }
-        Console.WriteLine("PASS: live status shape, loaded assembly MVID, arithmetic, metadata source precedence, game API metadata, runtime host reference, generic runtime retrieval and inspection, bounded runtime list, coroutine step and failure observability, successful and failed bridge timing stages, scene query component type resolution, newest bridge log page, mapped diagnostic, runtime exception, DTO serialization, pending Task rejection, and canceled queue. CLR " + Environment.Version);
+        Console.WriteLine("PASS: live status shape, loaded assembly MVID, arithmetic, metadata source precedence, game API metadata, runtime host reference, generic runtime retrieval and inspection, bounded runtime list, bridge request/response round trip with an open client, nested coroutine disposal and recursive-iterator rejection, stop and failure observability, spawn rollback and cancellation settlement, successful and failed bridge timing stages, client-disconnect queue cancellation, scene query component type resolution, newest bridge log page, mapped diagnostic, runtime exception, DTO serialization, pending Task rejection, and canceled queue. CLR " + Environment.Version);
     }
 
     private static void VerifyExampleCompilation()
@@ -452,6 +455,66 @@ internal static class BridgeSelfTest
         throw new InvalidOperationException("routine failed");
     }
 
+    private static IEnumerator NestedFinallyRoutine(List<string> disposed, string name, bool fail = false)
+    {
+        try
+        {
+            yield return null;
+            if (fail) throw new InvalidOperationException("nested routine failed");
+        }
+        finally
+        {
+            disposed.Add(name);
+        }
+    }
+
+    private static IEnumerator ParentFinallyRoutine(List<string> disposed, string name, IEnumerator child)
+    {
+        try
+        {
+            yield return child;
+            yield return null;
+        }
+        finally
+        {
+            disposed.Add(name);
+        }
+    }
+
+    private static IEnumerator TrackForSelfTest(McpRuntime runtime, string key, IEnumerator routine)
+    {
+        FieldInfo coroutineField = typeof(McpRuntime).GetField("coroutines", BindingFlags.Instance | BindingFlags.NonPublic);
+        IDictionary entries = (IDictionary)coroutineField.GetValue(runtime);
+        Type entryType = coroutineField.FieldType.GetGenericArguments()[1];
+        object entry = FormatterServices.GetUninitializedObject(entryType);
+        entryType.GetField("Routine").SetValue(entry, routine.GetType().FullName);
+        entryType.GetField("StartedUtc").SetValue(entry, DateTime.UtcNow);
+        entries.Add(key, entry);
+        MethodInfo track = typeof(McpRuntime).GetMethod("Track", BindingFlags.Instance | BindingFlags.NonPublic);
+        IEnumerator tracked = (IEnumerator)track.Invoke(runtime, new object[] { key, entry, routine });
+        entryType.GetField("Tracked").SetValue(entry, tracked);
+        return tracked;
+    }
+
+    private sealed class TestCustomYieldInstruction : UnityEngine.CustomYieldInstruction
+    {
+        public override bool keepWaiting => true;
+    }
+
+    private sealed class RecursiveEnumerator : IEnumerator, IDisposable
+    {
+        public object Current => this;
+        public bool Disposed { get; private set; }
+        public bool MoveNext() => true;
+        public void Reset() => throw new NotSupportedException();
+        public void Dispose() => Disposed = true;
+    }
+
+    private static IEnumerator YieldObject(object value)
+    {
+        yield return value;
+    }
+
     private static void VerifyCoroutineObservability()
     {
         McpRuntime runtime = CreateRuntimeForSelfTest();
@@ -483,6 +546,109 @@ internal static class BridgeSelfTest
             (string)failures[0]["routine"] == "Test.FailingRoutine" && (int)failures[0]["steps"] == 2 &&
             ((string)failures[0]["error"]).StartsWith("System.InvalidOperationException: routine failed", StringComparison.Ordinal),
             "recent failures record the routine, step count, and exception text");
+
+        var normallyDisposed = new List<string>();
+        McpRuntime normalRuntime = CreateRuntimeForSelfTest();
+        IEnumerator normal = TrackForSelfTest(normalRuntime, "normal",
+            ParentFinallyRoutine(normallyDisposed, "parent", NestedFinallyRoutine(normallyDisposed, "nested")));
+        Assert(normal.MoveNext() && normal.Current == null && normal.MoveNext() && normal.Current == null && !normal.MoveNext() &&
+            normallyDisposed.Count == 2 && normallyDisposed[0] == "nested" && normallyDisposed[1] == "parent",
+            "normal completion disposes nested and parent iterators");
+
+        var exceptionDisposed = new List<string>();
+        McpRuntime nestedFailureRuntime = CreateRuntimeForSelfTest();
+        IEnumerator nestedFailure = TrackForSelfTest(nestedFailureRuntime, "nested-failure",
+            ParentFinallyRoutine(exceptionDisposed, "parent", NestedFinallyRoutine(exceptionDisposed, "nested", true)));
+        Assert(nestedFailure.MoveNext(), "nested failure test starts its child iterator");
+        try
+        {
+            nestedFailure.MoveNext();
+            throw new Exception("Expected the nested coroutine failure.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Assert(ex.Message == "nested routine failed", "nested iterator exceptions propagate");
+        }
+        bool endedAfterNestedFailure = !nestedFailure.MoveNext();
+        JArray nestedFailures = (JArray)JObject.Parse(BridgeRequestHandler.SerializeResult(nestedFailureRuntime.Describe()))["recentFailures"];
+        Assert(exceptionDisposed.Count == 2 && exceptionDisposed[0] == "nested" && exceptionDisposed[1] == "parent" &&
+            nestedFailures.Count == 1 && (string)nestedFailures[0]["key"] == "nested-failure" && endedAfterNestedFailure,
+            "nested exception disposes the whole chain and records one failure");
+
+        var recursiveRuntime = CreateRuntimeForSelfTest();
+        var recursive = new RecursiveEnumerator();
+        IEnumerator recursiveTracked = TrackForSelfTest(recursiveRuntime, "recursive", recursive);
+        try
+        {
+            recursiveTracked.MoveNext();
+            throw new Exception("Expected a recursive nested iterator rejection.");
+        }
+        catch (InvalidOperationException exception)
+        {
+            Assert(exception.Message.IndexOf("active in its nested iterator chain", StringComparison.Ordinal) >= 0 &&
+                   recursive.Disposed,
+                "a recursive nested iterator fails clearly and disposes its chain");
+        }
+        Assert(!recursiveTracked.MoveNext(), "a failed recursive coroutine stays stopped");
+
+        McpRuntime customYieldRuntime = CreateRuntimeForSelfTest();
+        var customYield = new TestCustomYieldInstruction();
+        IEnumerator customYieldRoutine = TrackForSelfTest(customYieldRuntime, "custom-yield", YieldObject(customYield));
+        Assert(customYieldRoutine.MoveNext() && ReferenceEquals(customYieldRoutine.Current, customYield),
+            "Unity custom yield instructions pass through unchanged");
+        ((IDisposable)customYieldRoutine).Dispose();
+
+        var stoppedDisposals = new List<string>();
+        McpRuntime stopRuntime = CreateRuntimeForSelfTest();
+        IEnumerator stopped = TrackForSelfTest(stopRuntime, "stop",
+            ParentFinallyRoutine(stoppedDisposals, "parent", NestedFinallyRoutine(stoppedDisposals, "nested")));
+        Assert(stopped.MoveNext() && stopRuntime.StopManagedCoroutine("stop") &&
+            stoppedDisposals.Count == 2 && stoppedDisposals[0] == "nested" && stoppedDisposals[1] == "parent",
+            "explicit stop disposes nested and parent iterators");
+        ((IDisposable)stopped).Dispose();
+        Assert(stoppedDisposals.Count == 2, "repeated stop cleanup is idempotent");
+
+        var allStoppedDisposals = new List<string>();
+        McpRuntime stopAllRuntime = CreateRuntimeForSelfTest();
+        IEnumerator firstStopped = TrackForSelfTest(stopAllRuntime, "first",
+            ParentFinallyRoutine(allStoppedDisposals, "first-parent", NestedFinallyRoutine(allStoppedDisposals, "first-nested")));
+        IEnumerator secondStopped = TrackForSelfTest(stopAllRuntime, "second",
+            ParentFinallyRoutine(allStoppedDisposals, "second-parent", NestedFinallyRoutine(allStoppedDisposals, "second-nested")));
+        Assert(firstStopped.MoveNext() && secondStopped.MoveNext(), "stop-all test starts both iterator chains");
+        stopAllRuntime.StopAllManagedCoroutines();
+        JObject stoppedList = JObject.Parse(BridgeRequestHandler.SerializeResult(stopAllRuntime.Describe()));
+        Assert(allStoppedDisposals.Count == 4 && (int)stoppedList["coroutineCount"] == 0,
+            "stop-all disposes every managed iterator chain and removes every entry");
+
+        var clearedDisposals = new List<string>();
+        McpRuntime clearRuntime = CreateRuntimeForSelfTest();
+        IEnumerator cleared = TrackForSelfTest(clearRuntime, "clear",
+            ParentFinallyRoutine(clearedDisposals, "parent", NestedFinallyRoutine(clearedDisposals, "nested")));
+        Assert(cleared.MoveNext(), "clear test starts its iterator chain");
+        clearRuntime.Clear();
+        Assert(clearedDisposals.Count == 2 && clearedDisposals[0] == "nested" && clearedDisposals[1] == "parent",
+            "runtime clear disposes nested and parent iterators");
+        ((IDisposable)cleared).Dispose();
+        Assert(clearedDisposals.Count == 2, "clear cleanup is idempotent");
+
+        bool rollbackAttempted = false;
+        int failedRollbackAttempts = 0;
+        BridgeRequestHandler.RollbackSpawnIfUncommitted(new object(), false, _ => rollbackAttempted = true);
+        BridgeRequestHandler.RollbackSpawnIfUncommitted(new object(), false, _ =>
+        {
+            failedRollbackAttempts++;
+            throw new InvalidOperationException("cleanup failure");
+        });
+        BridgeRequestHandler.RollbackSpawnIfUncommitted(new object(), true,
+            _ => throw new InvalidOperationException("must not roll back a committed spawn"));
+        var abandonedCompletion = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+        BridgeRequestHandler.SettleAbandonedSpawn(abandonedCompletion);
+        var completedSpawn = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+        completedSpawn.TrySetResult("committed");
+        BridgeRequestHandler.SettleAbandonedSpawn(completedSpawn);
+        Assert(rollbackAttempted && failedRollbackAttempts == 1 && abandonedCompletion.Task.IsCanceled &&
+            completedSpawn.Task.Result.Equals("committed"),
+            "abandoned spawn cleanup attempts rollback, preserves completion, and settles pending requests");
 
         MethodInfo recordFailure = typeof(McpRuntime).GetMethod("RecordCoroutineFailure", BindingFlags.Instance | BindingFlags.NonPublic);
         for (int index = 0; index < 20; index++)
@@ -599,40 +765,125 @@ internal static class BridgeSelfTest
         VerifyRawTimingEnvelopeBounds();
     }
 
+    private static void VerifyBridgeServerRoundTrip()
+    {
+        int port;
+        var reservation = new TcpListener(IPAddress.Loopback, 0);
+        try
+        {
+            reservation.Start();
+            port = ((IPEndPoint)reservation.LocalEndpoint).Port;
+        }
+        finally
+        {
+            reservation.Stop();
+        }
+        var config = new BridgeConfig { Enabled = true, Host = "127.0.0.1", Port = port, Token = new string('a', 64) };
+        using (var server = new BridgeServer(config))
+        {
+            server.Start();
+            using (var client = new TcpClient())
+            {
+                client.Connect(IPAddress.Loopback, port);
+                NetworkStream stream = client.GetStream();
+                byte[] request = System.Text.Encoding.UTF8.GetBytes(
+                    "{\"id\":\"server-selftest\",\"token\":\"" + config.Token + "\",\"method\":\"logs\",\"parameters\":{}}\n");
+                stream.Write(request, 0, request.Length);
+                var buffer = new byte[4096];
+                int total = 0;
+                while (Array.IndexOf(buffer, (byte)'\n', 0, total) < 0 && total < buffer.Length)
+                {
+                    Task<int> read = stream.ReadAsync(buffer, total, buffer.Length - total);
+                    Assert(read.Wait(TimeSpan.FromSeconds(10)),
+                        "bridge returns a response while the client keeps the connection open");
+                    if (read.Result == 0) break;
+                    total += read.Result;
+                }
+                JObject response = JObject.Parse(System.Text.Encoding.UTF8.GetString(buffer, 0, total));
+                Assert((string)response["id"] == "server-selftest" && (bool)response["success"] &&
+                       response["result"]["entries"] is JArray,
+                    "bridge server completes a full request/response round trip");
+            }
+        }
+    }
+
     private static void VerifyCanceledQueueWait(BridgeRequestHandler handler)
     {
         var timings = BridgeRequestTimings.CreateForSelfTest();
-        using (var cancellation = new CancellationTokenSource())
+        using (var requestLifetime = new CancellationTokenSource())
         {
-            Task<object> dispatch = handler.DispatchAsync(new BridgeRequest
-            {
-                method = "evaluate",
-                parameters = JObject.FromObject(new { code = "return 6 * 7;", timeoutMs = 30000 })
-            }, cancellation.Token, timings);
-            object gate = typeof(MainThreadQueue).GetField("Gate", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
-            object queue = typeof(MainThreadQueue).GetField("Queue", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
-            var count = queue.GetType().GetProperty("Count");
-            Assert(SpinWait.SpinUntil(() =>
-            {
-                lock (gate) return (int)count.GetValue(queue) > 0;
-            }, TimeSpan.FromSeconds(30)), "evaluation reaches the main-thread queue");
-
-            cancellation.Cancel();
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
             try
             {
-                dispatch.GetAwaiter().GetResult();
-                throw new Exception("Expected queued evaluation cancellation.");
+                using (var client = new TcpClient())
+                {
+                    client.Connect(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port);
+                    using (var accepted = listener.AcceptTcpClient())
+                    {
+                        MethodInfo monitorMethod = typeof(BridgeServer).GetMethod(
+                            "MonitorClientDisconnect", BindingFlags.Static | BindingFlags.NonPublic);
+                        Assert(monitorMethod != null, "bridge client-disconnect monitor is available to its self-test");
+                        Task monitor = (Task)monitorMethod.Invoke(null, new object[]
+                        {
+                            accepted.GetStream(), requestLifetime
+                        });
+                        try
+                        {
+                            byte[] probe = System.Text.Encoding.ASCII.GetBytes("ok\n");
+                            accepted.GetStream().Write(probe, 0, probe.Length);
+                            var received = new byte[probe.Length];
+                            Task<int> probeRead = client.GetStream().ReadAsync(received, 0, received.Length);
+                            Assert(probeRead.Wait(TimeSpan.FromSeconds(5)) && probeRead.Result == probe.Length &&
+                                   System.Text.Encoding.ASCII.GetString(received) == "ok\n",
+                                "a pending client-disconnect read does not block the response write");
+
+                            Task<object> dispatch = handler.DispatchAsync(new BridgeRequest
+                            {
+                                method = "evaluate",
+                                parameters = JObject.FromObject(new { code = "return 6 * 7;", timeoutMs = 30000 })
+                            }, requestLifetime.Token, timings);
+                            object gate = typeof(MainThreadQueue).GetField("Gate", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+                            object queue = typeof(MainThreadQueue).GetField("Queue", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+                            var count = queue.GetType().GetProperty("Count");
+                            Assert(SpinWait.SpinUntil(() =>
+                            {
+                                lock (gate) return (int)count.GetValue(queue) > 0;
+                            }, TimeSpan.FromSeconds(30)), "evaluation reaches the main-thread queue before client disconnect");
+
+                            client.Close();
+                            Assert(SpinWait.SpinUntil(() => requestLifetime.IsCancellationRequested, TimeSpan.FromSeconds(5)),
+                                "client EOF cancels the bridge request lifetime");
+                            MainThreadQueue.Drain();
+                            try
+                            {
+                                dispatch.GetAwaiter().GetResult();
+                                throw new Exception("Expected queued evaluation cancellation after client disconnect.");
+                            }
+                            catch (BridgeEvaluationException exception)
+                            {
+                                Assert(exception.errorCode == "evaluation.not_started" &&
+                                       exception.executionOutcome == "not_started",
+                                    "client disconnect cancels queued evaluation before invocation");
+                            }
+                        }
+                        finally
+                        {
+                            accepted.Close();
+                            Assert(monitor.Wait(TimeSpan.FromSeconds(5)),
+                                "client-disconnect monitor ends when its socket closes");
+                        }
+                    }
+                }
             }
-            catch (BridgeEvaluationException exception)
+            finally
             {
-                Assert(exception.errorCode == "evaluation.not_started" && exception.executionOutcome == "not_started",
-                    "queued cancellation reports a not-started evaluation");
+                listener.Stop();
             }
-            MainThreadQueue.Drain();
         }
         timings.Complete();
         Assert(timings.Snapshot().ContainsKey("mainThreadQueueWaitMs"),
-            "canceled queued evaluation reports elapsed queue wait");
+            "disconnected queued evaluation reports elapsed queue wait");
     }
 
     private static void VerifyRawTimingEnvelopeBounds()

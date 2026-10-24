@@ -17,6 +17,7 @@ public static class GuideTools
         new("spawning", ["spawning", "spawn", "items", "item", "spawning items"], "## Spawning items"),
         new("levels", ["levels", "level", "loading", "loading a level"], "## Loading a level"),
         new("api", ["api", "api-workflow", "console", "console-api", "console/api", "console api", "console workflow", "workflow", "api workflow"], "## API workflow"),
+        new("authoring", ["authoring", "mod-authoring", "mod authoring", "modding"], "## Mod authoring workflow"),
         new("logs", ["logs", "log"], "## Logs"),
         new("eval", ["eval", "evaluate", "evaluate-csharp", "eval-limits", "evaluation", "eval limits"], "## `evaluate_csharp` limits"),
         new("example", ["example", "worked-example", "orbit", "worked example"], "## Worked example: spawn and orbit"),
@@ -25,7 +26,7 @@ public static class GuideTools
     ];
 
     [McpServerTool(Name = "game_guide", Title = "Read the Blade & Sorcery game guide", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
-    [Description("Read a bounded section of the embedded live-game guide. Topics: bootstrap/overview (default), unity, runtime, spawning, levels, api/console, logs, eval, example, troubleshooting, version. Returns {topic,content}.")]
+    [Description("Read a bounded section of the embedded game guide. Topics: bootstrap/overview (default), unity, runtime, spawning, levels, api/console, authoring/modding, logs, eval, example, troubleshooting, version. Returns {topic,content}.")]
     public static Task<CallToolResult> GameGuide(
         [Description("Guide topic or alias; defaults to bootstrap.")] string? topic = "bootstrap",
         CancellationToken cancellationToken = default) =>

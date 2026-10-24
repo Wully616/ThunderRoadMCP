@@ -2,14 +2,16 @@ using System.Reflection.Metadata.Ecma335;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Xml.Linq;
 using ICSharpCode.Decompiler.CSharp;
+using ICSharpCode.Decompiler.Documentation;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
 
 public sealed partial class InstalledApiCatalog
 {
-    private const int ApiIndexSchemaVersion = 5;
-    private const string ApiFormatterVersion = "signature-v9";
+    private const int ApiIndexSchemaVersion = 6;
+    private const string ApiFormatterVersion = "signature-v11+xml-docs-v1";
     private const int MaxApiIndexFileBytes = 32 * 1024 * 1024;
     private const long MaxApiIndexMemoryBytes = 384L * 1024 * 1024;
     private const long MaxApiIndexDiskBytes = 384L * 1024 * 1024;
@@ -230,7 +232,7 @@ public sealed partial class InstalledApiCatalog
         {
             if (symbol is null || symbol.Hit is null || symbol.MetadataToken <= 0 || symbol.RelatedTypeNames is null ||
                 symbol.ParameterSignatures is null || symbol.GenericConstraints is null || symbol.Hit.warnings is null ||
-                !IsValidApiHitAttributes(symbol.Hit.attributes))
+                !IsValidApiHitAttributes(symbol.Hit.attributes) || !IsValidXmlDocumentation(symbol.Hit.xmlDocumentation))
                 return false;
             var hit = symbol.Hit;
             if (string.IsNullOrEmpty(hit.assemblyId) || !hit.assemblyId.Equals(assemblyId, StringComparison.Ordinal) ||
@@ -405,6 +407,7 @@ public sealed partial class InstalledApiCatalog
         using var main = await LoadPeAsync(entry, CancellationToken.None).ConfigureAwait(false);
         using var resolver = new MainAssemblyResolver(main);
         var typeSystem = new DecompilerTypeSystem(main.File, resolver, CreateDecompilerSettings());
+        var documentationProvider = CreateXmlDocumentationProvider(entry);
         var symbols = new List<ApiIndexedSymbol>();
         var types = new List<ApiTypeRecord>();
         long nonPublicMembersOmitted = 0;
@@ -428,7 +431,10 @@ public sealed partial class InstalledApiCatalog
             var typeName = FormatTypeName(rawTypeName);
             var typeHit = CreateHit(entry, type, TypeKindName(type.Kind), typeName,
                 type.DeclaringTypeDefinition is null ? null : FormatTypeName(type.DeclaringTypeDefinition.FullTypeName.FullName),
-                FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type));
+                FormatTypeDeclaration(type), type.EffectiveAccessibility(), type.IsStatic, ObsoleteWarnings(type)) with
+            {
+                xmlDocumentation = ReadXmlDocumentation(type, documentationProvider),
+            };
             var directBaseTypeNames = type.DirectBaseTypes.Select(FormatType).ToArray();
             var constraints = FormatConstraints(type.TypeParameters);
             var members = new List<ApiIndexedSymbol>();
@@ -463,6 +469,7 @@ public sealed partial class InstalledApiCatalog
                 var hit = CreateMemberHit(snapshot, entry, type, member, memberWarnings);
                 if (hit is null)
                     continue;
+                hit = hit with { xmlDocumentation = ReadXmlDocumentation(member.MemberDefinition, documentationProvider) };
                 var indexed = CreateIndexedSymbol(hit, MetadataTokens.GetToken(member.MetadataToken), member);
                 var increment = EstimateIndexedSymbolBytes(indexed) + IntPtr.Size + ApiIndexSymbolMapOverheadBytes;
                 if (estimatedBytes + increment > _apiIndexMemoryBudgetBytes)
@@ -514,6 +521,137 @@ public sealed partial class InstalledApiCatalog
         return new ApiAssemblyIndex(entry.Id, symbols.ToArray(), types.ToArray(), estimatedBytes,
             omittedPublicDeclarations == 0 && !limitReached, omittedDeclarations, omittedPublicDeclarations, limitReached);
     }
+    private const int MaxXmlDocumentationChars = 4 * 1024;
+
+    private static XmlDocumentationProvider? CreateXmlDocumentationProvider(AssemblyEntry entry)
+    {
+        if (entry.XmlDocumentationStatus != "available" ||
+            entry.XmlDocumentationPath is null ||
+            entry.XmlDocumentationContentHash is null)
+            return null;
+
+        var path = Path.ChangeExtension(entry.FullPath, ".xml");
+        if (!File.Exists(path))
+            throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed during the request; rerun discovery.");
+        var canonicalPath = ResolveCanonicalPath(path);
+        if (!PathComparer.Equals(canonicalPath, entry.XmlDocumentationPath))
+            throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed during the request; rerun discovery.");
+
+        try
+        {
+            using var stream = new FileStream(canonicalPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var length = stream.Length;
+            var contentHash = Convert.ToHexString(SHA256.HashData(stream));
+            if (stream.Length != length || !contentHash.Equals(entry.XmlDocumentationContentHash, StringComparison.Ordinal))
+                throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed during the request; rerun discovery.");
+            return new XmlDocumentationProvider(canonicalPath);
+        }
+        catch (AssemblyChangedException) { throw; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or
+                                          InvalidOperationException or NotSupportedException or System.Xml.XmlException)
+        {
+            throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed or became invalid during the request; rerun discovery.", exception);
+        }
+    }
+
+    private static ApiXmlDocumentation? ReadXmlDocumentation(IEntity entity, XmlDocumentationProvider? provider)
+    {
+        var documentationText = provider?.GetDocumentation(entity);
+        if (documentationText is null)
+            return null;
+        var documentationRoot = XElement.Parse($"<doc>{documentationText}</doc>");
+        var documentation = new XmlDocumentationElement(documentationRoot, entity as IMember, null);
+
+        var remaining = MaxXmlDocumentationChars;
+        var truncated = false;
+        string? ReadSingle(string name)
+        {
+            var element = documentation.Children.FirstOrDefault(child => child.Name == name);
+            return element is null ? null : TakeXmlDocumentationText(element.TextContent, ref remaining, ref truncated);
+        }
+
+        var summary = ReadSingle("summary");
+        var remarks = ReadSingle("remarks");
+        List<ApiXmlDocumentationParameter>? parameters = null;
+        foreach (var parameter in documentation.Children.Where(child => child.Name == "param"))
+        {
+            var name = TakeXmlDocumentationText(parameter.GetAttribute("name"), ref remaining, ref truncated);
+            var description = TakeXmlDocumentationText(parameter.TextContent, ref remaining, ref truncated);
+            if (!string.IsNullOrEmpty(name) && description is not null)
+                (parameters ??= new()).Add(new ApiXmlDocumentationParameter(name, description));
+        }
+        var returns = ReadSingle("returns");
+        var value = ReadSingle("value");
+        List<string>? examples = null;
+        foreach (var example in documentation.Children.Where(child => child.Name == "example"))
+        {
+            var text = TakeXmlDocumentationText(example.TextContent, ref remaining, ref truncated);
+            if (text is not null)
+                (examples ??= new()).Add(text);
+        }
+
+        if (summary is null && remarks is null && parameters is null && returns is null && value is null && examples is null)
+            return null;
+        return new ApiXmlDocumentation(summary, remarks, parameters?.ToArray(), returns, value, examples?.ToArray(),
+            truncated ? true : null);
+    }
+
+    private static string? TakeXmlDocumentationText(string? text, ref int remaining, ref bool truncated)
+    {
+        var normalized = NormalizeXmlDocumentationText(text);
+        if (normalized.Length == 0)
+            return null;
+        if (normalized.Length <= remaining)
+        {
+            remaining -= normalized.Length;
+            return normalized;
+        }
+
+        var length = remaining;
+        if (length > 0 && length < normalized.Length &&
+            char.IsHighSurrogate(normalized[length - 1]) && char.IsLowSurrogate(normalized[length]))
+            length--;
+        remaining = 0;
+        truncated = true;
+        return length == 0 ? null : normalized[..length].TrimEnd();
+    }
+
+    private static string NormalizeXmlDocumentationText(string? text) =>
+        string.IsNullOrWhiteSpace(text)
+            ? ""
+            : string.Join(" ", text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    private static bool IsValidXmlDocumentation(ApiXmlDocumentation? documentation)
+    {
+        if (documentation is null)
+            return true;
+        if (documentation.Truncated is not (null or true) ||
+            documentation.Parameters is { Length: > MaxXmlDocumentationChars } ||
+            documentation.Examples is { Length: > MaxXmlDocumentationChars })
+            return false;
+        var textLength = (documentation.Summary?.Length ?? 0) + (documentation.Remarks?.Length ?? 0) +
+            (documentation.Returns?.Length ?? 0) + (documentation.Value?.Length ?? 0);
+        if (documentation.Parameters is not null)
+        {
+            foreach (var parameter in documentation.Parameters)
+            {
+                if (parameter is null || string.IsNullOrEmpty(parameter.Name) || string.IsNullOrEmpty(parameter.Description))
+                    return false;
+                textLength += parameter.Name.Length + parameter.Description.Length;
+            }
+        }
+        if (documentation.Examples is not null)
+        {
+            foreach (var example in documentation.Examples)
+            {
+                if (string.IsNullOrEmpty(example))
+                    return false;
+                textLength += example.Length;
+            }
+        }
+        return textLength <= MaxXmlDocumentationChars;
+    }
+
 
     private static bool IsCompilerGeneratedName(string name) =>
         name.Length == 0 || name[0] is '<' or '$' ||
@@ -804,6 +942,7 @@ public sealed partial class InstalledApiCatalog
             using var main = await LoadPeAsync(entry, CancellationToken.None).ConfigureAwait(false);
             using var resolver = new RootedAssemblyResolver(snapshot, entry, main);
             var settings = CreateDecompilerSettings();
+            var documentationProvider = CreateXmlDocumentationProvider(entry);
             var typeSystem = new DecompilerTypeSystem(main.File, resolver, settings);
             var entity = FindEntity(typeSystem.MainModule, symbol.MetadataToken)
                 ?? throw new InvalidOperationException("symbolId is invalid, stale, or does not identify a type/member in assemblyId.");
@@ -816,7 +955,11 @@ public sealed partial class InstalledApiCatalog
             }
             else
             {
-                var decompiler = new CSharpDecompiler(typeSystem, settings) { CancellationToken = CancellationToken.None };
+                var decompiler = new CSharpDecompiler(typeSystem, settings)
+                {
+                    CancellationToken = CancellationToken.None,
+                    DocumentationProvider = documentationProvider,
+                };
                 source = entity is ITypeDefinition definition
                     ? decompiler.DecompileTypeAsString(definition.FullTypeName)
                     : decompiler.DecompileAsString(entity.MetadataToken);
@@ -999,7 +1142,7 @@ public sealed partial class InstalledApiCatalog
     {
         var value = string.Join("\n", "api-index", ApiIndexSchemaVersion.ToString(), ApiFormatterVersion,
             ApiLookupRanker.Version, typeof(CSharpDecompiler).Assembly.GetName().Version?.ToString() ?? "unknown",
-            Environment.Version.ToString(), entry.Id);
+            Environment.Version.ToString(), entry.Id, entry.XmlDocumentationStatus, entry.XmlDocumentationContentHash ?? "");
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
     }
 
@@ -1065,7 +1208,7 @@ public sealed partial class InstalledApiCatalog
                     !assemblyIds.Contains(hit.assemblyId) || string.IsNullOrEmpty(hit.kind) ||
                     string.IsNullOrEmpty(hit.qualifiedName) || string.IsNullOrEmpty(hit.signature) ||
                     string.IsNullOrEmpty(hit.accessibility) || hit.attributes is not null ||
-                    hit.warnings is null || hit.warnings.Length != 0)
+                    hit.warnings is null || hit.warnings.Length != 0 || !IsValidXmlDocumentation(hit.xmlDocumentation))
                     return (null, false);
             }
             lock (_directoryGate)
@@ -1140,8 +1283,13 @@ public sealed partial class InstalledApiCatalog
         }
     }
 
-    private static long EstimateApiDirectoryBytes(IReadOnlyList<ApiHit> hits) =>
-        1024L + (long)hits.Count * 512L;
+    private static long EstimateApiDirectoryBytes(IReadOnlyList<ApiHit> hits)
+    {
+        long bytes = 1024L + (long)hits.Count * 512L;
+        foreach (var hit in hits)
+            bytes += EstimateXmlDocumentationBytes(hit.xmlDocumentation);
+        return bytes;
+    }
 
     private sealed record ApiDirectoryDocument(int Schema, string SnapshotId, string Formatter, bool Complete, ApiHit[] Hits);
 
@@ -1320,8 +1468,34 @@ public sealed partial class InstalledApiCatalog
             foreach (var argument in attribute.NamedArguments)
                 bytes += EstimateApiAttributeArgumentBytes(argument);
         }
+        bytes += EstimateXmlDocumentationBytes(hit.xmlDocumentation);
         return bytes;
     }
+    private static long EstimateXmlDocumentationBytes(ApiXmlDocumentation? documentation)
+    {
+        if (documentation is null)
+            return 0;
+        long bytes = 96;
+        static long StringBytes(string? value) => value is null ? 0 : 32L + (long)value.Length * 2;
+        bytes += StringBytes(documentation.Summary) + StringBytes(documentation.Remarks) +
+            StringBytes(documentation.Returns) + StringBytes(documentation.Value);
+        if (documentation.Parameters is not null)
+        {
+            bytes += ApiIndexEstimatedArrayOverheadBytes +
+                (long)documentation.Parameters.Length * IntPtr.Size;
+            foreach (var parameter in documentation.Parameters)
+                bytes += 48 + StringBytes(parameter.Name) + StringBytes(parameter.Description);
+        }
+        if (documentation.Examples is not null)
+        {
+            bytes += ApiIndexEstimatedArrayOverheadBytes +
+                (long)documentation.Examples.Length * IntPtr.Size;
+            foreach (var example in documentation.Examples)
+                bytes += StringBytes(example);
+        }
+        return bytes;
+    }
+
 
     private static long EstimateApiAttributeArgumentBytes(ApiAttributeArgument argument)
     {

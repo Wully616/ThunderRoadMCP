@@ -8,8 +8,8 @@ The harness skill at [`skills/blade-and-sorcery/SKILL.md`](../skills/blade-and-s
 
 `game_guide(topic?)` returns one section of this document from the copy embedded in the host, as `{topic, content}` plus text, without a game or bridge. The default `bootstrap` topic returns the intro, version stamp, and Bootstrap sections.
 
-- Topics: `bootstrap`, `unity`, `runtime`, `spawning`, `levels`, `api`, `logs`, `eval`, `example`, `troubleshooting`, `version`.
-- Aliases: `overview` → `bootstrap`, `console`/`workflow` → `api`, `worked-example` → `example`.
+- Topics: `bootstrap`, `unity`, `runtime`, `spawning`, `levels`, `api`, `authoring`, `logs`, `eval`, `example`, `troubleshooting`, `version`.
+- Aliases: `overview` → `bootstrap`, `console`/`workflow` → `api`, `mod-authoring`/`modding` → `authoring`, `worked-example` → `example`.
 - An unknown topic is a tool error that lists the canonical topics.
 
 The embedded copy is built with the host. Edit this file as the source of truth, then republish the host and reconnect the MCP client before expecting the new text from the tool.
@@ -61,7 +61,7 @@ Every `evaluate_csharp` call compiles a fresh assembly and runs its body synchro
 - `game_runtime(action:"stop", key:"key")` stops one managed coroutine and returns `{action,key,stopped}`. `key` is required; omitting it is a validation error and stops nothing.
 - `game_runtime(action:"clear")` stops all managed coroutines and clears stored object references, returning `{action:"clear",cleared:true}`. Use it before reusing keys or after a level change.
 
-Coroutines run on the main thread and are not threads; a blocking loop still stalls the game. A routine ends naturally when its `IEnumerator` finishes or after `StopManagedCoroutine`.
+Coroutines run on the main thread and are not threads; a blocking loop still stalls the game. A routine ends naturally when its `IEnumerator` finishes. The bridge drives nested iterators and disposes the iterator chain on completion, stop, replacement, and clear; put cleanup in iterator `finally` blocks. `YieldInstruction` and `CustomYieldInstruction` objects retain Unity's normal yield behavior.
 
 Never call `StopAllCoroutines` on a game-owned manager such as `Player`, `LevelManager`, or a creature controller. It stops the game's own routines too. Manage only the coroutines you started through `McpRuntime` (or on your own GameObject).
 
@@ -161,6 +161,16 @@ Choose the workflow by task:
 - Exact implementation question: use `api_lookup(mode:"symbol", query:"...")` or the lower-level `api_search`, `api_type`, and `api_decompile` tools. Do not fetch exhaustive inventory, inspect unrelated types, or read the guide twice by default.
 
 The API tools inspect installed files without executing them. They cover the game's `Managed` assemblies and enabled mod folders; disabled (underscore-prefixed) mod folders are never included. `api_search` and `api_lookup` take `scope`: before writing `evaluate_csharp` code, use `scope:"loaded"` (or the default `auto` while the bridge is connected) so results only include mods the running game actually loaded; for offline mod authoring, `scope:"installed"` covers every enabled mod. Base catalog records are shipped data, not proof that an object exists in the mod-merged runtime. Snapshot IDs reject stale symbols after files change.
+
+## Mod authoring workflow
+
+API and catalog discovery work offline against the selected installation; the game process is not required. Use `scope:"installed"` to keep discovery independent of the bridge. Retrieval is deterministic and evidence-based, not model-generated: `api_lookup` is for task intent and `conceptHints`, while `api_search` is for exact identifiers or distinctive XML documentation phrases. Follow a supported result with `api_type` and `api_decompile` when signatures or implementation details matter.
+
+Keep catalog data separate from live runtime objects. In the selected installation, the usual mappings are catalog `ItemData` → API `ThunderRoad.ItemData` → spawned runtime `ThunderRoad.Item`, and catalog `CreatureData` → API `ThunderRoad.CreatureData` → spawned runtime `ThunderRoad.Creature`. Confirm version-specific types and links from returned catalog `$type` and installed API/XML evidence; a search alias is only a concept hint.
+
+For an item mod, `ItemModule.OnItemLoaded(ThunderRoad.Item)` is the documented lifecycle hook for attaching runtime behaviour after an item loaded from its owning data has spawned. `ItemData.SpawnAsync` creates the configured runtime `Item`; `CreatureData.SpawnAsync` creates a configured runtime `Creature`. Discover catalog IDs with `catalog_search(catalogType:"ItemData")` or `catalog_search(catalogType:"CreatureData")`, then use a live spawn/evaluation tool only when you actually need to prototype in-game.
+
+The bridge is required for live operations such as `game_spawn_item`, `game_spawn_creature`, `game_find_objects`, and `evaluate_csharp`; it is not required for installed API search, XML documentation lookup, or `bas.jsondb` catalog discovery.
 
 ## Logs
 

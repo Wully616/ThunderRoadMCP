@@ -88,6 +88,10 @@ namespace Fixture.Shared
 
     public static class ApiAttributeExtensions
     {
-        public static void Extend(this ApiAttributeSurface value) { }
+        public static void Extend(this ApiAttributeSurface receiver) { }
+        public static void ExtendRef(this ref int receiver) { }
+        public static void ExtendIn(this in int receiver) { }
+        public static void ExtendRefReadonly(this ref readonly int receiver) { }
+        public static void KeywordParameters(string @class, string @event) { }
     }
 }

@@ -33,7 +33,8 @@ public sealed partial class InstalledApiCatalog
                         scope = resolvedScope?.Requested ?? "auto", snapshotId = snapshot.Id,
                     },
                 });
-        var candidates = new ApiLookupRanker.CandidateAccumulator(query, ApiLookupRanker.MaxCandidates);
+        var conceptAliases = ApiLookupRanker.MatchedConceptAliases(query);
+        var conceptEvidenceHits = new List<ApiHit>();
         var declarationsConsidered = 0;
         var exampleNames = includeExamples
             ? GameplayExamples.All.SelectMany(example => example.Symbols).Select(NormalizeTypeName).ToHashSet(StringComparer.OrdinalIgnoreCase)
@@ -42,6 +43,48 @@ public sealed partial class InstalledApiCatalog
         var diagnostics = new List<string>(snapshot.Diagnostics);
         if (loadedAssemblyDiagnostic is not null)
             AddDiagnostic(diagnostics, loadedAssemblyDiagnostic);
+        var catalogEvidenceByType = new Dictionary<string, CatalogTypeEvidence?>(StringComparer.OrdinalIgnoreCase);
+        var preferredCatalogApiTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var alias in conceptAliases)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var evidence = baseCatalog is null
+                ? null
+                : await ReadCatalogTypeEvidenceAsync(baseCatalog, alias.CatalogTypeName, cancellationToken, diagnostics);
+            catalogEvidenceByType[alias.CatalogTypeName] = evidence;
+            if (evidence?.ApiType is not null)
+                preferredCatalogApiTypes.Add(evidence.ApiType);
+        }
+        string? catalogSnapshotId = null;
+        IReadOnlyList<CatalogTaskRecord> catalogRecords = Array.Empty<CatalogTaskRecord>();
+        IReadOnlyList<string> catalogOmittedTerms = Array.Empty<string>();
+        var catalogComplete = false;
+        var catalogLocalizedSearchComplete = false;
+        if (baseCatalog is not null)
+        {
+            try
+            {
+                var catalogResult = await baseCatalog.SearchTaskCatalogAsync(query, Math.Min(5, maxResults),
+                    preferredCatalogApiTypes, cancellationToken);
+                catalogSnapshotId = catalogResult.SnapshotId;
+                catalogRecords = catalogResult.Records;
+                catalogOmittedTerms = catalogResult.OmittedTerms;
+                catalogComplete = catalogResult.IsComplete;
+                catalogLocalizedSearchComplete = catalogResult.LocalizedSearchComplete;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
+            {
+                AddDiagnostic(diagnostics, "Base catalog lookup unavailable: " + exception.Message);
+            }
+        }
+        var catalogEvidenceApiTypes = new HashSet<string>(preferredCatalogApiTypes, StringComparer.OrdinalIgnoreCase);
+        foreach (var record in catalogRecords)
+            if (record.DeclaredApiType is not null &&
+                record.MatchedTerms.Any(term => !ApiLookupRanker.IsActionToken(term)))
+                catalogEvidenceApiTypes.Add(NormalizeTypeName(record.DeclaredApiType));
+        var candidates = new ApiLookupRanker.CandidateAccumulator(query, ApiLookupRanker.MaxCandidates,
+            catalogEvidenceApiTypes);
         var indexComplete = !snapshot.CatalogTruncated;
         var typeMap = await ReadApiTypeMapAsync(snapshot);
         ApiHit[]? directoryHits = null;
@@ -68,6 +111,13 @@ public sealed partial class InstalledApiCatalog
                 if (exampleMatches.Count < 2)
                     exampleMatches.Add(hit);
             }
+            if (conceptAliases.Any(alias =>
+                    (IsTypeKind(hit.kind) &&
+                     (SimpleApiTypeName(hit.qualifiedName).Equals(alias.DataTypeSimpleName, StringComparison.OrdinalIgnoreCase) ||
+                      SimpleApiTypeName(hit.qualifiedName).Equals(alias.RuntimeTypeSimpleName, StringComparison.OrdinalIgnoreCase))) ||
+                    (hit.xmlDocumentation is not null &&
+                     SimpleApiTypeName(hit.declaringType).Equals(alias.DataTypeSimpleName, StringComparison.OrdinalIgnoreCase))))
+                conceptEvidenceHits.Add(hit);
             if (MatchesLookupKind(hit.kind, kindFilter))
             {
                 declarationsConsidered++;
@@ -177,33 +227,15 @@ public sealed partial class InstalledApiCatalog
         var page = ranked.Skip(offset).Take(maxResults).ToArray();
         var selectedHits = page.Select(result => result.Hit).ToArray();
         var selectedSymbols = await ReadSelectedSymbolsAsync(snapshot, selectedHits, cancellationToken);
-        var catalogSnapshotId = (string?)null;
-        IReadOnlyList<CatalogTaskRecord> catalogRecords = Array.Empty<CatalogTaskRecord>();
-        IReadOnlyList<string> catalogOmittedTerms = Array.Empty<string>();
-        var catalogComplete = false;
-        var catalogLocalizedSearchComplete = false;
-        if (baseCatalog is not null)
-        {
-            try
-            {
-                var preferredCatalogTypes = selectedHits
-                    .Select(hit => NormalizeTypeName(hit.declaringType ?? hit.qualifiedName))
-                    .Where(name => name.Length > 0)
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                var catalogResult = await baseCatalog.SearchTaskCatalogAsync(query, Math.Min(5, maxResults),
-                    preferredCatalogTypes, cancellationToken);
-                catalogSnapshotId = catalogResult.SnapshotId;
-                catalogRecords = catalogResult.Records;
-                catalogOmittedTerms = catalogResult.OmittedTerms;
-                catalogComplete = catalogResult.IsComplete;
-                catalogLocalizedSearchComplete = catalogResult.LocalizedSearchComplete;
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
-            {
-                AddDiagnostic(diagnostics, "Base catalog lookup unavailable: " + exception.Message);
-            }
-        }
+        var selectedCatalogTypes = selectedHits
+            .Select(hit => NormalizeTypeName(hit.declaringType ?? hit.qualifiedName))
+            .Where(name => name.Length > 0)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (selectedCatalogTypes.Count > 0)
+            catalogRecords = catalogRecords.OrderByDescending(record => record.DeclaredApiType is not null &&
+                selectedCatalogTypes.Contains(NormalizeTypeName(record.DeclaredApiType))).ToArray();
+        var conceptHints = ResolveConceptHints(conceptAliases, conceptEvidenceHits, catalogEvidenceByType,
+            cancellationToken);
 
         var relatedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var relationOwners = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
@@ -236,6 +268,7 @@ public sealed partial class InstalledApiCatalog
             ["scopeInventoryTruncated"] = scopePartial,
             ["partial"] = scopePartial,
             ["rankingVersion"] = ApiLookupRanker.Version,
+            ["conceptHints"] = JsonSerializer.SerializeToNode(conceptHints),
             ["found"] = candidates.TotalMatches > 0,
             ["ambiguous"] = candidates.ExactMatches > 1,
             ["total"] = candidates.TotalMatches,
@@ -344,6 +377,8 @@ public sealed partial class InstalledApiCatalog
                 ["coveragePercent"] = rankedResult.CoveragePercent,
                 ["directMatch"] = rankedResult.HasDirectMatch,
                 ["confidence"] = rankedResult.IsLowConfidence ? "low" : "supported",
+                ["documentationMatch"] = rankedResult.HasDocumentationMatch,
+                ["catalogMatch"] = rankedResult.HasCatalogMatch,
                 ["exactName"] = rankedResult.IsExact,
             };
             node["typeContext"] = new JsonObject
@@ -831,10 +866,144 @@ public sealed partial class InstalledApiCatalog
                 ? MakeLookupContinuation(snapshot.Id, query, assemblyId, kindFilter, maxResults, maxChars, includeExamples, scopeSnapshotId, nextOffset)
                 : null;
         }
+        ReconcileRelationships(results, relatedArray, catalogResultArray);
         if (LogicalLength(response) > maxChars)
             throw new ArgumentException("response envelope exceeds maxChars after optional context was omitted.", nameof(maxChars));
         return JsonSerializer.Serialize(response);
     }
+
+    private static void ReconcileRelationships(JsonArray results, JsonArray relatedTypes, JsonArray catalogRecords)
+    {
+        var resultIds = results.OfType<JsonObject>()
+            .Select(node => node["symbolId"]?.GetValue<string>()).OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        var relatedIds = relatedTypes.OfType<JsonObject>()
+            .Select(node => node["symbolId"]?.GetValue<string>()).OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        var catalogIds = catalogRecords.OfType<JsonObject>()
+            .Select(node => node["entryId"]?.GetValue<string>())
+            .Where(id => id is not null).Select(id => "catalog:" + id)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var result in results.OfType<JsonObject>())
+        {
+            if (result["typeContext"]?["relatedTypeIds"] is not JsonArray ids)
+                continue;
+            for (var index = ids.Count - 1; index >= 0; index--)
+                if (ids[index]?.GetValue<string>() is not { } id || !relatedIds.Contains(id))
+                    ids.RemoveAt(index);
+        }
+        foreach (var related in relatedTypes.OfType<JsonObject>())
+        {
+            if (related["relatedTo"] is not JsonArray owners)
+                continue;
+            for (var index = owners.Count - 1; index >= 0; index--)
+                if (owners[index]?.GetValue<string>() is not { } id ||
+                    !(resultIds.Contains(id) || catalogIds.Contains(id)))
+                    owners.RemoveAt(index);
+        }
+    }
+
+    private ResolvedConceptHint[] ResolveConceptHints(
+        IReadOnlyList<ApiLookupRanker.ConceptAlias> aliases, IReadOnlyList<ApiHit> evidenceHits,
+        IReadOnlyDictionary<string, CatalogTypeEvidence?> catalogEvidenceByType, CancellationToken cancellationToken)
+    {
+        if (aliases.Count == 0)
+            return Array.Empty<ResolvedConceptHint>();
+
+        var hits = evidenceHits.GroupBy(hit => hit.symbolId, StringComparer.Ordinal)
+            .Select(group => group.First()).ToArray();
+        var hints = new ResolvedConceptHint[aliases.Count];
+        for (var index = 0; index < aliases.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var alias = aliases[index];
+            catalogEvidenceByType.TryGetValue(alias.CatalogTypeName, out var catalogType);
+
+            var dataType = catalogType?.ApiType is null
+                ? null
+                : hits.FirstOrDefault(hit => IsTypeKind(hit.kind) &&
+                    NormalizeTypeName(hit.qualifiedName).Equals(catalogType.ApiType, StringComparison.OrdinalIgnoreCase));
+            ApiHit? runtimeType = null;
+            var xmlAssociationFound = false;
+            if (dataType is not null)
+            {
+                var dataTypeName = NormalizeTypeName(dataType.qualifiedName);
+                var separator = dataTypeName.LastIndexOf('.');
+                var runtimeTypeName = separator < 0
+                    ? alias.RuntimeTypeSimpleName
+                    : dataTypeName[..(separator + 1)] + alias.RuntimeTypeSimpleName;
+                xmlAssociationFound = hits.Any(hit =>
+                    hit.xmlDocumentation is not null &&
+                    NormalizeTypeName(hit.declaringType ?? "").Equals(dataTypeName, StringComparison.OrdinalIgnoreCase) &&
+                    hit.signature.Contains(runtimeTypeName, StringComparison.Ordinal));
+                if (xmlAssociationFound)
+                    runtimeType = hits.FirstOrDefault(hit => IsTypeKind(hit.kind) &&
+                        NormalizeTypeName(hit.qualifiedName).Equals(runtimeTypeName, StringComparison.OrdinalIgnoreCase));
+            }
+
+            var evidence = new List<string>(3) { "curatedAlias" };
+            if (xmlAssociationFound && runtimeType is not null)
+                evidence.Add("xmlDocumentation");
+            if (catalogType?.CatalogType is not null)
+                evidence.Add("catalogType");
+            hints[index] = new ResolvedConceptHint(alias.Term, alias.CanonicalConcept, catalogType?.CatalogType,
+                dataType?.qualifiedName, runtimeType?.qualifiedName, evidence.ToArray());
+        }
+        return hints;
+    }
+
+    private async Task<CatalogTypeEvidence?> ReadCatalogTypeEvidenceAsync(BaseCatalogDataCatalog baseCatalog,
+        string catalogType, CancellationToken cancellationToken, List<string> diagnostics)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(await baseCatalog.SearchAsync(null, catalogType, null, 0, 1,
+                null, cancellationToken));
+            if (!document.RootElement.TryGetProperty("results", out var results) ||
+                results.ValueKind != JsonValueKind.Array)
+                return null;
+            var record = results.EnumerateArray().FirstOrDefault();
+            if (record.ValueKind != JsonValueKind.Object)
+                return null;
+            var actualCatalogType = record.TryGetProperty("catalogType", out var typeElement) &&
+                typeElement.ValueKind == JsonValueKind.String ? typeElement.GetString() : null;
+            var apiType = record.TryGetProperty("fullType", out var fullTypeElement) &&
+                fullTypeElement.ValueKind == JsonValueKind.String
+                ? NormalizeCatalogApiType(fullTypeElement.GetString())
+                : null;
+            return actualCatalogType is null ? null : new CatalogTypeEvidence(actualCatalogType, apiType);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (ArgumentException) { return null; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                           InvalidOperationException or JsonException)
+        {
+            AddDiagnostic(diagnostics, $"Could not verify catalog type '{catalogType}': {exception.Message}");
+            return null;
+        }
+    }
+
+    private static string? NormalizeCatalogApiType(string? fullType)
+    {
+        if (string.IsNullOrWhiteSpace(fullType))
+            return null;
+        var comma = fullType.IndexOf(',');
+        var normalized = NormalizeTypeName(comma < 0 ? fullType : fullType[..comma]);
+        return normalized.Length == 0 ? null : normalized;
+    }
+
+    private static string SimpleApiTypeName(string? typeName)
+    {
+        if (string.IsNullOrWhiteSpace(typeName))
+            return "";
+        var normalized = NormalizeTypeName(typeName);
+        return normalized[(normalized.LastIndexOf('.') + 1)..];
+    }
+
+    private sealed record CatalogTypeEvidence(string CatalogType, string? ApiType);
+    private sealed record ResolvedConceptHint(string term, string concept, string? catalogType, string? dataApiType,
+        string? runtimeApiType, string[] evidence);
 
     private async Task<Dictionary<string, ApiIndexedSymbol>> ReadSelectedSymbolsAsync(CatalogSnapshot snapshot,
         IReadOnlyList<ApiHit> hits, CancellationToken cancellationToken)

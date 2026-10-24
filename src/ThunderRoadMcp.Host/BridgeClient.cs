@@ -7,7 +7,7 @@ public sealed class BridgeClient
 {
     private const int MaxLineBytes = 64 * 1024;
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(35);
-    private static readonly string BridgeConfigPath = Environment.GetEnvironmentVariable("THUNDERROAD_MCP_CONFIG")
+    private static string BridgeConfigPath => Environment.GetEnvironmentVariable("THUNDERROAD_MCP_CONFIG")
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ThunderRoadMcp", "bridge.json");
     private static readonly JsonSerializerOptions ConfigJsonOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly JsonDocumentOptions BridgeResponseJsonOptions = new() { MaxDepth = 64 };
@@ -43,68 +43,88 @@ public sealed class BridgeClient
 
     private async Task<string> RequestCoreAsync(string method, object parameters, CancellationToken cancellationToken)
     {
-        BridgeConfig config;
-        using (ToolTiming.Measure("bridgeConfigMs"))
-            config = await ReadBridgeConfigAsync(cancellationToken);
-        using var client = new TcpClient(AddressFamily.InterNetwork);
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var requestTimeout = method == "status" ? TimeSpan.FromSeconds(3) : RequestTimeout;
-        timeout.CancelAfter(requestTimeout);
-        var token = timeout.Token;
-        using (ToolTiming.Measure("bridgeConnectMs"))
-            await client.ConnectAsync(IPAddress.Loopback, config.Port, token);
-        await using var stream = client.GetStream();
-        var id = Guid.NewGuid().ToString("N");
-        ToolTiming.SetBridgeRequestId(id);
-        var request = JsonSerializer.SerializeToUtf8Bytes(new
+        var requestMayHaveBeenSent = false;
+        try
         {
-            id,
-            token = config.Token,
-            method,
-            parameters,
-            diagnostics = ToolTiming.Enabled,
-        });
-        if (request.Length + LineEnding.Length > MaxLineBytes)
-            throw new InvalidOperationException("Bridge request exceeds the 64 KiB line limit.");
-        using (ToolTiming.Measure("bridgeWriteMs"))
-        {
-            await stream.WriteAsync(request, token);
-            await stream.WriteAsync(LineEnding, token);
-        }
-        ToolTiming.Count("bridge.requests");
-        ToolTiming.Count("bridge.requestBytes", request.Length + LineEnding.Length);
-
-        var responseBytes = new ArrayBufferWriter<byte>(1024);
-        var buffer = new byte[4096];
-        var hasLineEnd = false;
-        using (ToolTiming.Measure("bridgeReadMs"))
-        {
-            while (responseBytes.WrittenCount < MaxLineBytes)
+            BridgeConfig config;
+            using (ToolTiming.Measure("bridgeConfigMs"))
+                config = await ReadBridgeConfigAsync(cancellationToken);
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var requestTimeout = method == "status" ? TimeSpan.FromSeconds(3) : RequestTimeout;
+            timeout.CancelAfter(requestTimeout);
+            var token = timeout.Token;
+            using (ToolTiming.Measure("bridgeConnectMs"))
+                await client.ConnectAsync(IPAddress.Loopback, config.Port, token);
+            await using var stream = client.GetStream();
+            var id = Guid.NewGuid().ToString("N");
+            ToolTiming.SetBridgeRequestId(id);
+            var request = JsonSerializer.SerializeToUtf8Bytes(new
             {
-                var read = await stream.ReadAsync(buffer, token);
-                if (read == 0)
-                    throw new IOException("Bridge closed the connection before responding.");
-                var lineEnd = Array.IndexOf(buffer, (byte)'\n', 0, read);
-                var count = lineEnd < 0 ? read : lineEnd;
-                var lineLength = responseBytes.WrittenCount + count + (lineEnd >= 0 ? 1 : 0);
-                if (lineLength > MaxLineBytes)
-                    throw new IOException("Bridge response exceeds the 64 KiB line limit.");
-                buffer.AsSpan(0, count).CopyTo(responseBytes.GetSpan(count));
-                responseBytes.Advance(count);
-                if (lineEnd >= 0)
+                id,
+                token = config.Token,
+                method,
+                parameters,
+                diagnostics = ToolTiming.Enabled,
+            });
+            if (request.Length + LineEnding.Length > MaxLineBytes)
+                throw new InvalidOperationException("Bridge request exceeds the 64 KiB line limit.");
+            using (ToolTiming.Measure("bridgeWriteMs"))
+            {
+                await stream.WriteAsync(request, token);
+                requestMayHaveBeenSent = true;
+                await stream.WriteAsync(LineEnding, token);
+            }
+            ToolTiming.Count("bridge.requests");
+            ToolTiming.Count("bridge.requestBytes", request.Length + LineEnding.Length);
+
+            var responseBytes = new ArrayBufferWriter<byte>(1024);
+            var buffer = new byte[4096];
+            var hasLineEnd = false;
+            using (ToolTiming.Measure("bridgeReadMs"))
+            {
+                while (responseBytes.WrittenCount < MaxLineBytes)
                 {
-                    hasLineEnd = true;
-                    break;
+                    var read = await stream.ReadAsync(buffer, token);
+                    if (read == 0)
+                        throw new IOException("Bridge closed the connection before responding.");
+                    var lineEnd = Array.IndexOf(buffer, (byte)'\n', 0, read);
+                    var count = lineEnd < 0 ? read : lineEnd;
+                    var lineLength = responseBytes.WrittenCount + count + (lineEnd >= 0 ? 1 : 0);
+                    if (lineLength > MaxLineBytes)
+                        throw new IOException("Bridge response exceeds the 64 KiB line limit.");
+                    buffer.AsSpan(0, count).CopyTo(responseBytes.GetSpan(count));
+                    responseBytes.Advance(count);
+                    if (lineEnd >= 0)
+                    {
+                        hasLineEnd = true;
+                        break;
+                    }
                 }
             }
+            if (!hasLineEnd)
+                throw new IOException("Bridge response exceeds the 64 KiB line limit.");
+            ToolTiming.Count("bridge.responseBytes", responseBytes.WrittenCount + LineEnding.Length);
+            string result;
+            using (ToolTiming.Measure("bridgeResponseParseMs"))
+                result = ParseResponse(responseBytes.WrittenMemory, id);
+            return result;
         }
-        if (!hasLineEnd)
-            throw new IOException("Bridge response exceeds the 64 KiB line limit.");
-        ToolTiming.Count("bridge.responseBytes", responseBytes.WrittenCount + LineEnding.Length);
-        string result;
-        using (ToolTiming.Measure("bridgeResponseParseMs"))
-            result = ParseResponse(responseBytes.WrittenMemory, id);
-        return result;
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (method == "evaluate")
+        {
+            var requestTimeout = RequestTimeout;
+            throw new BridgeRequestException($"Bridge {method} request exceeded {requestTimeout.TotalSeconds:0} seconds.",
+                "evaluation.failed", requestMayHaveBeenSent ? "unknown" : "not_started", null);
+        }
+        catch (Exception exception) when (method == "evaluate" && exception is not BridgeRequestException)
+        {
+            throw new BridgeRequestException(exception.Message, "evaluation.failed",
+                requestMayHaveBeenSent ? "unknown" : "not_started", null);
+        }
     }
 
     internal static string ParseResponse(ReadOnlyMemory<byte> responseBytes, string id)
