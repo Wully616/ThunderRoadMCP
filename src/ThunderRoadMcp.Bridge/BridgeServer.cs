@@ -95,7 +95,20 @@ namespace ThunderRoadMcp.Bridge
                 timings = BridgeRequestTimings.Create(request.diagnostics);
                 object result = await requestHandler.DispatchAsync(request, shutdown.Token, timings).ConfigureAwait(false);
                 timings.Complete();
-                await WriteSuccess(stream, request.id, result, timings.Snapshot(), client).ConfigureAwait(false);
+                await WriteSuccess(stream, request.id, result, timings.Snapshot(), client, request.method == "evaluate").ConfigureAwait(false);
+            }
+            catch (BridgeEvaluationException exception)
+            {
+                BridgeLogs.Record("Error", exception.Message);
+                if (stream != null)
+                {
+                    try
+                    {
+                        timings?.Complete();
+                        await WriteFailure(stream, requestId, exception, timings?.Snapshot(), client).ConfigureAwait(false);
+                    }
+                    catch { }
+                }
             }
             catch (OperationCanceledException)
             {
@@ -155,12 +168,13 @@ namespace ThunderRoadMcp.Bridge
             throw new InvalidDataException("Request line exceeds 64 KiB.");
         }
 
-        private static async Task WriteSuccess(Stream stream, string id, object result, Dictionary<string, double> timings, TcpClient client)
+        private static async Task WriteSuccess(Stream stream, string id, object result, Dictionary<string, double> timings,
+            TcpClient client, bool evaluationResult)
         {
             var jsonResult = result as BridgeJsonResult;
             if (jsonResult != null)
             {
-                await WriteRawSuccess(stream, id, jsonResult.Json, timings, client).ConfigureAwait(false);
+                await WriteRawSuccess(stream, id, jsonResult.Json, timings, client, evaluationResult).ConfigureAwait(false);
                 return;
             }
             if (timings == null)
@@ -184,6 +198,28 @@ namespace ThunderRoadMcp.Bridge
                 : (object)new { id, success = false, error, timings };
             await WriteResponse(stream, id, response, client, timings).ConfigureAwait(false);
         }
+        internal static async Task WriteFailure(Stream stream, string id, BridgeEvaluationException failure,
+            Dictionary<string, double> timings, TcpClient client)
+        {
+            string error = failure.Message ?? "Evaluation failed.";
+            if (error.Length > 4096)
+            {
+                const string marker = " …[truncated]";
+                error = error.Substring(0, 4096 - marker.Length) + marker;
+            }
+            var response = new Dictionary<string, object>
+            {
+                ["id"] = id,
+                ["success"] = false,
+                ["error"] = error,
+                ["errorCode"] = failure.errorCode,
+                ["executionOutcome"] = failure.executionOutcome,
+                ["diagnostics"] = failure.diagnostics
+            };
+            if (timings != null)
+                response["timings"] = timings;
+            await WriteResponse(stream, id, response, client, timings).ConfigureAwait(false);
+        }
 
         private static async Task WriteFailure(Stream stream, string id, string error, TcpClient client)
         {
@@ -205,8 +241,7 @@ namespace ThunderRoadMcp.Bridge
                 writer.CloseOutput = false;
                 JsonSerializer.Create(new JsonSerializerSettings
                 {
-                    ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
-                    MaxDepth = 16
+                    ReferenceLoopHandling = ReferenceLoopHandling.Ignore
                 }).Serialize(writer, response);
                 writer.Flush();
             }
@@ -221,18 +256,20 @@ namespace ThunderRoadMcp.Bridge
             await WriteBounded(stream, bytes, client).ConfigureAwait(false);
         }
 
-        private static async Task WriteRawSuccess(Stream stream, string id, string resultJson, Dictionary<string, double> timings, TcpClient client)
+        private static async Task WriteRawSuccess(Stream stream, string id, string resultJson, Dictionary<string, double> timings,
+            TcpClient client, bool evaluationResult)
         {
-            await WriteBounded(stream, BuildRawSuccessResponse(id, resultJson, timings), client).ConfigureAwait(false);
+            await WriteBounded(stream, BuildRawSuccessResponse(id, resultJson, timings, evaluationResult), client).ConfigureAwait(false);
         }
 
-        internal static byte[] BuildRawSuccessResponse(string id, string resultJson, Dictionary<string, double> timings)
+        internal static byte[] BuildRawSuccessResponse(string id, string resultJson, Dictionary<string, double> timings,
+            bool evaluationResult = false)
         {
             if (TrySerializeRawSuccess(id, resultJson, timings, out var bytes) && bytes.Length <= MaxLineBytes)
                 return bytes;
             if (timings != null && TrySerializeRawSuccess(id, resultJson, null, out bytes) && bytes.Length <= MaxLineBytes)
                 return bytes;
-            return OversizedRawResponse(id, timings);
+            return OversizedRawResponse(id, timings, evaluationResult);
         }
 
         private static bool TrySerializeRawSuccess(string id, string resultJson, Dictionary<string, double> timings, out byte[] bytes)
@@ -283,15 +320,26 @@ namespace ThunderRoadMcp.Bridge
             }
         }
 
-        private static byte[] OversizedRawResponse(string id, Dictionary<string, double> timings)
+        private static byte[] OversizedRawResponse(string id, Dictionary<string, double> timings, bool evaluationResult)
         {
-            object response = timings is null
-                ? new { id, success = false, error = "Response exceeds 64 KiB." }
-                : (object)new { id, success = false, error = "Response exceeds 64 KiB.", timings };
-            byte[] bytes = Utf8.GetBytes(JsonConvert.SerializeObject(response) + "\n");
+            var response = new Dictionary<string, object>
+            {
+                ["id"] = id,
+                ["success"] = false,
+                ["error"] = "Response exceeds 64 KiB."
+            };
+            if (evaluationResult)
+            {
+                response["errorCode"] = "evaluation.result_unavailable";
+                response["executionOutcome"] = "completed_result_unavailable";
+            }
+            if (timings != null)
+                response["timings"] = timings;
+            var bytes = Utf8.GetBytes(JsonConvert.SerializeObject(response) + "\n");
             if (bytes.Length <= MaxLineBytes)
                 return bytes;
-            return Utf8.GetBytes(JsonConvert.SerializeObject(new { id, success = false, error = "Response exceeds 64 KiB." }) + "\n");
+            response.Remove("timings");
+            return Utf8.GetBytes(JsonConvert.SerializeObject(response) + "\n");
         }
 
         private static async Task WriteBounded(Stream stream, byte[] bytes, TcpClient client)

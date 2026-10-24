@@ -39,11 +39,11 @@ public static class ApiLookupRegressionCheck
         }
         async Task<JsonDocument> Lookup(string query)
         {
-            var document = await apiToolJsonAsync("api_lookup", new { query, assemblyId, maxResults = 20, includeExamples = false });
+            var document = await apiToolJsonAsync("api_lookup", new { query, assemblyId, maxResults = 20, maxChars = 16000, includeExamples = false });
             var root = document.RootElement;
             assert(root.TryGetProperty("logicalChars", out var logicalChars) &&
                    logicalChars.GetInt32() == root.GetRawText().Length && logicalChars.GetInt32() <= 16000,
-                "task logicalChars equals the serialized response length including itself and stays within the default maxChars");
+                "task logicalChars equals the serialized response length including itself and stays within the requested maxChars");
             return document;
         }
 
@@ -52,6 +52,16 @@ public static class ApiLookupRegressionCheck
         static InstalledApiCatalog.ApiHit Hit(string symbolId, string qualifiedName, string signature) =>
             new("fixture-assembly", "Fixture.Shared", "game", "Fixture.Shared.dll", symbolId, "method",
                 qualifiedName, "Fixture.Shared", signature, "public", false, Array.Empty<string>());
+
+        using (var compact = await apiToolJsonAsync("api_lookup", new { query = "generic nested dictionary", assemblyId }))
+        {
+            var root = compact.RootElement;
+            assert(root.GetProperty("found").GetBoolean() &&
+                   root.GetProperty("results").GetArrayLength() is > 0 and <= 3 &&
+                   root.GetProperty("examples").GetArrayLength() == 0 &&
+                   root.GetProperty("logicalChars").GetInt32() <= 8000,
+                "default task lookup returns useful results, limits the page to three declarations, and keeps examples opt-in");
+        }
 
         static string MalformedContinuation(string query, string? assemblyId, int maxResults, int maxChars,
             bool includeExamples, string? snapshotId, bool includeSnapshotId)
@@ -149,7 +159,7 @@ public static class ApiLookupRegressionCheck
         }
         using (var cleanup = await apiToolJsonAsync("api_lookup", new
         {
-            query = "clean up the spawned creature", assemblyId, maxResults = 5, includeExamples = true
+            query = "clean up the spawned creature", assemblyId, maxResults = 5, maxChars = 16000, includeExamples = true
         }))
         {
             var cleanupRoot = cleanup.RootElement;
@@ -163,7 +173,7 @@ public static class ApiLookupRegressionCheck
         }
         using (var runtimeCounters = await apiToolJsonAsync("api_lookup", new
         {
-            query = "runtime counters", assemblyId, maxResults = 5, includeExamples = true
+            query = "runtime counters", assemblyId, maxResults = 5, maxChars = 16000, includeExamples = true
         }))
         {
             var counterRoot = runtimeCounters.RootElement;
@@ -184,7 +194,7 @@ public static class ApiLookupRegressionCheck
                 "nonexistent task query returns no declarations");
         using (var examples = await apiToolJsonAsync("api_lookup", new
         {
-            query = "spawn an item near the player", assemblyId, maxResults = 5, includeExamples = true
+            query = "spawn an item near the player", assemblyId, maxResults = 5, maxChars = 16000, includeExamples = true
         }))
         {
             var exampleRoot = examples.RootElement;

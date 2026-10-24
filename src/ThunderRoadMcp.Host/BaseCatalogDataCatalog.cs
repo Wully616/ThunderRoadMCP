@@ -28,7 +28,7 @@ public sealed partial class BaseCatalogDataCatalog
     };
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     // Accessed only under the catalog operation gate; keyed by snapshot so a changed archive rebuilds it.
-    private (string SnapshotId, IReadOnlyDictionary<string, string> Texts)? _localizedText;
+    private (string SnapshotId, IReadOnlyDictionary<string, string> Texts, bool Complete)? _localizedText;
 
     public async Task<string> SearchAsync(string? query, string? catalogType, string? id, int offset, int limit,
         string? snapshotId, CancellationToken cancellationToken)
@@ -54,7 +54,8 @@ public sealed partial class BaseCatalogDataCatalog
             RequireKnownCatalogType(index, catalogType);
         var diagnostics = index.Diagnostics.ToList();
         var terms = query is null ? Array.Empty<string>() : GetTaskTerms(query).Included;
-        var texts = query is null ? null : await GetLocalizedTextAsync(opened, index, diagnostics, cancellationToken);
+        var localized = query is null ? null : await GetLocalizedTextAsync(opened, index, diagnostics, cancellationToken);
+        var texts = localized?.Texts;
         var hideTextData = query is not null && catalogType is null && id is null;
         var hiddenTextData = 0;
         var matches = new List<(CatalogIndexedRecord Record, int Score)>();
@@ -101,6 +102,15 @@ public sealed partial class BaseCatalogDataCatalog
         var hasMore = offset + page.Length < results.Count;
         return SerializeResponse(new
         {
+            total = results.Count,
+            offset,
+            limit,
+            hasMore,
+            nextOffset = hasMore ? offset + page.Length : (int?)null,
+            snapshotId = opened.SnapshotId,
+            catalogTruncated = index.CatalogTruncated,
+            localizedSearchComplete = localized?.Complete,
+            diagnostics,
             results = page.Select(record => new
             {
                 entryId = record.EntryId,
@@ -112,14 +122,6 @@ public sealed partial class BaseCatalogDataCatalog
                 memberPath = record.MemberPath,
                 size = record.Size,
             }),
-            total = results.Count,
-            offset,
-            limit,
-            hasMore,
-            nextOffset = hasMore ? offset + page.Length : (int?)null,
-            snapshotId = opened.SnapshotId,
-            catalogTruncated = index.CatalogTruncated,
-            diagnostics,
         });
     }
 
@@ -153,7 +155,9 @@ public sealed partial class BaseCatalogDataCatalog
                 CreateEntryId(opened.SnapshotId, candidate.EntryIndex, candidate.Path).Equals(entryId, StringComparison.Ordinal));
         }
         if (indexed is null && uncached is null)
-            throw new InvalidOperationException("entryId is invalid or stale; rerun catalog_search and use a current entryId.");
+            throw new ApiDiscoveryException("catalog.entry_invalid_or_stale",
+                "entryId is invalid or stale; restart catalog_search and use a current entryId and snapshotId.",
+                new { tool = "catalog_search", arguments = new { offset = 0, limit = 50 }, next = "Use a current entryId and snapshotId from the restarted search." });
 
         var entryIndex = indexed?.EntryIndex ?? uncached!.Index;
         var path = indexed?.Path ?? uncached!.Entry.FullName;
@@ -203,7 +207,7 @@ public sealed partial class BaseCatalogDataCatalog
         });
     }
 
-    internal async Task<(string SnapshotId, IReadOnlyList<CatalogTaskRecord> Records, bool IsComplete, IReadOnlyList<string> OmittedTerms)> SearchTaskCatalogAsync(
+    internal async Task<(string SnapshotId, IReadOnlyList<CatalogTaskRecord> Records, bool IsComplete, bool LocalizedSearchComplete, IReadOnlyList<string> OmittedTerms)> SearchTaskCatalogAsync(
         string query, int maxRecords, IReadOnlyCollection<string>? preferredApiTypes, CancellationToken cancellationToken)
     {
         using var timing = ToolTiming.Measure("catalogSearchMs");
@@ -215,9 +219,10 @@ public sealed partial class BaseCatalogDataCatalog
         using var operation = await EnterCatalogOperationAsync(cancellationToken);
         await using var opened = await OpenArchiveAsync(cancellationToken);
         var index = await GetIndexAsync(opened, cancellationToken);
-        var texts = index is null ? null : await GetLocalizedTextAsync(opened, index, new List<string>(), cancellationToken);
+        var localized = await GetLocalizedTextAsync(opened, index, new List<string>(), cancellationToken);
+        var texts = localized.Texts;
         var candidates = new List<(CatalogIndexedRecord Record, string[] Terms)>();
-        var complete = (index?.IsComplete ?? true) && omittedTerms.Length == 0;
+        var complete = (index?.IsComplete ?? true) && localized.Complete && omittedTerms.Length == 0;
         long recordsConsidered = index?.Records.Length ?? 0;
         if (index is not null)
         {
@@ -266,7 +271,7 @@ public sealed partial class BaseCatalogDataCatalog
                         continue;
                     var record = new CatalogIndexedRecord(member.Index, member.Entry.FullName, member.Entry.Length,
                         CatalogRecordState.Valid, metadata, null);
-                    var matches = GetMatchedTerms(terms, record, document.RootElement, cancellationToken);
+                    var matches = GetMatchedTerms(terms, record, document.RootElement, cancellationToken, texts);
                     if (matches.Length > 0)
                         candidates.Add((record, matches));
                 }
@@ -308,7 +313,7 @@ public sealed partial class BaseCatalogDataCatalog
         }
         ToolTiming.Count("catalogRecordsConsidered", recordsConsidered);
         ToolTiming.Count("catalogResultsReturned", records.Count);
-        return (opened.SnapshotId, records, complete && ordered.Length <= maxRecords, omittedTerms);
+        return (opened.SnapshotId, records, complete && ordered.Length <= maxRecords, localized.Complete, omittedTerms);
     }
 
     private async Task<string> SearchUncachedAsync(OpenedArchive opened, string? query, string? catalogType, string? id,
@@ -316,8 +321,9 @@ public sealed partial class BaseCatalogDataCatalog
     {
         var diagnostics = new List<string>();
         var matches = new List<(CatalogRecord Record, int Score)>();
-        // ponytail: the unindexed path skips localized text; only an archive too large to index reaches it.
         var terms = query is null ? Array.Empty<string>() : GetTaskTerms(query).Included;
+        var localized = query is null ? null : await GetLocalizedTextAsync(opened, null, diagnostics, cancellationToken);
+        var texts = localized?.Texts;
         var hideTextData = query is not null && catalogType is null && id is null;
         var hiddenTextData = 0;
         long expandedBytes = 0;
@@ -363,6 +369,8 @@ public sealed partial class BaseCatalogDataCatalog
                     score = ScoreMetadata(query, terms, path, metadata);
                     if (score == 0 && MatchesContent(query, terms, path, metadata, document.RootElement, cancellationToken))
                         score = 1;
+                    if (score == 0 && MatchesLocalizedContent(query, terms, path, metadata, document.RootElement, texts, cancellationToken))
+                        score = 1;
                     if (score == 0)
                         continue;
                     if (hideTextData && IsTextData(metadata))
@@ -394,6 +402,15 @@ public sealed partial class BaseCatalogDataCatalog
         var hasMore = offset + page.Length < results.Count;
         return SerializeResponse(new
         {
+            total = results.Count,
+            offset,
+            limit,
+            hasMore,
+            nextOffset = hasMore ? offset + page.Length : (int?)null,
+            snapshotId = opened.SnapshotId,
+            catalogTruncated,
+            localizedSearchComplete = localized?.Complete,
+            diagnostics,
             results = page.Select(record => new
             {
                 entryId = record.EntryId,
@@ -405,14 +422,6 @@ public sealed partial class BaseCatalogDataCatalog
                 memberPath = record.MemberPath,
                 size = record.Size,
             }),
-            total = results.Count,
-            offset,
-            limit,
-            hasMore,
-            nextOffset = hasMore ? offset + page.Length : (int?)null,
-            snapshotId = opened.SnapshotId,
-            catalogTruncated,
-            diagnostics,
         });
     }
 
@@ -444,8 +453,8 @@ public sealed partial class BaseCatalogDataCatalog
             ToolTiming.Count("catalogJsonParseCount", 1);
             ToolTiming.Count("catalogSearchFallbackParses", 1);
             using var document = JsonDocument.Parse(bytes, DocumentOptions);
-            // ponytail: oversize records skip localized text; cache their {Id} tokens if this matters
-            return MatchesContent(query, terms, record.Path, metadata, document.RootElement, cancellationToken) ? 1 : 0;
+            return MatchesContent(query, terms, record.Path, metadata, document.RootElement, cancellationToken) ||
+                MatchesLocalizedContent(query, terms, record.Path, metadata, document.RootElement, texts, cancellationToken) ? 1 : 0;
         }
         catch (JsonException exception)
         {
@@ -482,65 +491,256 @@ public sealed partial class BaseCatalogDataCatalog
         MatchTerms(root, terms, matched, cancellationToken);
         return matched.All(value => value);
     }
+    private static bool MatchesLocalizedContent(string query, string[] terms, string path, CatalogMetadata metadata,
+        JsonElement root, IReadOnlyDictionary<string, string>? texts, CancellationToken cancellationToken)
+    {
+        if (texts is null || texts.Count == 0)
+            return false;
+        var matched = SeedMatchedTerms(terms, path, metadata);
+        var phraseMatch = false;
+        if (string.Equals(metadata.Type, "ItemData", StringComparison.OrdinalIgnoreCase) &&
+            metadata.Id is { } id && texts.TryGetValue("item:" + id, out var itemText))
+            MatchLocalizedText(itemText);
+        if (WaveLocalizationId(metadata) is { } waveId && texts.TryGetValue("wave:" + waveId, out var waveText))
+            MatchLocalizedText(waveText);
+        Visit(root);
+        return phraseMatch || terms.Length >= 2 && matched.All(value => value);
 
-    private async Task<IReadOnlyDictionary<string, string>> GetLocalizedTextAsync(OpenedArchive opened, CatalogIndex index,
+        void MatchLocalizedText(string value)
+        {
+            if (value.Contains(query, StringComparison.OrdinalIgnoreCase))
+                phraseMatch = true;
+            for (var index = 0; index < terms.Length; index++)
+                if (!matched[index] && value.Contains(terms[index], StringComparison.OrdinalIgnoreCase))
+                    matched[index] = true;
+        }
+
+        void Visit(JsonElement element)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            switch (element.ValueKind)
+            {
+                case JsonValueKind.String:
+                    var value = element.GetString();
+                    if (value is { Length: > 2 } && value[0] == '{' && value[^1] == '}' &&
+                        texts.TryGetValue(value, out var localized))
+                        MatchLocalizedText(localized);
+                    break;
+                case JsonValueKind.Object:
+                    foreach (var property in element.EnumerateObject())
+                        Visit(property.Value);
+                    break;
+                case JsonValueKind.Array:
+                    foreach (var item in element.EnumerateArray())
+                        Visit(item);
+                    break;
+            }
+        }
+    }
+
+
+    private async Task<LocalizedTextSearch> GetLocalizedTextAsync(OpenedArchive opened, CatalogIndex? index,
         List<string> diagnostics, CancellationToken cancellationToken)
     {
         if (_localizedText is { } cached && cached.SnapshotId == opened.SnapshotId)
-            return cached.Texts;
-        var texts = new Dictionary<string, string>(StringComparer.Ordinal);
-        var english = index.Records.FirstOrDefault(record => record.State == CatalogRecordState.Valid &&
-            record.Metadata is { } metadata && IsTextData(metadata) &&
-            string.Equals(metadata.Id, "English", StringComparison.OrdinalIgnoreCase));
-        if (english is not null)
         {
-            try
+            if (!cached.Complete)
+                AddDiagnostic(diagnostics, "English TextData was missing, unreadable, malformed, or exceeded the scan limit; localized search results may be incomplete.");
+            return new LocalizedTextSearch(cached.Texts, cached.Complete);
+        }
+
+        var texts = new Dictionary<string, string>(StringComparer.Ordinal);
+        var complete = false;
+        if (index is not null)
+        {
+            var english = index.Records.FirstOrDefault(record => record.State == CatalogRecordState.Valid &&
+                record.Metadata is { } metadata && IsTextData(metadata) &&
+                string.Equals(metadata.Id, "English", StringComparison.OrdinalIgnoreCase));
+            if (english is not null)
             {
-                var bytes = await ReadMemberBytesAsync(opened.GetArchive().Entries[english.EntryIndex], cancellationToken);
-                ToolTiming.Count("catalogJsonParseCount", 1);
-                using var document = JsonDocument.Parse(bytes, DocumentOptions);
-                AddLocalizedTexts(texts, document.RootElement);
-            }
-            catch (Exception exception) when (exception is JsonException or IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
-            {
-                // ponytail: a failed read is cached as an empty map for this snapshot and reported once.
-                AddDiagnostic(diagnostics, $"Could not read English TextData for localized search: {exception.Message}");
+                try
+                {
+                    var bytes = await ReadMemberBytesAsync(opened.GetArchive().Entries[english.EntryIndex], cancellationToken);
+                    ToolTiming.Count("catalogJsonParseCount", 1);
+                    using var document = JsonDocument.Parse(bytes, DocumentOptions);
+                    complete = AddLocalizedTexts(texts, document.RootElement);
+                }
+                catch (Exception exception) when (exception is JsonException or IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+                {
+                    AddDiagnostic(diagnostics, $"Could not read English TextData for localized search: {exception.Message}");
+                }
             }
         }
-        _localizedText = (opened.SnapshotId, texts);
-        return texts;
+        else
+        {
+            long expandedBytes = 0;
+            foreach (var member in GetJsonMembers(opened.GetArchive()))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var path = member.Entry.FullName;
+                if (path.Length > MaxMemberPathChars || member.Entry.Length < 0 || member.Entry.Length > MaxMemberBytes ||
+                    member.Entry.Length > MaxExpandedBytes - expandedBytes)
+                {
+                    if (member.Entry.Length > MaxExpandedBytes - expandedBytes)
+                        AddDiagnostic(diagnostics, $"Stopped scanning English TextData after reaching the {MaxExpandedBytes} byte expanded-data limit.");
+                    complete = false;
+                    break;
+                }
+                expandedBytes += member.Entry.Length;
+                try
+                {
+                    var bytes = await ReadMemberBytesAsync(member.Entry, cancellationToken);
+                    ToolTiming.Count("catalogJsonParseCount", 1);
+                    using var document = JsonDocument.Parse(bytes, DocumentOptions);
+                    var metadata = ReadMetadata(document.RootElement);
+                    if (!IsTextData(metadata) ||
+                        !string.Equals(metadata.Id, "English", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    complete = AddLocalizedTexts(texts, document.RootElement);
+                    break;
+                }
+                catch (JsonException exception)
+                {
+                    AddDiagnostic(diagnostics, $"Ignored malformed JSON member while locating English TextData {path}: {exception.Message}");
+                }
+                catch (Exception exception) when (exception is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+                {
+                    AddDiagnostic(diagnostics, $"Could not inspect {path} while locating English TextData: {exception.Message}");
+                }
+            }
+        }
+
+        if (!complete)
+            AddDiagnostic(diagnostics, "English TextData was missing, unreadable, malformed, or exceeded the scan limit; localized search results may be incomplete.");
+        _localizedText = (opened.SnapshotId, texts, complete);
+        return new LocalizedTextSearch(texts, complete);
     }
 
-    // Keys: "{TextId}" for textGroups[].texts[] (duplicate IDs are concatenated) and "item:{ItemId}" for items[].
-    private static void AddLocalizedTexts(Dictionary<string, string> texts, JsonElement root)
+    // Keys: "{TextId}" for textGroups[].texts[], "item:{ItemId}" for items[], and "wave:{Id}" for waves[].
+    private static bool AddLocalizedTexts(Dictionary<string, string> texts, JsonElement root)
     {
         if (root.ValueKind != JsonValueKind.Object)
-            return;
-        if (root.TryGetProperty("textGroups", out var textGroups) && textGroups.ValueKind == JsonValueKind.Array)
-            foreach (var textGroup in textGroups.EnumerateArray())
-                if (textGroup.ValueKind == JsonValueKind.Object && textGroup.TryGetProperty("texts", out var entries) &&
-                    entries.ValueKind == JsonValueKind.Array)
-                    foreach (var entry in entries.EnumerateArray())
-                        if (StringProperty(entry, "id") is { } textId && StringProperty(entry, "text") is { } text)
-                            Add("{" + textId + "}", text);
-        if (root.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
-            foreach (var item in items.EnumerateArray())
+            return false;
+        var foundLocalizedSection = false;
+        var complete = true;
+        if (root.TryGetProperty("textGroups", out var textGroups))
+        {
+            foundLocalizedSection = true;
+            if (textGroups.ValueKind != JsonValueKind.Array)
             {
-                var itemText = string.Join(' ', new[] { StringProperty(item, "name"), StringProperty(item, "description") }
-                    .Where(part => !string.IsNullOrEmpty(part)));
-                if (StringProperty(item, "id") is { } itemId && itemText.Length > 0)
-                    Add("item:" + itemId, itemText);
+                complete = false;
             }
+            else
+            {
+                foreach (var textGroup in textGroups.EnumerateArray())
+                {
+                    if (textGroup.ValueKind != JsonValueKind.Object ||
+                        !textGroup.TryGetProperty("texts", out var entries) || entries.ValueKind != JsonValueKind.Array)
+                    {
+                        complete = false;
+                        continue;
+                    }
+                    foreach (var entry in entries.EnumerateArray())
+                    {
+                        var textId = StringProperty(entry, "id");
+                        var text = StringProperty(entry, "text");
+                        if (string.IsNullOrEmpty(textId) || text is null)
+                        {
+                            complete = false;
+                            continue;
+                        }
+                        Add("{" + textId + "}", text);
+                    }
+                }
+            }
+        }
+        if (root.TryGetProperty("items", out var items))
+        {
+            foundLocalizedSection = true;
+            if (items.ValueKind != JsonValueKind.Array)
+            {
+                complete = false;
+            }
+            else
+            {
+                foreach (var item in items.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Object)
+                    {
+                        complete = false;
+                        continue;
+                    }
+                    var itemId = StringProperty(item, "id");
+                    var name = StringProperty(item, "name");
+                    var description = StringProperty(item, "description");
+                    var invalidTextShape =
+                        (item.TryGetProperty("name", out var rawName) && rawName.ValueKind != JsonValueKind.String) ||
+                        (item.TryGetProperty("description", out var rawDescription) && rawDescription.ValueKind != JsonValueKind.String);
+                    if (string.IsNullOrEmpty(itemId) || (name is null && description is null) || invalidTextShape)
+                    {
+                        complete = false;
+                        continue;
+                    }
+                    var itemText = string.Join(' ', new[] { name, description }
+                        .Where(part => !string.IsNullOrEmpty(part)));
+                    if (itemText.Length > 0)
+                        Add("item:" + itemId, itemText);
+                }
+            }
+        }
+        if (root.TryGetProperty("waves", out var waves))
+        {
+            foundLocalizedSection = true;
+            if (waves.ValueKind != JsonValueKind.Array)
+            {
+                complete = false;
+            }
+            else
+            {
+                foreach (var wave in waves.EnumerateArray())
+                {
+                    if (wave.ValueKind != JsonValueKind.Object)
+                    {
+                        complete = false;
+                        continue;
+                    }
+                    var waveId = StringProperty(wave, "id");
+                    var title = StringProperty(wave, "title");
+                    var description = StringProperty(wave, "description");
+                    var invalidTextShape =
+                        (wave.TryGetProperty("title", out var rawTitle) && rawTitle.ValueKind != JsonValueKind.String) ||
+                        (wave.TryGetProperty("description", out var rawDescription) && rawDescription.ValueKind != JsonValueKind.String);
+                    if (string.IsNullOrEmpty(waveId) || (title is null && description is null) || invalidTextShape)
+                    {
+                        complete = false;
+                        continue;
+                    }
+                    var waveText = string.Join(' ', new[] { title, description }
+                        .Where(part => !string.IsNullOrEmpty(part)));
+                    if (waveText.Length > 0)
+                        Add("wave:" + waveId, waveText);
+                }
+            }
+        }
+        return foundLocalizedSection && complete;
 
         void Add(string key, string value) =>
             texts[key] = texts.TryGetValue(key, out var existing) ? existing + " " + value : value;
     }
 
+
     private static string? StringProperty(JsonElement element, string name) =>
         element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) &&
         value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
-    // Yields the record's strings, then the English text behind each "{Token}" string and, for ItemData, behind its ID.
+    private static string? WaveLocalizationId(CatalogMetadata metadata)
+    {
+        if (!string.Equals(metadata.Type, "WaveData", StringComparison.OrdinalIgnoreCase))
+            return null;
+        return string.IsNullOrEmpty(metadata.LocalizationId) ? metadata.Id : metadata.LocalizationId;
+    }
+
+    // Yields the record's strings, plus English text behind tokens and ItemData/WaveData localization IDs.
     private static IEnumerable<string> WithLocalizedText(CatalogIndexedRecord record, string[] values,
         IReadOnlyDictionary<string, string>? texts)
     {
@@ -551,10 +751,14 @@ public sealed partial class BaseCatalogDataCatalog
                 texts.TryGetValue(value, out var text))
                 yield return text;
         }
-        if (texts is not null && record.Metadata is { Id: { } id } metadata &&
-            string.Equals(metadata.Type, "ItemData", StringComparison.OrdinalIgnoreCase) &&
-            texts.TryGetValue("item:" + id, out var itemText))
-            yield return itemText;
+        if (texts is not null && record.Metadata is { } metadata)
+        {
+            if (string.Equals(metadata.Type, "ItemData", StringComparison.OrdinalIgnoreCase) &&
+                metadata.Id is { } id && texts.TryGetValue("item:" + id, out var itemText))
+                yield return itemText;
+            if (WaveLocalizationId(metadata) is { } waveId && texts.TryGetValue("wave:" + waveId, out var waveText))
+                yield return waveText;
+        }
     }
 
     private async Task<string[]?> GetMatchedTermsAsync(string[] terms, OpenedArchive opened, CatalogIndexedRecord record,
@@ -579,6 +783,7 @@ public sealed partial class BaseCatalogDataCatalog
                 ToolTiming.Count("catalogSearchFallbackParses", 1);
                 using var document = JsonDocument.Parse(bytes, DocumentOptions);
                 MatchTerms(document.RootElement, terms, matched, cancellationToken);
+                MatchLocalizedTerms(document.RootElement, terms, matched, metadata, texts, cancellationToken);
             }
             catch (JsonException) { return null; }
             catch (Exception exception) when (exception is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
@@ -590,7 +795,7 @@ public sealed partial class BaseCatalogDataCatalog
     }
 
     private static string[] GetMatchedTerms(string[] terms, CatalogIndexedRecord record, JsonElement root,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, IReadOnlyDictionary<string, string>? texts)
     {
         if (terms.Length == 0)
             return Array.Empty<string>();
@@ -598,17 +803,55 @@ public sealed partial class BaseCatalogDataCatalog
         for (var index = 0; index < terms.Length; index++)
             matched[index] = MatchesQueryPrefix(terms[index], record.Path, record.Metadata!);
         MatchTerms(root, terms, matched, cancellationToken);
+        MatchLocalizedTerms(root, terms, matched, record.Metadata!, texts, cancellationToken);
         return terms.Where((_, index) => matched[index]).ToArray();
     }
 
     private static void MatchTerms(IEnumerable<string> values, string[] terms, bool[] matched, CancellationToken cancellationToken)
     {
         foreach (var value in values)
+            MatchTerms(value, terms, matched, cancellationToken);
+    }
+    private static void MatchTerms(string value, string[] terms, bool[] matched, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        for (var index = 0; index < terms.Length; index++)
+            if (!matched[index] && value.Contains(terms[index], StringComparison.OrdinalIgnoreCase))
+                matched[index] = true;
+    }
+
+    private static void MatchLocalizedTerms(JsonElement root, string[] terms, bool[] matched, CatalogMetadata metadata,
+        IReadOnlyDictionary<string, string>? texts, CancellationToken cancellationToken)
+    {
+        if (texts is null || terms.Length == 0)
+            return;
+        if (string.Equals(metadata.Type, "ItemData", StringComparison.OrdinalIgnoreCase) &&
+            metadata.Id is { } id && texts.TryGetValue("item:" + id, out var itemText))
+            MatchTerms(itemText, terms, matched, cancellationToken);
+        if (WaveLocalizationId(metadata) is { } waveId && texts.TryGetValue("wave:" + waveId, out var waveText))
+            MatchTerms(waveText, terms, matched, cancellationToken);
+        Visit(root);
+
+        void Visit(JsonElement element)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            for (var index = 0; index < terms.Length; index++)
-                if (!matched[index] && value.Contains(terms[index], StringComparison.OrdinalIgnoreCase))
-                    matched[index] = true;
+            switch (element.ValueKind)
+            {
+                case JsonValueKind.String:
+                    var value = element.GetString();
+                    if (value is { Length: > 2 } && value[0] == '{' && value[^1] == '}' &&
+                        texts.TryGetValue(value, out var localized))
+                        MatchTerms(localized, terms, matched, cancellationToken);
+                    break;
+                case JsonValueKind.Object:
+                    foreach (var property in element.EnumerateObject())
+                        Visit(property.Value);
+                    break;
+                case JsonValueKind.Array:
+                    foreach (var item in element.EnumerateArray())
+                        Visit(item);
+                    break;
+            }
         }
     }
 
@@ -721,6 +964,7 @@ public sealed partial class BaseCatalogDataCatalog
         string? fullType = null;
         string? id = null;
         string? name = null;
+        string? localizationId = null;
         if (root.ValueKind == JsonValueKind.Object)
         {
             foreach (var property in root.EnumerateObject())
@@ -731,9 +975,11 @@ public sealed partial class BaseCatalogDataCatalog
                     id = PrimitiveText(property.Value);
                 else if (name is null && property.Name.Equals("name", StringComparison.OrdinalIgnoreCase))
                     name = PrimitiveText(property.Value);
+                else if (localizationId is null && property.Name.Equals("localizationId", StringComparison.OrdinalIgnoreCase))
+                    localizationId = PrimitiveText(property.Value);
             }
         }
-        return new CatalogMetadata(id, name, fullType, SimpleType(fullType));
+        return new CatalogMetadata(id, name, fullType, SimpleType(fullType), localizationId);
     }
 
     private static string? PrimitiveText(JsonElement element) => element.ValueKind switch
@@ -920,7 +1166,9 @@ public sealed partial class BaseCatalogDataCatalog
     private static void CheckSnapshot(string actual, string? expected)
     {
         if (expected is not null && !expected.Equals(actual, StringComparison.Ordinal))
-            throw new InvalidOperationException("snapshotId is not for the current bas.jsondb archive; rerun catalog_search, then use its current entryId and snapshotId together.");
+            throw new ApiDiscoveryException("catalog.snapshot_stale",
+                "snapshotId is stale; restart catalog_search without snapshotId and use the new snapshotId and entryId.",
+                new { tool = "catalog_search", arguments = new { offset = 0, limit = 50 }, next = "Use the snapshotId and entryId returned by the restarted search." });
     }
 
     private static void AddDiagnostic(List<string> diagnostics, string message)
@@ -937,8 +1185,9 @@ public sealed partial class BaseCatalogDataCatalog
         return json;
     }
 
+    private sealed record LocalizedTextSearch(IReadOnlyDictionary<string, string> Texts, bool Complete);
     private sealed record ZipMember(ZipArchiveEntry Entry, int Index);
-    private sealed record CatalogMetadata(string? Id, string? Name, string? FullType, string? Type);
+    private sealed record CatalogMetadata(string? Id, string? Name, string? FullType, string? Type, string? LocalizationId);
     private sealed record CatalogRecord(string EntryId, string? Id, string? Name, string? Type, string? FullType,
         string MemberPath, long Size);
 }

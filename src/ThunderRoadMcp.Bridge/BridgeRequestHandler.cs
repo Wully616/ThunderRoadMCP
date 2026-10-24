@@ -29,6 +29,23 @@ namespace ThunderRoadMcp.Bridge
         public readonly string Json;
         public BridgeJsonResult(string json) { Json = json; }
     }
+    internal sealed class BridgeEvaluationException : Exception
+    {
+        public readonly string errorCode;
+        public readonly string executionOutcome;
+        public readonly object diagnostics;
+        public BridgeEvaluationException(string errorCode, string message, string executionOutcome, object diagnostics = null,
+            Exception innerException = null) : base(message, innerException)
+        {
+            this.errorCode = errorCode;
+            this.executionOutcome = executionOutcome;
+            this.diagnostics = diagnostics;
+        }
+    }
+    internal sealed class BridgeResultDepthException : Exception
+    {
+        public BridgeResultDepthException() : base("Evaluation result exceeds the maximum JSON nesting depth of 62.") { }
+    }
     internal sealed class LoadedAssemblyStatus
     {
         public object[] loadedAssemblies { get; set; }
@@ -38,6 +55,7 @@ namespace ThunderRoadMcp.Bridge
     internal sealed class BridgeRequestHandler
     {
         internal const int MaxLineBytes = 64 * 1024;
+        private const int MaxResultDepth = 62;
         private const int MaxLevelIdLength = 256;
         private const int MaxModeLength = 256;
         private const int MaxCatalogIdLength = 256;
@@ -70,12 +88,32 @@ namespace ThunderRoadMcp.Bridge
                 writer.CloseOutput = false;
                 JsonSerializer.Create(new JsonSerializerSettings
                 {
-                    ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
-                    MaxDepth = 16
+                    ReferenceLoopHandling = ReferenceLoopHandling.Ignore
                 }).Serialize(writer, result);
                 writer.Flush();
             }
-            return output.ToString();
+            string json = output.ToString();
+            EnsureResultDepth(json);
+            return json;
+        }
+        private static void EnsureResultDepth(string json)
+        {
+            int depth = 0;
+            using (var textReader = new JsonTextReader(new StringReader(json)) { MaxDepth = null })
+            {
+                while (textReader.Read())
+                {
+                    if (textReader.TokenType == JsonToken.StartArray || textReader.TokenType == JsonToken.StartObject)
+                    {
+                        if (++depth > MaxResultDepth)
+                            throw new BridgeResultDepthException();
+                    }
+                    else if (textReader.TokenType == JsonToken.EndArray || textReader.TokenType == JsonToken.EndObject)
+                    {
+                        depth--;
+                    }
+                }
+            }
         }
         internal async Task<object> DispatchAsync(BridgeRequest request, CancellationToken token, BridgeRequestTimings timings)
         {
@@ -91,12 +129,25 @@ namespace ThunderRoadMcp.Bridge
                     if (since < 0) throw new InvalidDataException("logs.since must be non-negative.");
                     return BridgeLogs.ReadSince(since);
                 case "evaluate":
-                    string code = (string)args["code"];
-                    if (string.IsNullOrWhiteSpace(code) || Encoding.UTF8.GetByteCount(code) > MaxLineBytes)
-                        throw new InvalidDataException("evaluate.code must be non-empty and at most 64 KiB UTF-8.");
-                    long timeout = GetInteger(args, "timeoutMs", 10000);
-                    if (timeout < 1 || timeout > 30000) throw new InvalidDataException("evaluate.timeoutMs must be between 1 and 30000.");
-                    return new BridgeJsonResult(await Evaluate(code, TimeSpan.FromMilliseconds(timeout), token, timings).ConfigureAwait(false));
+                    try
+                    {
+                        string code = (string)args["code"];
+                        if (string.IsNullOrWhiteSpace(code) || Encoding.UTF8.GetByteCount(code) > MaxLineBytes)
+                            throw new InvalidDataException("evaluate.code must be non-empty and at most 64 KiB UTF-8.");
+                        long timeout = GetInteger(args, "timeoutMs", 10000);
+                        if (timeout < 1 || timeout > 30000)
+                            throw new InvalidDataException("evaluate.timeoutMs must be between 1 and 30000.");
+                        return new BridgeJsonResult(await Evaluate(code, TimeSpan.FromMilliseconds(timeout), token, timings).ConfigureAwait(false));
+                    }
+                    catch (BridgeEvaluationException)
+                    {
+                        throw;
+                    }
+                    catch (Exception exception)
+                    {
+                        throw new BridgeEvaluationException("evaluation.not_started", exception.Message,
+                            "not_started", null, exception);
+                    }
                 case "runtime":
                     return await RuntimeAsync(args, token).ConfigureAwait(false);
                 case "load_level":
@@ -629,9 +680,9 @@ namespace ThunderRoadMcp.Bridge
             });
             if (includeAssemblies)
             {
-                status["loadedAssemblies"] = JArray.FromObject(assemblyStatus.loadedAssemblies);
                 status["loadedAssemblyCount"] = assemblyStatus.loadedAssemblyCount;
                 status["loadedAssembliesTruncated"] = assemblyStatus.loadedAssembliesTruncated;
+                status["loadedAssemblies"] = JArray.FromObject(assemblyStatus.loadedAssemblies);
             }
             return status;
         }
@@ -720,8 +771,17 @@ namespace ThunderRoadMcp.Bridge
             {
                 deadline.CancelAfter(timeout);
                 CancellationToken token = deadline.Token;
-                using (timings.Measure("compilerQueueWaitMs"))
-                    await compiler.WaitAsync(token).ConfigureAwait(false);
+                try
+                {
+                    using (timings.Measure("compilerQueueWaitMs"))
+                        await compiler.WaitAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException exception)
+                {
+                    throw new BridgeEvaluationException("evaluation.not_started",
+                        "Evaluation timed out before invocation began.", "not_started", null, exception);
+                }
+
                 Task<Func<object>> compile = null;
                 bool releaseDeferred = false;
                 Func<object> evaluation;
@@ -733,7 +793,7 @@ namespace ThunderRoadMcp.Bridge
                             return CSharpEvaluator.Compile(code, token, timings);
                     }, token);
                     try { evaluation = await AwaitWithCancellation(compile, token).ConfigureAwait(false); }
-                    catch
+                    catch (Exception exception)
                     {
                         if (!compile.IsCompleted)
                         {
@@ -744,7 +804,12 @@ namespace ThunderRoadMcp.Bridge
                                 compiler.Release();
                             }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                         }
-                        throw;
+                        var diagnostics = CompilationDiagnostics(exception);
+                        if (exception is OperationCanceledException)
+                            throw new BridgeEvaluationException("evaluation.not_started",
+                                "Evaluation timed out before invocation began.", "not_started", diagnostics, exception);
+                        throw new BridgeEvaluationException("evaluation.compilation_failed", exception.Message,
+                            "not_started", diagnostics, exception);
                     }
                 }
                 finally
@@ -752,6 +817,7 @@ namespace ThunderRoadMcp.Bridge
                     if (!releaseDeferred) compiler.Release();
                 }
 
+                var invocationReturned = 0;
                 var queueWait = Stopwatch.StartNew();
                 var queueWaitRecorded = 0;
                 void RecordQueueWait()
@@ -760,18 +826,74 @@ namespace ThunderRoadMcp.Bridge
                         timings.Add("mainThreadQueueWaitMs", queueWait.Elapsed.TotalMilliseconds);
                 }
 
-                Task<string> execution = MainThreadQueue.Enqueue(() =>
+                Task<string> execution;
+                try
                 {
-                    RecordQueueWait();
-                    object value;
-                    using (timings.Measure("invocationMs"))
-                        value = evaluation();
-                    using (timings.Measure("serializationMs"))
-                        return SerializeResult(value);
-                }, token);
+                    execution = MainThreadQueue.Enqueue(() =>
+                    {
+                        RecordQueueWait();
+                        object value;
+                        try
+                        {
+                            using (timings.Measure("invocationMs"))
+                                value = evaluation();
+                            Interlocked.Exchange(ref invocationReturned, 1);
+                        }
+                        catch (Exception exception)
+                        {
+                            throw new BridgeEvaluationException("evaluation.invocation_failed", exception.ToString(),
+                                "unknown", null, exception);
+                        }
+                        try
+                        {
+                            using (timings.Measure("serializationMs"))
+                                return SerializeResult(value);
+                        }
+                        catch (BridgeResultDepthException exception)
+                        {
+                            throw new BridgeEvaluationException("evaluation.result_depth_exceeded", exception.Message,
+                                "completed_result_unavailable", null, exception);
+                        }
+                        catch (Exception exception)
+                        {
+                            throw new BridgeEvaluationException("evaluation.result_unavailable", exception.Message,
+                                "completed_result_unavailable", null, exception);
+                        }
+                    }, token);
+                }
+                catch (OperationCanceledException exception)
+                {
+                    throw new BridgeEvaluationException("evaluation.not_started",
+                        "Evaluation timed out before invocation began.", "not_started", null, exception);
+                }
+                catch (Exception exception)
+                {
+                    throw new BridgeEvaluationException("evaluation.not_started", exception.Message, "not_started", null, exception);
+                }
+
                 try
                 {
                     return await AwaitWithCancellation(execution, token).ConfigureAwait(false);
+                }
+                catch (BridgeEvaluationException)
+                {
+                    throw;
+                }
+                catch (OperationCanceledException exception)
+                {
+                    if (Volatile.Read(ref invocationReturned) != 0)
+                        throw new BridgeEvaluationException("evaluation.result_unavailable",
+                            "Evaluation completed, but result serialization did not finish before the timeout.",
+                            "completed_result_unavailable", null, exception);
+                    if (Volatile.Read(ref queueWaitRecorded) == 0)
+                        throw new BridgeEvaluationException("evaluation.not_started",
+                            "Evaluation timed out before invocation began.", "not_started", null, exception);
+                    throw new BridgeEvaluationException("evaluation.outcome_unknown",
+                        "Evaluation timed out after invocation may have begun; do not retry automatically.", "unknown", null, exception);
+                }
+                catch (Exception exception)
+                {
+                    throw new BridgeEvaluationException("evaluation.outcome_unknown", exception.Message, "unknown", null, exception);
                 }
                 finally
                 {
@@ -780,6 +902,49 @@ namespace ThunderRoadMcp.Bridge
             }
         }
 
+        private static object[] CompilationDiagnostics(Exception exception)
+        {
+            var property = exception.GetType().GetProperty("Diagnostics", BindingFlags.Public | BindingFlags.Instance);
+            if (property == null || !(property.GetValue(exception, null) is IEnumerable values))
+                return null;
+            var diagnostics = new List<object>();
+            foreach (var value in values)
+            {
+                if (value == null) continue;
+                var type = value.GetType();
+                string id = ReadDiagnosticString(type, value, "Id", 64);
+                string severity = ReadDiagnosticString(type, value, "Severity", 16);
+                string message = ReadDiagnosticString(type, value, "Message", 256);
+                int? line = ReadDiagnosticInt(type, value, "Line");
+                int? column = ReadDiagnosticInt(type, value, "Column");
+                var spanValue = type.GetProperty("Span", BindingFlags.Public | BindingFlags.Instance)?.GetValue(value, null);
+                object span = null;
+                if (spanValue != null)
+                {
+                    var spanType = spanValue.GetType();
+                    span = new
+                    {
+                        start = ReadDiagnosticInt(spanType, spanValue, "Start"),
+                        length = ReadDiagnosticInt(spanType, spanValue, "Length")
+                    };
+                }
+                diagnostics.Add(new { id, severity, message, line, column, span });
+                if (diagnostics.Count == 20) break;
+            }
+            return diagnostics.ToArray();
+        }
+
+        private static string ReadDiagnosticString(Type type, object value, string name, int maxLength)
+        {
+            string text = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(value, null) as string;
+            return text != null && text.Length > maxLength ? text.Substring(0, maxLength) : text;
+        }
+
+        private static int? ReadDiagnosticInt(Type type, object value, string name)
+        {
+            var propertyValue = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(value, null);
+            return propertyValue is int number ? (int?)number : propertyValue as int?;
+        }
         private static async Task<T> AwaitWithCancellation<T>(Task<T> task, CancellationToken token)
         {
             var canceled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);

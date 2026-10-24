@@ -159,9 +159,9 @@ internal static class CatalogReuseCheck
                 "replacement fixture retains the prior size and timestamp");
             var staleRejected = false;
             try { await catalog.ReadAsync(firstEntry, snapshot, 1, 1, CancellationToken.None); }
-            catch (InvalidOperationException exception)
+            catch (ApiDiscoveryException exception)
             {
-                staleRejected = exception.Message.Contains("snapshotId is not for the current bas.jsondb archive", StringComparison.Ordinal);
+                staleRejected = exception.Code == "catalog.snapshot_stale";
             }
             Assert(staleRejected, "full content hashing rejects a same-size, same-timestamp archive replacement");
             var changed = await MeasureSearchAsync(new BaseCatalogDataCatalog(), "deep brown phrase");
@@ -188,9 +188,9 @@ internal static class CatalogReuseCheck
             using var isolatedJson = JsonDocument.Parse(isolated.Json);
             var crossInstallStaleRejected = false;
             try { await new BaseCatalogDataCatalog().ReadAsync(changedEntry, changedSnapshot, 1, 1, CancellationToken.None); }
-            catch (InvalidOperationException exception)
+            catch (ApiDiscoveryException exception)
             {
-                crossInstallStaleRejected = exception.Message.Contains("snapshotId is not for the current bas.jsondb archive", StringComparison.Ordinal);
+                crossInstallStaleRejected = exception.Code == "catalog.snapshot_stale";
             }
             Assert(Count(isolated, "catalogPersistentHit") == 0 && Count(isolated, "catalogJsonParseCount") > 0 &&
                    isolatedJson.RootElement.GetProperty("snapshotId").GetString() != changedSnapshot &&

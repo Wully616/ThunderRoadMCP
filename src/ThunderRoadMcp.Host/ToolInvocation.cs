@@ -12,7 +12,10 @@ internal static class ToolInvocation
 
     public static Task<CallToolResult> RunText(Func<Task<string>> action) => Run(action, structured: false);
 
-    private static async Task<CallToolResult> Run(Func<Task<string>> action, bool structured)
+    public static Task<CallToolResult> RunEvaluation(Func<Task<string>> action) =>
+        Run(action, structured: true, evaluation: true);
+
+    private static async Task<CallToolResult> Run(Func<Task<string>> action, bool structured, bool evaluation = false)
     {
         using var invocation = ToolTiming.BeginInvocation();
         var started = ToolTiming.Enabled ? Stopwatch.GetTimestamp() : 0;
@@ -55,6 +58,8 @@ internal static class ToolInvocation
         }
         catch (ArgumentException exception)
         {
+            if (evaluation)
+                return EvaluationFailure(exception.Message, "request.invalid", "not_started", null, started);
             if (ToolTiming.Enabled)
             {
                 ToolTiming.Add("hostTotalMs", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
@@ -77,16 +82,50 @@ internal static class ToolInvocation
                 StructuredContent = JsonSerializer.SerializeToElement(error),
             };
         }
-        catch (McpException)
+        catch (McpException exception)
         {
+            if (evaluation)
+                return EvaluationFailure(exception.Message, "evaluation.failed", "unknown", null, started);
             RecordFailure(started);
             throw;
         }
         catch (Exception exception)
         {
+            if (evaluation)
+            {
+                var bridgeFailure = exception as BridgeRequestException;
+                return EvaluationFailure(exception.Message, bridgeFailure?.ErrorCode ?? "evaluation.failed",
+                    bridgeFailure?.ExecutionOutcome ?? "unknown", bridgeFailure?.Diagnostics, started);
+            }
             RecordFailure(started);
             throw new McpException(exception.Message, exception);
         }
+    }
+
+    private static CallToolResult EvaluationFailure(string message, string errorCode, string executionOutcome,
+        JsonElement? diagnostics, long started)
+    {
+        RecordFailure(started);
+        var structured = new JsonObject
+        {
+            ["errorCode"] = errorCode,
+            ["executionOutcome"] = executionOutcome,
+            ["error"] = new JsonObject
+            {
+                ["code"] = errorCode,
+                ["message"] = message.Length <= 4096 ? message : message[..4096],
+                ["messageTruncated"] = message.Length > 4096,
+                ["recovery"] = null,
+            },
+        };
+        if (diagnostics is { } value)
+            structured["diagnostics"] = JsonNode.Parse(value.GetRawText());
+        return new CallToolResult
+        {
+            IsError = true,
+            Content = [new TextContentBlock { Text = message }],
+            StructuredContent = JsonSerializer.SerializeToElement(structured),
+        };
     }
 
     internal static CallToolResult InvalidRequest(string message)

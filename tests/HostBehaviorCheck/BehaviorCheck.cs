@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Reflection.Metadata;
 using System.Threading.Channels;
 using System.Reflection.PortableExecutable;
@@ -289,6 +290,9 @@ try
         Path.GetFullPath(args[0]), configPath, launchConfigPath, logDirectory, apiCacheDirectory,
         executablePath, managedDirectory, apiGameSharedPath, apiModSharedPath, apiGameBasePath,
         missingDependencyPath, changedFixturePath, fixtureOutputDirectory, directory, NextApiDiagnosticsAsync));
+    DiscoveryContractCheck.Run();
+    await CatalogLocalizedFallbackCheck.RunAsync();
+    await EvaluationContractCheck.RunAsync();
     await CheckApiToolsAsync();
     await CheckCatalogToolsAsync();
     await ApiSignatureCheck.RunAsync(ApiToolJsonAsync, Assert);
@@ -399,7 +403,8 @@ try
                !timedOutLevel.RootElement.GetProperty("completed").GetBoolean() &&
                timedOutLevel.RootElement.GetProperty("timedOut").GetBoolean() &&
                timedOutLevel.RootElement.GetProperty("elapsedMs").GetInt64() >= 1000,
-            "game_load_level reports an acknowledged readiness timeout with its pre-request snapshot");
+            "game_load_level reports an acknowledged readiness timeout with its pre-request snapshot: " +
+            timedOutLevel.RootElement.GetRawText());
     Interlocked.Exchange(ref delayNextLevelRequest, 1);
     using (var unacknowledgedLevel = await ApiToolJsonAsync("game_load_level", new { levelId = "Arena", mode = "Sandbox", waitUntilReady = true, timeoutMs = 40 }))
     {
@@ -732,6 +737,32 @@ async Task CheckApiToolsAsync()
         Assert(toolNames.Contains(toolName), $"{toolName} is exposed through tools/list");
     var toolDefinitions = list.RootElement.GetProperty("result").GetProperty("tools").EnumerateArray()
         .ToDictionary(tool => tool.GetProperty("name").GetString()!, tool => tool, StringComparer.Ordinal);
+    var launchInputSchema = toolDefinitions["game_launch"].GetProperty("inputSchema");
+    var launchArgumentsRequired = launchInputSchema.TryGetProperty("required", out var requiredArguments) &&
+        requiredArguments.ValueKind == JsonValueKind.Array &&
+        requiredArguments.EnumerateArray().Any(argument => argument.GetString() == "arguments");
+    var launchArgumentItems = launchInputSchema.GetProperty("properties").GetProperty("arguments").GetProperty("items");
+    var launchItemType = launchArgumentItems.GetProperty("type");
+    var launchItemTypes = launchItemType.ValueKind switch
+    {
+        JsonValueKind.String => new[] { launchItemType.GetString() },
+        JsonValueKind.Array => launchItemType.EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.String)
+            .Select(item => item.GetString()).ToArray(),
+        _ => Array.Empty<string?>(),
+    };
+    Assert(!launchArgumentsRequired && launchItemTypes.Contains("string") && !launchItemTypes.Contains("null"),
+        "game_launch schema allows omitted arguments and rejects null array items");
+    var priorLaunchSchema = JsonNode.Parse(launchInputSchema.GetRawText())!.AsObject();
+    priorLaunchSchema["properties"]!["arguments"]!["items"]!["type"] =
+        new JsonArray(JsonValue.Create("string"), JsonValue.Create("null"));
+    var priorSchemaBytes = Encoding.UTF8.GetByteCount(priorLaunchSchema.ToJsonString());
+    var currentSchemaBytes = Encoding.UTF8.GetByteCount(launchInputSchema.GetRawText());
+    Console.WriteLine($"game_launch inputSchema bytes (nullable-item baseline -> fixed): {priorSchemaBytes} -> {currentSchemaBytes} ({currentSchemaBytes - priorSchemaBytes} bytes)");
+    Assert(currentSchemaBytes < priorSchemaBytes, "game_launch truthful schema reduces its measured byte size");
+    using var nullLaunchArguments = await ToolAsync("game_launch", new { arguments = new string?[] { null } });
+    Assert(IsError(nullLaunchArguments) && ErrorText(nullLaunchArguments).Contains("index 0", StringComparison.Ordinal),
+        "game_launch tool invocation rejects null argument items at runtime");
     var evaluateTool = toolDefinitions["evaluate_csharp"];
     var statusAnnotations = toolDefinitions["game_status"].GetProperty("annotations");
     var evaluateAnnotations = evaluateTool.GetProperty("annotations");
@@ -775,6 +806,8 @@ async Task CheckApiToolsAsync()
         "unknown game_guide topics list the available topics");
     Assert(evaluateTool.GetProperty("outputSchema").GetProperty("type").GetString() == "object",
         "tools/list exposes the structured result schema");
+    using var invalidLaunchArgument = await ToolAsync("game_launch", new { arguments = new string?[] { null } });
+    Assert(IsError(invalidLaunchArgument), "game_launch rejects null argument items at runtime");
     using var installationResponse = await ToolAsync("game_installations", new { });
     using var installationText = JsonDocument.Parse(ErrorText(installationResponse));
     var installationStructure = installationResponse.RootElement.GetProperty("result").GetProperty("structuredContent");
@@ -1366,11 +1399,11 @@ async Task CheckCatalogToolsAsync()
     File.Delete(catalogArchivePath);
     WritePackage(catalogArchivePath, ("Levels/Level_Changed.json", levelJson));
     using var stalePage = await ToolAsync("catalog_read", new { entryId, snapshotId, startLine = 1, lineCount = 3 });
+    var staleSnapshotError = stalePage.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("error");
     Assert(IsError(stalePage) &&
-           ErrorText(stalePage).Contains(
-               "snapshotId is not for the current bas.jsondb archive; rerun catalog_search, then use its current entryId and snapshotId together.",
-               StringComparison.Ordinal),
-        "stale catalog snapshot error gives the current entryId and snapshotId recovery sequence");
+           staleSnapshotError.GetProperty("code").GetString() == "catalog.snapshot_stale" &&
+           staleSnapshotError.GetProperty("recovery").GetProperty("tool").GetString() == "catalog_search",
+        "stale catalog snapshot error exposes structured catalog_search recovery");
 }
 
 static bool IsReadOnlyTool(JsonElement tool) =>

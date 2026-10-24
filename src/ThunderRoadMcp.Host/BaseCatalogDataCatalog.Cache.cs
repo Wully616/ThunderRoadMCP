@@ -7,7 +7,7 @@ using System.Text.Json;
 
 public sealed partial class BaseCatalogDataCatalog
 {
-    private const int CatalogCacheSchema = 1;
+    private const int CatalogCacheSchema = 2;
     private const long MaxCatalogIndexMemoryBytes = 64L * 1024 * 1024;
     private const long MaxCachedSearchStringMemoryBytes = 64L * 1024 * 1024;
     private const long MaxCachedStringBytesPerRecord = 2L * 1024 * 1024;
@@ -376,7 +376,7 @@ public sealed partial class BaseCatalogDataCatalog
                 CatalogMetadata? metadata = null;
                 if (reader.ReadBoolean())
                     metadata = new CatalogMetadata(ReadNullableCacheString(reader), ReadNullableCacheString(reader),
-                        ReadNullableCacheString(reader), ReadNullableCacheString(reader));
+                        ReadNullableCacheString(reader), ReadNullableCacheString(reader), ReadNullableCacheString(reader));
                 string[]? searchableStrings = null;
                 if (reader.ReadBoolean())
                 {
@@ -495,6 +495,7 @@ public sealed partial class BaseCatalogDataCatalog
                         WriteNullableCacheString(writer, metadata.Name);
                         WriteNullableCacheString(writer, metadata.FullType);
                         WriteNullableCacheString(writer, metadata.Type);
+                        WriteNullableCacheString(writer, metadata.LocalizationId);
                     }
                     writer.Write(record.SearchableStrings is not null);
                     if (record.SearchableStrings is { } values)
@@ -547,7 +548,8 @@ public sealed partial class BaseCatalogDataCatalog
                     bytes += SerializedNullableCacheStringBytes(metadata.Id) +
                              SerializedNullableCacheStringBytes(metadata.Name) +
                              SerializedNullableCacheStringBytes(metadata.FullType) +
-                             SerializedNullableCacheStringBytes(metadata.Type);
+                             SerializedNullableCacheStringBytes(metadata.Type) +
+                             SerializedNullableCacheStringBytes(metadata.LocalizationId);
                 }
                 bytes += 1;
                 if (record.SearchableStrings is { } values)
@@ -602,7 +604,8 @@ public sealed partial class BaseCatalogDataCatalog
         var bytes = 96L + record.Path.Length * sizeof(char);
         if (record.Metadata is { } metadata)
             bytes += EstimateStringMemory(metadata.Id) + EstimateStringMemory(metadata.Name) +
-                     EstimateStringMemory(metadata.FullType) + EstimateStringMemory(metadata.Type);
+                     EstimateStringMemory(metadata.FullType) + EstimateStringMemory(metadata.Type) +
+                     EstimateStringMemory(metadata.LocalizationId);
         if (record.SearchableStrings is { } values)
             bytes += EstimateStringListMemory(values);
         return bytes;

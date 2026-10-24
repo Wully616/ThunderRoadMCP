@@ -26,9 +26,9 @@ public static class GameTools
         });
 
     [McpServerTool(Name = "game_launch", Title = "Launch Blade & Sorcery", OpenWorld = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
-    [Description("Start the selected game installation and return its PID without waiting for bridge readiness. On cold start, explicitly pass arguments [\"-level\", \"Home\"] unless the user requested another level; pass that target directly as the startup -level argument. The bridge initializes only after main-menu/Home startup, so use game_wait_ready or game_status before bridge-backed calls. Optional raw arguments override the launch.json array and are preserved by game_restart.")]
+    [Description("Start the selected game installation and return its PID without waiting for bridge readiness. On cold start, explicitly pass arguments [\"-level\", \"Home\"] unless the user requested another level; pass that target directly as the startup -level argument. The bridge initializes only after main-menu/Home startup, so use game_wait_ready or game_status before bridge-backed calls. Optional raw arguments override the launch.json array and are preserved by game_restart; every argument must be non-null.")]
     public static Task<CallToolResult> GameLaunch(GameProcess gameProcess,
-        [Description("Optional raw process arguments, at most 64 strings of 4096 characters each; omit to use launch.json.")] string[]? arguments = null,
+        [Description("Optional raw process arguments, at most 64 non-null strings of 4096 characters each; omit to use launch.json.")] string[]? arguments = null,
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(() => gameProcess.LaunchAsync(arguments, cancellationToken));
 
@@ -280,12 +280,12 @@ public static class GameTools
         ToolInvocation.Run(() => gameProcess.RestartAsync(force, cancellationToken));
 
     [McpServerTool(Name = "evaluate_csharp", Title = "Evaluate trusted C# in the game", Destructive = true, OpenWorld = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
-    [Description("Compile and run trusted arbitrary C# in the game, without a sandbox and with full game-process and filesystem access. Runs synchronously on Unity's main thread; timeout cannot stop code already running.")]
+    [Description("Compile and run trusted arbitrary C# in the game, without a sandbox and with full game-process and filesystem access. Runs synchronously on Unity's main thread; timeout cannot stop code already running. Error results report executionOutcome: not_started, completed_result_unavailable, or unknown; never automatically retry an unknown outcome.")]
     public static Task<CallToolResult> EvaluateCSharp(BridgeClient bridgeClient,
         [Description("Synchronous C# statement body that returns a JSON-serializable value.")] string code,
         [Description("Evaluation deadline in milliseconds, from 1 to 30000; a running snippet cannot be interrupted.")] int timeoutMs = 30000,
         CancellationToken cancellationToken = default) =>
-        ToolInvocation.Run(() =>
+        ToolInvocation.RunEvaluation(() =>
         {
             if (timeoutMs is < 1 or > 30_000)
                 throw new ArgumentOutOfRangeException(nameof(timeoutMs), "timeoutMs must be between 1 and 30000; for longer work start a managed coroutine with McpRuntime.Current.StartManagedCoroutine and poll game_runtime(action:\"list\").");

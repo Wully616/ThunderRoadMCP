@@ -30,6 +30,7 @@ internal static class BridgeSelfTest
         }
         if (args.Length != 1) throw new ArgumentException("Pass the packaged Roslyn payload directory, or --validate-examples <payload-directory> <report-path>.");
         CSharpEvaluator.Configure(Path.GetFullPath(args[0]));
+        BridgeResultContractCheck.Run();
         VerifyExampleCompilation();
         VerifyReferenceSourcePrecedence(managed);
         object arithmetic = CSharpEvaluator.Compile("return 6 * 7;", CancellationToken.None)();
@@ -555,9 +556,10 @@ internal static class BridgeSelfTest
             }, failedTimings);
             throw new Exception("Expected the timed evaluation failure.");
         }
-        catch (InvalidOperationException ex)
+        catch (BridgeEvaluationException ex)
         {
-            Assert(ex.Message == "timed failure", "timed evaluation failure propagation");
+            Assert(ex.errorCode == "evaluation.invocation_failed" && ex.executionOutcome == "unknown" &&
+                   ex.Message.Contains("timed failure"), "timed evaluation failure propagation");
         }
         finally
         {
@@ -577,9 +579,10 @@ internal static class BridgeSelfTest
             }, CancellationToken.None, compilationTimings).GetAwaiter().GetResult();
             throw new Exception("Expected the timed compilation failure.");
         }
-        catch (InvalidOperationException ex)
+        catch (BridgeEvaluationException ex)
         {
-            Assert(ex.Message.Contains("CS0103"), "timed compilation failure propagation");
+            Assert(ex.errorCode == "evaluation.compilation_failed" && ex.executionOutcome == "not_started" &&
+                   ex.Message.Contains("CS0103"), "timed compilation failure propagation");
         }
         finally
         {
@@ -620,7 +623,11 @@ internal static class BridgeSelfTest
                 dispatch.GetAwaiter().GetResult();
                 throw new Exception("Expected queued evaluation cancellation.");
             }
-            catch (OperationCanceledException) { }
+            catch (BridgeEvaluationException exception)
+            {
+                Assert(exception.errorCode == "evaluation.not_started" && exception.executionOutcome == "not_started",
+                    "queued cancellation reports a not-started evaluation");
+            }
             MainThreadQueue.Drain();
         }
         timings.Complete();

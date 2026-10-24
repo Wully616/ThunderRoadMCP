@@ -11,7 +11,7 @@ public static class ApiNavigationTools
     public static Task<CallToolResult> ApiFindCallers(InstalledApiCatalog catalog, string assemblyId, string symbolId,
         [Description("Required search scope: assembly or snapshot.")] string scope,
         [Description("Zero-based result offset.")] int offset = 0,
-        [Description("Maximum results, 1 to 100.")] int limit = 50,
+        [Description("Maximum results, 1 to 100; default 20.")] int limit = 20,
         [Description("Snapshot ID from the previous page.")] string? snapshotId = null,
         [Description("Include the full searched-assembly list and every diagnostic; default returns counts and the first 5 diagnostics.")] bool includeDiagnostics = false,
         CancellationToken cancellationToken = default) =>
@@ -21,7 +21,7 @@ public static class ApiNavigationTools
     [Description("Decode the direct IL operands of an exact method symbol. Targets without an exact installed metadata definition remain unresolved references, not source IDs. Abstract, external, and runtime-provided methods have no IL body. No runtime dispatch or callback guarantee is implied.")]
     public static Task<CallToolResult> ApiFindCallees(InstalledApiCatalog catalog, string assemblyId, string symbolId,
         [Description("Zero-based result offset.")] int offset = 0,
-        [Description("Maximum results, 1 to 100.")] int limit = 50,
+        [Description("Maximum results, 1 to 100; default 20.")] int limit = 20,
         [Description("Snapshot ID from the previous page.")] string? snapshotId = null,
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(() => catalog.FindCalleesAsync(assemblyId, symbolId, offset, limit, snapshotId, cancellationToken));
@@ -31,7 +31,7 @@ public static class ApiNavigationTools
     public static Task<CallToolResult> ApiFindUsages(InstalledApiCatalog catalog, string assemblyId, string symbolId,
         [Description("Required search scope: assembly or snapshot.")] string scope,
         [Description("Zero-based result offset.")] int offset = 0,
-        [Description("Maximum results, 1 to 100.")] int limit = 50,
+        [Description("Maximum results, 1 to 100; default 20.")] int limit = 20,
         [Description("Snapshot ID from the previous page.")] string? snapshotId = null,
         [Description("Include the full searched-assembly list and every diagnostic; default returns counts and the first 5 diagnostics.")] bool includeDiagnostics = false,
         CancellationToken cancellationToken = default) =>

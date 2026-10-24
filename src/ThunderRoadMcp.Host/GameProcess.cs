@@ -230,14 +230,15 @@ public sealed class GameProcess
         return LaunchPending(_ownedProcess, launched: true, _launchedArguments);
     }
 
-    private static string[] ValidateLaunchArguments(string[] arguments)
+    internal static string[] ValidateLaunchArguments(string[] arguments)
     {
         if (arguments.Length > MaxLaunchArgumentCount)
             throw new ArgumentException($"At most {MaxLaunchArgumentCount} launch arguments are supported.");
         var copy = new string[arguments.Length];
         for (var index = 0; index < arguments.Length; index++)
         {
-            var argument = arguments[index] ?? throw new ArgumentException("Launch arguments must be strings.");
+            var argument = arguments[index] ??
+                throw new ArgumentException($"Launch argument at index {index} must not be null.", nameof(arguments));
             if (argument.Length > MaxLaunchArgumentLength)
                 throw new ArgumentException($"Each launch argument must be at most {MaxLaunchArgumentLength} characters.");
             copy[index] = argument;

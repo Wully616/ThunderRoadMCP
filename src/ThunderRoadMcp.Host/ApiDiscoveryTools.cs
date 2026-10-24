@@ -145,17 +145,17 @@ public static class ApiDiscoveryTools
         [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
         CancellationToken cancellationToken = default) =>
         ToolInvocation.Run(() => catalog.TypeAsync(assemblyId, typeSymbolId, includeInherited, includeNonPublic, name, kind, offset, limit, snapshotId, cancellationToken));
-[McpServerTool(Name = "api_lookup", Title = "Find an installed API for a task", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
-[Description("Recommended first discovery tool. A natural-language query defaults to ranked task mode: it returns metadata-only declarations, bounded signatures/type context, related catalog records, and evidence-labelled examples without eager decompilation. Use mode=\"symbol\" for the legacy exact-symbol/source lookup, or pass exact assemblyId and symbolId to receive its source directly. Task mode never executes installed code; its executionContract explains the separate evaluator constraints. Continuations are bound to the exact query, options, ranking version, and full installed snapshot. Query modes take the same scope as api_search: installed (game plus enabled mods; offline modding), loaded (only what the running game loaded; for evaluate_csharp), or auto (default: loaded when the bridge is connected, otherwise installed). Disabled mod folders are never included.")]
-public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCatalogDataCatalog baseCatalog, GameProcess gameProcess,
+    [McpServerTool(Name = "api_lookup", Title = "Find an installed API for a task", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
+    [Description("Recommended first discovery tool. A natural-language query defaults to compact ranked task mode with up to three metadata-only declarations and bounded context; curated examples are opt-in with includeExamples=true. Use mode=\"symbol\" for exact-symbol/source lookup, or pass exact assemblyId and symbolId to receive its source directly. Task mode never executes installed code; its executionContract explains the separate evaluator constraints. Continuations are bound to the exact query, options, ranking version, and full installed snapshot. Query modes use api_search scope rules: installed (enabled mods on disk), loaded (mods loaded by the running game), or auto (loaded when the bridge is connected, otherwise installed). Disabled mod folders are never included.")]
+    public static Task<CallToolResult> ApiLookup(InstalledApiCatalog catalog, BaseCatalogDataCatalog baseCatalog, GameProcess gameProcess,
     [Description("Natural-language task or exact type/member text. Task mode accepts up to 2048 characters. Omit when passing the exact assemblyId and symbolId pair.")] string? query = null,
     [Description("Optional assemblyId restriction from api_assemblies or a previous lookup.")] string? assemblyId = null,
     [Description("Exact symbolId returned by api_search, api_lookup, or api_type. Requires assemblyId and no query.")] string? symbolId = null,
     [Description("Lookup mode: task (default for query; ranked metadata/context) or symbol (query plus reconstructed source). Exact assemblyId+symbolId uses symbol mode.")] string? mode = null,
     [Description("Optional task/symbol query kind, such as type, method, field, or property.")] string? kind = null,
-    [Description("Maximum task-mode result declarations, 1 to 20.")] int maxResults = 5,
-    [Description("Maximum serialized JSON response length in characters, 3000 to 32000.")] int maxChars = 16000,
-    [Description("Include the highest-ranked relevant curated example with explicit evidence labels.")] bool includeExamples = true,
+    [Description("Maximum task-mode result declarations, 1 to 20; default 3.")] int maxResults = 3,
+    [Description("Maximum serialized JSON response length in characters, 3000 to 32000; default 8000.")] int maxChars = 8000,
+    [Description("Include the highest-ranked relevant curated example with explicit evidence labels; opt in for additional context.")] bool includeExamples = false,
     [Description("Stable task-mode continuation token. Repeat the same query, options, and snapshot.")] string? continuation = null,
     [Description("One-based first source line in symbol mode.")] int startLine = 1,
     [Description("Number of source lines to return in symbol mode.")] int lineCount = 200,

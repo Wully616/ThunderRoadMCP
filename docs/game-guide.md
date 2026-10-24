@@ -175,7 +175,7 @@ Use `source:"current"` and `source:"previous"` to read `Player.log` and `Player-
 - `timeoutMs` (1 to 30000, default 30000; the host rejects other values as `request.invalid`) bounds compilation, queue wait, and dispatch. It cannot interrupt a method that is already running; a long loop keeps blocking the game after the error is returned. For longer work, start a managed coroutine and poll `game_runtime(action:"list")`. An MCP client can enforce its own request timeout that is shorter than `timeoutMs`, so keep each call short. `game_wait_ready` and `game_load_level` with `waitUntilReady` send MCP progress notifications about every 5 seconds when the client supplies a progress token; if the client times out first, poll again with `game_wait_ready` and a smaller `timeoutMs` rather than repeating a load.
 - Every successful eval leaves a compiled assembly loaded until the game process restarts. Prefer a small number of purposeful snippets over a stream of one-liners.
 - The code is trusted arbitrary C# with full game-process and filesystem access. Prefer read-only probes; mutate only when that is the goal.
-- Runtime exceptions come back as errors with the exception message; compile diagnostics refer to `evaluation.cs` line numbers.
+- Runtime exceptions return bounded exception type, message, and stack details; compiler diagnostics report physical line and column in the submitted snippet, unaffected by `#line` directives. Errors include `executionOutcome`: `not_started`, `completed_result_unavailable`, or `unknown`; do not automatically retry an `unknown` evaluation.
 
 ## Unity 2021.3 guidance
 

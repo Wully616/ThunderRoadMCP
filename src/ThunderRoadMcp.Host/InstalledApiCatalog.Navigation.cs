@@ -129,6 +129,7 @@ public sealed partial class InstalledApiCatalog
                         (scope != "assembly" || index.Assemblies[reference.AssemblyIndex].Id == selected.Id))
                         .Select(reference => reference with { potentialVirtualDispatch = true }));
         }
+        matched = DeduplicateCallSites(matched);
         matched.Sort(static (left, right) =>
         {
             var result = left.AssemblyIndex.CompareTo(right.AssemblyIndex);
@@ -144,16 +145,19 @@ public sealed partial class InstalledApiCatalog
         if (queryLimited) diagnostics = diagnostics.Append($"Target results stopped at the {NavigationMaxResults} result safety limit.").ToArray();
         var response = new Dictionary<string, object?>
         {
-            ["results"] = page, ["total"] = total, ["offset"] = offset, ["limit"] = limit, ["hasMore"] = hasMore,
+            ["total"] = total, ["offset"] = offset, ["limit"] = limit, ["hasMore"] = hasMore,
             ["nextOffset"] = hasMore ? offset + page.Length : (int?)null, ["snapshotId"] = snapshot.Id, ["scope"] = scope,
             ["searchedAssemblyCount"] = searchedAssemblies.Length, ["unresolvedReferences"] = unresolvedReferences,
             ["complete"] = complete && !queryLimited, ["diagnosticCount"] = diagnostics.Length,
             ["diagnostics"] = includeDiagnostics ? diagnostics : diagnostics.Take(5).ToArray(),
+            ["results"] = page,
         };
         if (includeDiagnostics)
             response["searchedAssemblies"] = searchedAssemblies;
         return SerializeResponse(response);
     }
+    internal static List<NavigationEdge> DeduplicateCallSites(IEnumerable<NavigationEdge> edges) =>
+        edges.DistinctBy(edge => (edge.AssemblyIndex, edge.MethodToken, edge.ilOffset)).ToList();
     private async Task<NavigationQueryScan> ScanNavigationOverflowAsync(CatalogSnapshot snapshot,
         NavigationAssembly[] assemblies, ResolvedNavigationTarget target, string mode, CancellationToken cancellationToken)
     {
@@ -713,7 +717,7 @@ public sealed partial class InstalledApiCatalog
     private sealed record ResolvedNavigationTarget(string AssemblyId, int Token, int[] Tokens, NavigationTargetKey[] PotentialTargets);
     private sealed record NavigationResult(string assemblyId, string assemblyName, string origin, string relativePath,
         string symbolId, string method, string opcode, int ilOffset, string operandKind, string matchKind);
-    private readonly record struct NavigationEdge(int AssemblyIndex, int MethodToken, string opcode, int ilOffset,
+    internal readonly record struct NavigationEdge(int AssemblyIndex, int MethodToken, string opcode, int ilOffset,
         IlOperandType operandKind, bool potentialVirtualDispatch = false);
     private readonly record struct DecodedReference(EntityHandle Token, string Kind, string opcode, int ilOffset, IlOperandType operandKind);
     private sealed record NavigationAssembly(string Id, string Name, string Origin, string RelativePath);

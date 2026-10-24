@@ -10,6 +10,7 @@ public sealed class BridgeClient
     private static readonly string BridgeConfigPath = Environment.GetEnvironmentVariable("THUNDERROAD_MCP_CONFIG")
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ThunderRoadMcp", "bridge.json");
     private static readonly JsonSerializerOptions ConfigJsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private static readonly JsonDocumentOptions BridgeResponseJsonOptions = new() { MaxDepth = 64 };
     private const double MaxBridgeTimingMs = 60_000;
     private static readonly byte[] LineEnding = "\n"u8.ToArray();
     private static readonly HashSet<string> BridgeTimingNames = new(StringComparer.Ordinal)
@@ -100,26 +101,39 @@ public sealed class BridgeClient
         if (!hasLineEnd)
             throw new IOException("Bridge response exceeds the 64 KiB line limit.");
         ToolTiming.Count("bridge.responseBytes", responseBytes.WrittenCount + LineEnding.Length);
-        JsonDocument document;
+        string result;
         using (ToolTiming.Measure("bridgeResponseParseMs"))
-            document = JsonDocument.Parse(responseBytes.WrittenMemory);
-        using (document)
+            result = ParseResponse(responseBytes.WrittenMemory, id);
+        return result;
+    }
+
+    internal static string ParseResponse(ReadOnlyMemory<byte> responseBytes, string id)
+    {
+        using var document = JsonDocument.Parse(responseBytes, BridgeResponseJsonOptions);
+        var root = document.RootElement;
+        if (root.GetProperty("id").GetString() != id)
+            throw new IOException("Bridge response ID did not match the request.");
+        if (ToolTiming.Enabled &&
+            root.TryGetProperty("timings", out var timings) && timings.ValueKind == JsonValueKind.Object)
+            foreach (var timing in timings.EnumerateObject())
+                if (BridgeTimingNames.Contains(timing.Name) &&
+                    timing.Value.ValueKind == JsonValueKind.Number &&
+                    timing.Value.TryGetDouble(out var milliseconds) &&
+                    double.IsFinite(milliseconds) && milliseconds is >= 0 and <= MaxBridgeTimingMs)
+                    ToolTiming.Add(timing.Name, milliseconds);
+        if (!root.GetProperty("success").GetBoolean())
         {
-            var root = document.RootElement;
-            if (root.GetProperty("id").GetString() != id)
-                throw new IOException("Bridge response ID did not match the request.");
-            if (ToolTiming.Enabled &&
-                root.TryGetProperty("timings", out var timings) && timings.ValueKind == JsonValueKind.Object)
-                foreach (var timing in timings.EnumerateObject())
-                    if (BridgeTimingNames.Contains(timing.Name) &&
-                        timing.Value.ValueKind == JsonValueKind.Number &&
-                        timing.Value.TryGetDouble(out var milliseconds) &&
-                        double.IsFinite(milliseconds) && milliseconds is >= 0 and <= MaxBridgeTimingMs)
-                        ToolTiming.Add(timing.Name, milliseconds);
-            if (!root.GetProperty("success").GetBoolean())
-                throw new InvalidOperationException(root.GetProperty("error").GetString() ?? "Bridge request failed.");
-            return root.GetProperty("result").GetRawText();
+            var errorCode = root.TryGetProperty("errorCode", out var errorCodeElement) &&
+                errorCodeElement.ValueKind == JsonValueKind.String ? errorCodeElement.GetString() : null;
+            var executionOutcome = root.TryGetProperty("executionOutcome", out var outcomeElement) &&
+                outcomeElement.ValueKind == JsonValueKind.String ? outcomeElement.GetString() : null;
+            JsonElement? diagnostics = root.TryGetProperty("diagnostics", out var diagnosticElement)
+                ? diagnosticElement.Clone()
+                : null;
+            throw new BridgeRequestException(root.GetProperty("error").GetString() ?? "Bridge request failed.",
+                errorCode, executionOutcome, diagnostics);
         }
+        return root.GetProperty("result").GetRawText();
     }
 
 

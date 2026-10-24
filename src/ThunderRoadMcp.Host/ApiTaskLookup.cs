@@ -181,6 +181,7 @@ public sealed partial class InstalledApiCatalog
         IReadOnlyList<CatalogTaskRecord> catalogRecords = Array.Empty<CatalogTaskRecord>();
         IReadOnlyList<string> catalogOmittedTerms = Array.Empty<string>();
         var catalogComplete = false;
+        var catalogLocalizedSearchComplete = false;
         if (baseCatalog is not null)
         {
             try
@@ -195,6 +196,7 @@ public sealed partial class InstalledApiCatalog
                 catalogRecords = catalogResult.Records;
                 catalogOmittedTerms = catalogResult.OmittedTerms;
                 catalogComplete = catalogResult.IsComplete;
+                catalogLocalizedSearchComplete = catalogResult.LocalizedSearchComplete;
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
@@ -250,6 +252,7 @@ public sealed partial class InstalledApiCatalog
                 ["snapshotId"] = catalogSnapshotId,
                 ["records"] = new JsonArray(),
                 ["complete"] = catalogComplete,
+                ["localizedSearchComplete"] = catalogLocalizedSearchComplete,
             },
             ["examples"] = new JsonArray(),
             ["executionContract"] = new JsonObject

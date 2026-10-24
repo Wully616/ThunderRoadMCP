@@ -8,12 +8,15 @@ using System.Threading;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Emit;
+using Microsoft.CodeAnalysis.Text;
 using ThunderRoad;
 
 namespace ThunderRoadMcp.Compiler
 {
     public static class CSharpEvaluator
     {
+        private const string SourcePrefix = "using System; using System.Linq; using System.Collections.Generic; using UnityEngine; using ThunderRoad; using ThunderRoadMcp.Bridge; " +
+            "public static class __ThunderRoadMcpEvaluation { public static object Run() {\n#line 1 \"evaluation.cs\"\n";
         private static readonly HashSet<string> CompilerDependencyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "ThunderRoadMcp.Compiler",
@@ -40,7 +43,7 @@ namespace ThunderRoadMcp.Compiler
             Action<string, double> recordTiming)
         {
             CSharpCompilation compilation = CreateCompilation(code, bridgeAssemblyPath, token, recordTiming);
-            using (MemoryStream image = Emit(compilation, token, recordTiming))
+            using (MemoryStream image = Emit(compilation, code, token, recordTiming))
             {
                 token.ThrowIfCancellationRequested();
                 Assembly assembly = Measure("assemblyLoadMs", recordTiming, () => Assembly.Load(image.ToArray()));
@@ -59,7 +62,7 @@ namespace ThunderRoadMcp.Compiler
             Action<string, double> recordTiming)
         {
             CSharpCompilation compilation = CreateCompilation(code, bridgeAssemblyPath, token, recordTiming);
-            using (Emit(compilation, token, recordTiming)) { }
+            using (Emit(compilation, code, token, recordTiming)) { }
         }
 
         private static CSharpCompilation CreateCompilation(string code, string bridgeAssemblyPath, CancellationToken token,
@@ -69,8 +72,7 @@ namespace ThunderRoadMcp.Compiler
             if (string.IsNullOrWhiteSpace(bridgeAssemblyPath) || !File.Exists(bridgeAssemblyPath))
                 throw new FileNotFoundException("Bridge assembly not found.", bridgeAssemblyPath);
             string fullBridgeAssemblyPath = Path.GetFullPath(bridgeAssemblyPath);
-            const string prefix = "using System; using System.Linq; using System.Collections.Generic; using UnityEngine; using ThunderRoad; using ThunderRoadMcp.Bridge; " +
-                "public static class __ThunderRoadMcpEvaluation { public static object Run() {\n#line 1 \"evaluation.cs\"\n";
+            const string prefix = SourcePrefix;
             const string suffix = "\n#line default\n} }";
             string source = prefix + code + suffix;
             SyntaxTree syntax = Measure("parseMs", recordTiming,
@@ -85,7 +87,8 @@ namespace ThunderRoadMcp.Compiler
                 new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: OptimizationLevel.Release));
         }
 
-        private static MemoryStream Emit(CSharpCompilation compilation, CancellationToken token, Action<string, double> recordTiming)
+        private static MemoryStream Emit(CSharpCompilation compilation, string code, CancellationToken token,
+            Action<string, double> recordTiming)
         {
             var image = new MemoryStream();
             try
@@ -93,9 +96,14 @@ namespace ThunderRoadMcp.Compiler
                 EmitResult emitted = Measure("emitMs", recordTiming, () => compilation.Emit(image, cancellationToken: token));
                 if (!emitted.Success)
                 {
-                    string diagnostics = string.Join(Environment.NewLine,
-                        emitted.Diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error).Select(d => d.ToString()));
-                    throw new InvalidOperationException("C# compilation failed:" + Environment.NewLine + diagnostics);
+                    var diagnostics = string.Join(Environment.NewLine, emitted.Diagnostics.Select(d => d.ToString()));
+
+                    const string prefix = SourcePrefix;
+                    var codeSource = SourceText.From(code);
+                    var structured = emitted.Diagnostics
+                        .Select(d => CreateDiagnosticInfo(d, prefix.Length, codeSource))
+                        .ToArray();
+                    throw new EvaluationCompilationException("C# compilation failed:" + Environment.NewLine + diagnostics, structured);
                 }
                 token.ThrowIfCancellationRequested();
                 return image;
@@ -105,6 +113,29 @@ namespace ThunderRoadMcp.Compiler
                 image.Dispose();
                 throw;
             }
+        }
+
+        private static EvaluationDiagnosticInfo CreateDiagnosticInfo(Diagnostic diagnostic, int codeStart, SourceText codeSource)
+        {
+            int? line = null;
+            int? column = null;
+            EvaluationDiagnosticSpan span = null;
+            var location = diagnostic.Location;
+            if (location.IsInSource && location.SourceTree != null)
+            {
+                var sourceSpan = location.SourceSpan;
+                var codeOffset = sourceSpan.Start - codeStart;
+                if (codeOffset >= 0 && codeOffset <= codeSource.Length)
+                {
+                    var linePosition = codeSource.Lines.GetLinePosition(codeOffset);
+                    line = linePosition.Line + 1;
+                    column = linePosition.Character + 1;
+                    span = new EvaluationDiagnosticSpan(codeOffset,
+                        Math.Min(sourceSpan.Length, codeSource.Length - codeOffset));
+                }
+            }
+            return new EvaluationDiagnosticInfo(diagnostic.Id, diagnostic.Severity.ToString().ToLowerInvariant(),
+                diagnostic.GetMessage(), line, column, span);
         }
 
         private static T Measure<T>(string name, Action<string, double> recordTiming, Func<T> operation)
@@ -171,4 +202,40 @@ namespace ThunderRoadMcp.Compiler
                 (name != null && name.StartsWith("UnityEngine.", StringComparison.OrdinalIgnoreCase));
         }
     }
+
+    public sealed class EvaluationCompilationException : InvalidOperationException
+    {
+        public IReadOnlyList<EvaluationDiagnosticInfo> Diagnostics { get; }
+        public EvaluationCompilationException(string message, IReadOnlyList<EvaluationDiagnosticInfo> diagnostics) : base(message) =>
+            Diagnostics = diagnostics;
+    }
+
+    public sealed class EvaluationDiagnosticInfo
+    {
+        public string Id { get; }
+        public string Severity { get; }
+        public string Message { get; }
+        public int? Line { get; }
+        public int? Column { get; }
+        public EvaluationDiagnosticSpan Span { get; }
+
+        public EvaluationDiagnosticInfo(string id, string severity, string message, int? line, int? column,
+            EvaluationDiagnosticSpan span)
+        {
+            Id = id;
+            Severity = severity;
+            Message = message;
+            Line = line;
+            Column = column;
+            Span = span;
+        }
+    }
+
+    public sealed class EvaluationDiagnosticSpan
+    {
+        public int Start { get; }
+        public int Length { get; }
+        public EvaluationDiagnosticSpan(int start, int length) { Start = start; Length = length; }
+    }
 }
+

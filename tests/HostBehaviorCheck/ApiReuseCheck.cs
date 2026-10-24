@@ -180,7 +180,7 @@ public static class ApiReuseCheck
         {
             using var restoredLookup = await apiToolJsonAsync("api_lookup", new
             {
-                query = "derived surface", assemblyId = modAssemblyId, maxResults = 10, includeExamples = false,
+                query = "derived surface", assemblyId = modAssemblyId, maxResults = 10, maxChars = 16000, includeExamples = false,
             });
             var baseResolved = restoredLookup.RootElement.GetProperty("relatedTypes").EnumerateArray()
                 .Any(type => type.GetProperty("qualifiedName").GetString() == "Fixture.Base.BaseSurface");

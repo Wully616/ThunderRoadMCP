@@ -1,6 +1,8 @@
 using System.ComponentModel;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -37,10 +39,40 @@ internal static class HostApplication
                 Version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
             };
             options.ServerInstructions = ServerInstructions + " Unknown argument names are rejected; use the exact parameter names from each tool schema. Detailed timing diagnostics require THUNDERROAD_MCP_DIAGNOSTICS=1 in the MCP host process environment before startup; they are not an MCP tool and changing the setting requires restarting the host.";
-        }).WithStdioServerTransport().WithToolsFromAssembly()
+        }).WithStdioServerTransport()
+          .WithTools(Assembly.GetExecutingAssembly().GetTypes().Where(type =>
+              type != typeof(GameTools) && type.GetCustomAttribute<McpServerToolTypeAttribute>() is not null))
           .WithRequestFilters(filters => filters.AddCallToolFilter(ToolInvocation.RejectUnknownArguments));
+        RegisterGameTools(builder.Services);
         await builder.Build().RunAsync();
         return 0;
+    }
+
+    private static void RegisterGameTools(IServiceCollection services)
+    {
+        var launchSchemaOptions = new AIJsonSchemaCreateOptions
+        {
+            TransformSchemaNode = static (context, schema) =>
+            {
+                if (context.TypeInfo.Type == typeof(string[]) &&
+                    schema is JsonObject arraySchema &&
+                    arraySchema["items"] is JsonObject itemSchema)
+                    itemSchema["type"] = "string";
+                return schema;
+            },
+        };
+        foreach (var method in typeof(GameTools).GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+        {
+            if (method.GetCustomAttribute<McpServerToolAttribute>() is null)
+                continue;
+            var schemaOptions = method.Name == nameof(GameTools.GameLaunch) ? launchSchemaOptions : null;
+            services.AddSingleton((Func<IServiceProvider, McpServerTool>)(provider =>
+                McpServerTool.Create(method, options: new()
+                {
+                    Services = provider,
+                    SchemaCreateOptions = schemaOptions,
+                })));
+        }
     }
 
     private static async Task<int> RunCommandAsync(string[] args)
