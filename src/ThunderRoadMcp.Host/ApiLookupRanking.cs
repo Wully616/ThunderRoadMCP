@@ -1,6 +1,6 @@
 internal static class ApiLookupRanker
 {
-    internal const string Version = "evidence-v7-xml-catalog-concepts";
+    internal const string Version = "evidence-v10-action-inflection-prefilter";
     internal const int MaxCandidates = 50_000;
     internal const int MinimumConfidenceScore = 500;
     internal const int MinimumCoveragePercent = 75;
@@ -56,8 +56,10 @@ internal static class ApiLookupRanker
     {
         private readonly string _exactQuery;
         private readonly List<string> _queryTokens;
+        private readonly bool _hasSetterActionSynonymQuery;
         private readonly int _maxCandidates;
         private readonly IReadOnlySet<string> _catalogApiTypes;
+        private readonly string[] _potentialMatchTerms;
         private readonly PriorityQueue<RankedResult, RankedResult> _candidates;
 
         internal CandidateAccumulator(string query, int maxCandidates, IReadOnlySet<string>? catalogApiTypes = null)
@@ -67,8 +69,26 @@ internal static class ApiLookupRanker
                 throw new ArgumentOutOfRangeException(nameof(maxCandidates));
             _exactQuery = query.Trim();
             _queryTokens = QueryTokens(query);
+            _hasSetterActionSynonymQuery = _queryTokens.Any(SetterActionSynonyms.Contains);
             _maxCandidates = maxCandidates;
             _catalogApiTypes = catalogApiTypes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var potentialTerms = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var token in _queryTokens)
+            {
+                if (IsActionToken(token))
+                    continue;
+                potentialTerms.Add(token);
+                if (FindConceptAlias(token) is { } concept)
+                    potentialTerms.Add(concept.CanonicalConcept);
+                foreach (var group in SynonymGroups)
+                    if (group.Contains(token, StringComparer.Ordinal))
+                        foreach (var synonym in group)
+                            potentialTerms.Add(synonym);
+            }
+            foreach (var term in potentialTerms.ToArray())
+                if (term.Length > 2 && term.EndsWith("y", StringComparison.Ordinal))
+                    potentialTerms.Add(term[..^1] + "ies");
+            _potentialMatchTerms = potentialTerms.ToArray();
             _candidates = new PriorityQueue<RankedResult, RankedResult>(WorstFirstComparer);
         }
 
@@ -78,6 +98,8 @@ internal static class ApiLookupRanker
 
         internal void Add(InstalledApiCatalog.ApiHit hit)
         {
+            if (!MightMatch(hit))
+                return;
             var result = RankHit(_exactQuery, _queryTokens, hit, _catalogApiTypes);
             if (!result.HasValue)
                 return;
@@ -108,6 +130,49 @@ internal static class ApiLookupRanker
             Array.Sort(results, CompareRankedResults);
             return results;
         }
+        private bool MightMatch(InstalledApiCatalog.ApiHit hit)
+        {
+            if (hit.qualifiedName.Equals(_exactQuery, StringComparison.OrdinalIgnoreCase))
+                return true;
+            var simpleNameStart = hit.qualifiedName.LastIndexOf('.') + 1;
+            if (hit.qualifiedName.AsSpan(simpleNameStart).Equals(_exactQuery, StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (IsApiTypeKind(hit.kind) && _catalogApiTypes.Contains(hit.qualifiedName))
+                return true;
+            if (_queryTokens.Count == 1 && FindConceptAlias(_queryTokens[0]) is not null &&
+                hit.kind == "method" && hit.qualifiedName.EndsWith(".SpawnAsync", StringComparison.Ordinal) &&
+                hit.declaringType is not null && _catalogApiTypes.Contains(hit.declaringType))
+                return true;
+            foreach (var term in _potentialMatchTerms)
+            {
+                if (ContainsPotentialTerm(hit.qualifiedName, term) ||
+                    ContainsPotentialTerm(hit.declaringType, term) ||
+                    ContainsPotentialTerm(hit.signature, term))
+                    return true;
+                if (hit.xmlDocumentation is not { } documentation)
+                    continue;
+                if (ContainsPotentialTerm(documentation.Summary, term) ||
+                    ContainsPotentialTerm(documentation.Remarks, term) ||
+                    ContainsPotentialTerm(documentation.Returns, term) ||
+                    ContainsPotentialTerm(documentation.Value, term))
+                    return true;
+                if (documentation.Parameters is not null)
+                    foreach (var parameter in documentation.Parameters)
+                        if (ContainsPotentialTerm(parameter.Name, term) ||
+                            ContainsPotentialTerm(parameter.Description, term))
+                            return true;
+                if (documentation.Examples is not null)
+                    foreach (var example in documentation.Examples)
+                        if (ContainsPotentialTerm(example, term))
+                            return true;
+            }
+            return _hasSetterActionSynonymQuery &&
+                   hit.xmlDocumentation is { } setterDocumentation &&
+                   DocumentationContainsSetterLanguage(setterDocumentation);
+        }
+
+        private static bool ContainsPotentialTerm(string? text, string term) =>
+            text?.Contains(term, StringComparison.OrdinalIgnoreCase) == true;
     }
 
     private static RankedResult? RankHit(string exactQuery, IReadOnlyList<string> queryTokens,
@@ -124,10 +189,24 @@ internal static class ApiLookupRanker
         var signatureTokens = Tokenize(hit.signature);
         var exactQualified = hit.qualifiedName.Equals(exactQuery, StringComparison.OrdinalIgnoreCase);
         var exactSimple = simpleName.Equals(exactQuery, StringComparison.OrdinalIgnoreCase);
-        var actionQuery = queryTokens.Any(token => ActionTokens.Contains(token));
+        var actionQuery = queryTokens.Any(IsActionToken);
+        var setterIntent = queryTokens.Any(IsSetterActionToken);
+        var configurationBoolean = setterIntent &&
+            queryTokens.Any(token => ValueTargetTokens.Contains(token)) &&
+            (hit.kind is "property" or "field") &&
+            (Contains(signatureTokens, "bool") || Contains(signatureTokens, "boolean")) &&
+            simpleTokens.Any(ConfigurationFlagTokens.Contains);
+        var writablePropertyAction = !configurationBoolean && hit.kind == "property" &&
+            HasPublicSetter(hit.signature) && setterIntent;
+        var namedAction = hit.kind == "method" && simpleTokens.Any(IsSetterActionToken);
+        var documentedAction = !configurationBoolean && setterIntent &&
+            queryTokens.Any(token => IsSetterActionToken(token) &&
+                                     DocumentationMatchesToken(hit.xmlDocumentation, token));
+        var actionableMutation = setterIntent &&
+            (writablePropertyAction || namedAction || documentedAction);
         var matched = 0;
         var meaningfulMatched = 0;
-        var meaningfulQueryTokens = queryTokens.Count(token => !ActionTokens.Contains(token));
+        var meaningfulQueryTokens = queryTokens.Count(token => !IsActionToken(token));
         var direct = false;
         var documentationMatch = false;
         var catalogTypeName = IsApiTypeKind(hit.kind) ? hit.qualifiedName : null;
@@ -136,49 +215,63 @@ internal static class ApiLookupRanker
             hit.declaringType is not null && catalogApiTypes?.Contains(hit.declaringType) == true;
         var catalogTypeMatch = catalogTypeName is not null && catalogApiTypes?.Contains(catalogTypeName) == true;
         var catalogMatch = catalogTypeMatch || conceptSpawnMatch;
+        var conceptTypeAgreement = HasConceptTypeAgreement(queryTokens, hit);
         var score = exactQualified ? 12000 : exactSimple ? 11000 : 0;
         if (!exactQualified && !exactSimple)
-            score += conceptSpawnMatch ? 1900 : catalogTypeMatch ? 900 : 0;
+            score += (conceptSpawnMatch ? 1900 : catalogTypeMatch ? 900 : 0) +
+                     (conceptTypeAgreement ? 800 : 0);
 
         foreach (var token in queryTokens)
         {
-            var inSimple = Contains(simpleTokens, token);
-            var inDeclaring = Contains(declaringTokens, token);
-            var inSignature = Contains(signatureTokens, token);
-            var synonymInSimple = !inSimple && SynonymMatches(token, simpleTokens);
-            var synonymInDeclaring = !inDeclaring && SynonymMatches(token, declaringTokens);
-            var inDocumentation = DocumentationMatchesToken(hit.xmlDocumentation, token);
+            var configurationAction = configurationBoolean && IsSetterActionToken(token);
+            var inSimple = !configurationAction && Contains(simpleTokens, token);
+            var inDeclaring = !configurationAction && Contains(declaringTokens, token);
+            var inSignature = !configurationAction && Contains(signatureTokens, token);
+            var synonymInSimple = !configurationAction && !inSimple && SynonymMatches(token, simpleTokens);
+            var synonymInDeclaring = !configurationAction && !inDeclaring &&
+                SynonymMatches(token, declaringTokens);
+            var inDocumentation = !configurationAction && DocumentationMatchesToken(hit.xmlDocumentation, token);
             var concept = FindConceptAlias(token);
             var inConcept = concept is not null &&
                 (Contains(simpleTokens, concept.CanonicalConcept) ||
                  Contains(declaringTokens, concept.CanonicalConcept) ||
                  Contains(signatureTokens, concept.CanonicalConcept) ||
                  DocumentationContains(hit.xmlDocumentation, concept.CanonicalConcept));
+            var setterAction = actionableMutation && IsSetterActionToken(token);
             if (!inSimple && !inDeclaring && !inSignature && !synonymInSimple && !synonymInDeclaring &&
-                !inDocumentation && !inConcept)
+                !inDocumentation && !inConcept && !setterAction)
                 continue;
             matched++;
-            if (!ActionTokens.Contains(token))
+            if (!IsActionToken(token))
                 meaningfulMatched++;
-            if (inSimple || inDeclaring || inSignature)
+            if (inSimple || inDeclaring || inSignature || setterAction)
                 direct = true;
             documentationMatch |= inDocumentation ||
                 concept is not null && inConcept && DocumentationContains(hit.xmlDocumentation, concept.CanonicalConcept);
             if (!exactQualified && !exactSimple)
             {
                 score += inSimple ? 600 : inSignature ? 180 : inDeclaring ? 120 :
-                    synonymInSimple ? 180 : synonymInDeclaring ? 40 :
-                    inConcept ? 240 : inDocumentation ? 140 : 0;
-                if (actionQuery && inSimple && ActionTokens.Contains(token))
+                    synonymInSimple ? 180 : synonymInDeclaring ? 180 :
+                    inConcept ? 240 : inDocumentation ? 140 : setterAction ? 400 : 0;
+                if (actionQuery && inSimple && IsActionToken(token))
                     score += 400;
+                if (actionQuery && IsActionToken(token) && inDocumentation)
+                    score += 250;
             }
         }
 
+        if (!exactQualified && !exactSimple)
+        {
+            if (writablePropertyAction)
+                score += 350;
+            if (configurationBoolean)
+                score -= 600;
+        }
         var intentBonus = 0;
         if (!exactQualified && !exactSimple)
         {
             intentBonus = GameplayIntentBonus(queryTokens, hit.qualifiedName);
-            score += KindPreference(hit.kind, actionQuery) + intentBonus;
+            score += intentBonus;
         }
         var exact = exactQualified || exactSimple;
         if (!exact && matched == 0 && !catalogMatch)
@@ -201,6 +294,50 @@ internal static class ApiLookupRanker
             documentationMatch, catalogMatch);
     }
 
+    private static bool HasConceptTypeAgreement(IReadOnlyList<string> queryTokens, InstalledApiCatalog.ApiHit hit)
+    {
+        var ownerType = hit.kind is "class" or "struct" or "interface" or "enum" or "delegate" or "type"
+            ? hit.qualifiedName
+            : hit.declaringType;
+        foreach (var token in queryTokens)
+        {
+            var concept = FindConceptAlias(token);
+            if (concept is not null &&
+                (TypeNameMatches(ownerType, concept.RuntimeTypeSimpleName) ||
+                 TypeNameMatches(ownerType, concept.DataTypeSimpleName)))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool TypeNameMatches(string? qualifiedName, string simpleTypeName)
+    {
+        if (string.IsNullOrEmpty(qualifiedName))
+            return false;
+        var separator = Math.Max(qualifiedName.LastIndexOf('.'), qualifiedName.LastIndexOf('+'));
+        var simpleName = qualifiedName.AsSpan(separator + 1);
+        var genericStart = simpleName.IndexOf('`');
+        if (genericStart >= 0)
+            simpleName = simpleName[..genericStart];
+        return simpleName.Equals(simpleTypeName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSetterActionToken(string token) => SetterActionTokens.Contains(token);
+
+    private static bool HasPublicSetter(string signature)
+    {
+        var openingBrace = signature.IndexOf('{');
+        var closingBrace = signature.LastIndexOf('}');
+        if (openingBrace < 0 || closingBrace <= openingBrace)
+            return false;
+        var accessors = signature.AsSpan(openingBrace + 1, closingBrace - openingBrace - 1);
+        var setter = accessors.IndexOf("set;", StringComparison.Ordinal);
+        if (setter < 0)
+            return false;
+        var previousAccessor = accessors[..setter].LastIndexOf(';');
+        var modifier = accessors[(previousAccessor + 1)..setter].Trim();
+        return modifier.IsEmpty || modifier.Equals("public", StringComparison.Ordinal);
+    }
     private static bool DocumentationContains(InstalledApiCatalog.ApiXmlDocumentation? documentation, string token)
     {
         if (documentation is null)
@@ -216,25 +353,54 @@ internal static class ApiLookupRanker
     {
         if (DocumentationContains(documentation, token))
             return true;
+        if (SetterActionSynonyms.Contains(token) && DocumentationContainsSetterLanguage(documentation))
+            return true;
         return SynonymGroups.Any(group => group.Contains(token, StringComparer.Ordinal) &&
             group.Any(candidate => !candidate.Equals(token, StringComparison.Ordinal) &&
                                    DocumentationContains(documentation, candidate)));
     }
-    private static int KindPreference(string kind, bool actionQuery)
+    private static bool DocumentationContainsSetterLanguage(
+        InstalledApiCatalog.ApiXmlDocumentation? documentation)
     {
-        if (!actionQuery)
-            return 0;
-        return kind switch
-        {
-            "method" => 350,
-            "property" => -120,
-            "event" => -80,
-            "constructor" => -300,
-            "field" => -250,
-            "class" or "struct" or "interface" or "enum" or "delegate" or "type" => -200,
-            _ => 0,
-        };
+        if (documentation is null)
+            return false;
+        if (ContainsSetterLanguage(documentation.Summary) ||
+            ContainsSetterLanguage(documentation.Remarks) ||
+            ContainsSetterLanguage(documentation.Returns) ||
+            ContainsSetterLanguage(documentation.Value))
+            return true;
+        if (documentation.Parameters is not null)
+            foreach (var parameter in documentation.Parameters)
+                if (ContainsSetterLanguage(parameter.Name) || ContainsSetterLanguage(parameter.Description))
+                    return true;
+        if (documentation.Examples is not null)
+            foreach (var example in documentation.Examples)
+                if (ContainsSetterLanguage(example))
+                    return true;
+        return false;
     }
+
+    private static bool ContainsSetterLanguage(string? text)
+    {
+        if (text is null)
+            return false;
+        for (var index = 0; index < text.Length;)
+        {
+            while (index < text.Length && !char.IsLetterOrDigit(text[index]))
+                index++;
+            var start = index;
+            while (index < text.Length && char.IsLetterOrDigit(text[index]))
+                index++;
+            if (index <= start)
+                continue;
+            var word = text.AsSpan(start, index - start);
+            foreach (var setterWord in SetterDocumentationWords)
+                if (word.Equals(setterWord, StringComparison.OrdinalIgnoreCase))
+                    return true;
+        }
+        return false;
+    }
+
 
     private static int GameplayIntentBonus(IReadOnlyList<string> queryTokens, string qualifiedName)
     {
@@ -263,6 +429,31 @@ internal static class ApiLookupRanker
         "give", "equip", "set", "get", "find", "load", "save", "start", "stop", "open", "close",
         "apply", "launch", "enable", "disable", "invoke", "call", "play", "kill", "damage", "heal",
         "attach", "detach", "move", "teleport", "follow", "track", "cleanup", "clean",
+        "change", "adjust", "modify", "update",
+    };
+    private static readonly HashSet<string> SetterActionTokens = new(StringComparer.Ordinal)
+    {
+        "set", "change", "adjust", "modify", "update",
+    };
+    private static readonly HashSet<string> ValueTargetTokens = new(StringComparer.Ordinal)
+    {
+        "height", "width", "length", "position", "speed", "direction", "orientation", "rotation",
+        "size", "distance", "velocity", "acceleration",
+    };
+    private static readonly HashSet<string> SetterActionSynonyms = new(StringComparer.Ordinal)
+    {
+        "set", "change", "adjust", "modify", "update", "assign", "write",
+    };
+    private static readonly string[] SetterDocumentationWords =
+    [
+        "set", "setting", "sets", "setter", "setters",
+        "assign", "assigns", "assigned", "assigning",
+        "write", "writes", "written", "writable",
+    ];
+    private static readonly HashSet<string> ConfigurationFlagTokens = new(StringComparer.Ordinal)
+    {
+        "use", "is", "can", "should", "allow", "enable", "enabled", "disable", "disabled",
+        "active", "config", "configuration", "setting", "settings",
     };
 
     private static readonly HashSet<string> StopWords = new(StringComparer.Ordinal)
@@ -291,8 +482,10 @@ internal static class ApiLookupRanker
         ["runtime", "live", "current", "active", "session"],
         ["counter", "count", "total", "number", "metric", "statistics"],
         ["behavior", "behaviour"],
+        ["reference", "ref"],
+        ["direction", "dir", "orientation"],
+        ["water", "ocean"],
     ];
-
     private static bool Contains(IReadOnlyList<string> tokens, string token)
     {
         foreach (var candidate in tokens)
@@ -308,6 +501,8 @@ internal static class ApiLookupRanker
 
     private static bool SynonymMatches(string token, IReadOnlyList<string> candidates)
     {
+        if (SetterActionSynonyms.Contains(token) && candidates.Any(SetterActionSynonyms.Contains))
+            return true;
         foreach (var group in SynonymGroups)
             if (group.Contains(token, StringComparer.Ordinal) &&
                 candidates.Any(candidate => group.Contains(candidate, StringComparer.Ordinal)))
@@ -315,8 +510,6 @@ internal static class ApiLookupRanker
         return false;
     }
 
-    internal static RankedResult ContextResult(InstalledApiCatalog.ApiHit hit) =>
-        new(hit, 0, 0, 0, false, 0, false, true, false, false);
 
     internal static IReadOnlyList<RankedResult> Rank(
         string query, IReadOnlyList<InstalledApiCatalog.ApiHit> hits, int maxResults)
@@ -396,9 +589,9 @@ internal static class ApiLookupRanker
     private static string NormalizeInflection(string token)
     {
         if (token.Length > 6 && token.EndsWith("ing", StringComparison.Ordinal))
-            return RemoveRepeatedFinalConsonant(token[..^3]);
+            return NormalizeRecognizedActionStem(RemoveRepeatedFinalConsonant(token[..^3]));
         if (token.Length > 5 && token.EndsWith("ed", StringComparison.Ordinal))
-            return RemoveRepeatedFinalConsonant(token[..^2]);
+            return NormalizeRecognizedActionStem(RemoveRepeatedFinalConsonant(token[..^2]));
         if (token.Length > 4 && token.EndsWith("ies", StringComparison.Ordinal))
             return token[..^3] + "y";
         if (token.Length > 5 && token.EndsWith("es", StringComparison.Ordinal) &&
@@ -412,6 +605,12 @@ internal static class ApiLookupRanker
             return token[..^1];
         return token;
     }
+    private static string NormalizeRecognizedActionStem(string token) => token switch
+    {
+        "chang" => "change",
+        "updat" => "update",
+        _ => token,
+    };
 
     private static string RemoveRepeatedFinalConsonant(string token) =>
         token.Length > 2 && token[^1] == token[^2] && !"aeiou".Contains(token[^1])

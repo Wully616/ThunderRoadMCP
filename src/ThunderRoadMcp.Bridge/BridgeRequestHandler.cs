@@ -9,6 +9,7 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Text;
+using System.Security.Cryptography;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using ThunderRoad;
@@ -34,12 +35,17 @@ namespace ThunderRoadMcp.Bridge
         public readonly string errorCode;
         public readonly string executionOutcome;
         public readonly object diagnostics;
+        public readonly bool diagnosticsTruncated;
+        public readonly int omittedDiagnosticCount;
         public BridgeEvaluationException(string errorCode, string message, string executionOutcome, object diagnostics = null,
-            Exception innerException = null) : base(message, innerException)
+            Exception innerException = null, bool diagnosticsTruncated = false, int omittedDiagnosticCount = 0)
+            : base(message, innerException)
         {
             this.errorCode = errorCode;
             this.executionOutcome = executionOutcome;
             this.diagnostics = diagnostics;
+            this.diagnosticsTruncated = diagnosticsTruncated;
+            this.omittedDiagnosticCount = omittedDiagnosticCount;
         }
     }
     internal sealed class BridgeResultDepthException : Exception
@@ -51,10 +57,14 @@ namespace ThunderRoadMcp.Bridge
         public object[] loadedAssemblies { get; set; }
         public int loadedAssemblyCount { get; set; }
         public bool loadedAssembliesTruncated { get; set; }
+        public bool inventoryComplete { get; set; }
+        public string inventorySnapshotId { get; set; }
+        internal object[] allLoadedAssemblies;
     }
     internal sealed class BridgeRequestHandler
     {
         internal const int MaxLineBytes = 64 * 1024;
+        private const int MaxLoadedAssemblyPageSize = 32;
         private const int MaxResultDepth = 62;
         private const int MaxLevelIdLength = 256;
         private const int MaxModeLength = 256;
@@ -124,6 +134,23 @@ namespace ThunderRoadMcp.Bridge
                     bool includeAssemblies = GetBoolean(args, "includeAssemblies", false);
                     return new BridgeJsonResult(await AwaitWithCancellation(
                         MainThreadQueue.Enqueue(() => SerializeResult(CreateStatus(includeAssemblies)), token), token).ConfigureAwait(false));
+                case "loaded_assemblies":
+                    long inventoryOffset = GetInteger(args, "offset", 0);
+                    long inventoryLimit = GetInteger(args, "limit", MaxLoadedAssemblyPageSize);
+                    string inventorySnapshotId = GetOptionalString(args, "snapshotId", 80);
+                    if (inventoryOffset < 0 || inventoryOffset > int.MaxValue)
+                        throw new InvalidDataException("loaded_assemblies.offset must be a non-negative 32-bit integer.");
+                    if (inventoryLimit < 1 || inventoryLimit > MaxLoadedAssemblyPageSize)
+                        throw new InvalidDataException("loaded_assemblies.limit must be between 1 and " + MaxLoadedAssemblyPageSize + ".");
+                    return new BridgeJsonResult(await AwaitWithCancellation(
+                        MainThreadQueue.Enqueue(() =>
+                        {
+                            string managedRoot = GetManagedRoot();
+                            LoadedAssemblyStatus inventory = BuildLoadedAssemblyStatus(AppDomain.CurrentDomain.GetAssemblies(),
+                                managedRoot, FindModsRoot(managedRoot));
+                            return BuildLoadedAssemblyPage(inventory, (int)inventoryOffset,
+                                (int)inventoryLimit, inventorySnapshotId);
+                        }, token), token).ConfigureAwait(false));
                 case "logs":
                     long since = GetInteger(args, "since", 0);
                     if (since < 0) throw new InvalidDataException("logs.since must be non-negative.");
@@ -782,10 +809,13 @@ namespace ThunderRoadMcp.Bridge
         private object CreateStatus(bool includeAssemblies)
         {
             ThunderRoad.LevelManager.State state = ThunderRoad.LevelManager.state;
-            LoadedAssemblyStatus assemblyStatus = includeAssemblies
-                ? BuildLoadedAssemblyStatus(AppDomain.CurrentDomain.GetAssemblies(),
-                    GetAssemblyDirectory(typeof(ThunderRoad.ThunderScript).Assembly), FindModsRoot())
-                : null;
+            LoadedAssemblyStatus assemblyStatus = null;
+            if (includeAssemblies)
+            {
+                string managedRoot = GetManagedRoot();
+                assemblyStatus = BuildLoadedAssemblyStatus(AppDomain.CurrentDomain.GetAssemblies(),
+                    managedRoot, FindModsRoot(managedRoot));
+            }
             return BuildStatusPayload(Process.GetCurrentProcess().Id, Application.productName, Application.version,
                 Application.unityVersion, ThunderRoad.LevelManager.GetCurrentLevel(), state.ToString(),
                 state == ThunderRoad.LevelManager.State.Loaded, includeAssemblies, assemblyStatus);
@@ -809,6 +839,7 @@ namespace ThunderRoadMcp.Bridge
             {
                 status["loadedAssemblyCount"] = assemblyStatus.loadedAssemblyCount;
                 status["loadedAssembliesTruncated"] = assemblyStatus.loadedAssembliesTruncated;
+                status["inventoryComplete"] = assemblyStatus.inventoryComplete;
                 status["loadedAssemblies"] = JArray.FromObject(assemblyStatus.loadedAssemblies);
             }
             return status;
@@ -819,51 +850,151 @@ namespace ThunderRoadMcp.Bridge
             var entries = new List<Tuple<string, string, string, object>>();
             string managed = NormalizeRoot(managedRoot);
             string mods = NormalizeRoot(modsRoot);
+            bool complete = true;
             foreach (Assembly assembly in assemblies)
             {
+                if (assembly == null || assembly.IsDynamic) continue;
                 try
                 {
-                    if (assembly == null || assembly.IsDynamic) continue;
-                    string location = assembly.Location;
-                    if (string.IsNullOrEmpty(location)) continue;
-                    string fullPath = Path.GetFullPath(location);
-                    string origin;
-                    string root;
-                    if (IsUnderRoot(fullPath, managed)) { origin = "game"; root = managed; }
-                    else if (IsUnderRoot(fullPath, mods)) { origin = "mod"; root = mods; }
-                    else continue;
-                    string relativePath = fullPath.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                     AssemblyName name = assembly.GetName();
                     Guid mvid = assembly.ManifestModule.ModuleVersionId;
+                    string assemblyName = name.Name;
+                    string version = name.Version == null ? null : name.Version.ToString();
+                    if (string.IsNullOrEmpty(assemblyName) || version == null) complete = false;
+
+                    string origin = null;
+                    string relativePath = null;
+                    string location = null;
+                    try { location = assembly.Location; }
+                    catch (Exception ex) when (ex is NotSupportedException || ex is IOException || ex is ArgumentException ||
+                        ex is UnauthorizedAccessException || ex is System.Security.SecurityException)
+                    {
+                        complete = false;
+                        continue;
+                    }
+                    if (!string.IsNullOrEmpty(location))
+                    {
+                        string root = null;
+                        try
+                        {
+                            string fullPath = Path.GetFullPath(location);
+                            if (IsUnderRoot(fullPath, managed)) { origin = "game"; root = managed; }
+                            else if (IsUnderRoot(fullPath, mods)) { origin = "mod"; root = mods; }
+                            if (root != null)
+                                relativePath = fullPath.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                        }
+                        catch (Exception ex) when (ex is IOException || ex is ArgumentException ||
+                            ex is UnauthorizedAccessException || ex is System.Security.SecurityException) { }
+                        if (root == null) continue;
+                    }
                     object entry = new
                     {
-                        name = name.Name,
-                        version = name.Version == null ? null : name.Version.ToString(),
+                        name = assemblyName,
+                        version,
                         moduleVersionId = mvid,
                         origin,
                         relativePath
                     };
-                    entries.Add(Tuple.Create(origin, relativePath, name.Name + "\0" + mvid.ToString("D"), entry));
+                    entries.Add(Tuple.Create(origin, relativePath,
+                        (assemblyName ?? string.Empty) + "\0" + (version ?? string.Empty) + "\0" + mvid.ToString("D"), entry));
                 }
                 catch (Exception ex) when (ex is NotSupportedException || ex is IOException || ex is ArgumentException ||
-                    ex is UnauthorizedAccessException || ex is System.Security.SecurityException)
+                    ex is UnauthorizedAccessException || ex is System.Security.SecurityException || ex is InvalidOperationException)
                 {
-                    // Assemblies without accessible file locations are not reportable.
+                    complete = false;
                 }
             }
             entries.Sort((a, b) =>
             {
                 int comparison = string.CompareOrdinal(a.Item1, b.Item1);
                 if (comparison == 0) comparison = string.CompareOrdinal(a.Item2, b.Item2);
-                return comparison != 0 ? comparison : string.CompareOrdinal(a.Item3, b.Item3);
+                if (comparison == 0) comparison = string.CompareOrdinal(a.Item3, b.Item3);
+                return comparison;
             });
-            int count = entries.Count;
+            object[] allLoadedAssemblies = entries.Select(entry => entry.Item4).ToArray();
             return new LoadedAssemblyStatus
             {
-                loadedAssemblies = entries.Take(128).Select(entry => entry.Item4).ToArray(),
-                loadedAssemblyCount = count,
-                loadedAssembliesTruncated = count > 128
+                allLoadedAssemblies = allLoadedAssemblies,
+                loadedAssemblies = allLoadedAssemblies.Take(128).ToArray(),
+                loadedAssemblyCount = allLoadedAssemblies.Length,
+                loadedAssembliesTruncated = allLoadedAssemblies.Length > 128,
+                inventoryComplete = complete,
+                inventorySnapshotId = CreateLoadedAssemblySnapshotId(entries)
             };
+        }
+
+        internal static string BuildLoadedAssemblyPage(LoadedAssemblyStatus inventory, int offset, int limit,
+            string expectedSnapshotId)
+        {
+            if (expectedSnapshotId != null &&
+                !string.Equals(expectedSnapshotId, inventory.inventorySnapshotId, StringComparison.Ordinal))
+                throw new InvalidDataException("loaded_assemblies inventory changed while paging; restart at offset 0.");
+            if (offset < 0 || offset > inventory.loadedAssemblyCount)
+                throw new InvalidDataException("loaded_assemblies.offset is outside the current inventory.");
+            if (limit < 1 || limit > MaxLoadedAssemblyPageSize)
+                throw new InvalidDataException("loaded_assemblies.limit must be between 1 and " + MaxLoadedAssemblyPageSize + ".");
+
+            int pageLength = Math.Min(limit, inventory.loadedAssemblyCount - offset);
+            for (int length = pageLength; length > 0; length--)
+            {
+                var page = new object[length];
+                Array.Copy(inventory.allLoadedAssemblies, offset, page, 0, length);
+                int nextOffset = offset + length;
+                bool hasMore = nextOffset < inventory.loadedAssemblyCount;
+                object payload = new
+                {
+                    inventorySnapshotId = inventory.inventorySnapshotId,
+                    inventoryComplete = inventory.inventoryComplete,
+                    loadedAssemblyCount = inventory.loadedAssemblyCount,
+                    loadedAssembliesOffset = offset,
+                    loadedAssemblies = page,
+                    loadedAssembliesTruncated = hasMore,
+                    nextOffset = hasMore ? (int?)nextOffset : null
+                };
+                string json;
+                try { json = SerializeResult(payload); }
+                catch (InvalidDataException)
+                {
+                    if (length == 1) throw OversizedLoadedAssembly(offset, page[0]);
+                    continue;
+                }
+                if (Encoding.UTF8.GetByteCount(json) <= MaxLineBytes - 512) return json;
+                if (length == 1) throw OversizedLoadedAssembly(offset, page[0]);
+            }
+
+            if (pageLength == 0)
+                return SerializeResult(new
+                {
+                    inventorySnapshotId = inventory.inventorySnapshotId,
+                    inventoryComplete = inventory.inventoryComplete,
+                    loadedAssemblyCount = inventory.loadedAssemblyCount,
+                    loadedAssembliesOffset = offset,
+                    loadedAssemblies = new object[0],
+                    loadedAssembliesTruncated = false,
+                    nextOffset = (int?)null
+                });
+            throw OversizedLoadedAssembly(offset, inventory.allLoadedAssemblies[offset]);
+        }
+
+        private static InvalidDataException OversizedLoadedAssembly(int offset, object entry)
+        {
+            JObject identity = JObject.FromObject(entry);
+            string name = Bound((string)identity["name"], 128) ?? "<unknown>";
+            string mvid = (string)identity["moduleVersionId"] ?? "<unknown>";
+            return new InvalidDataException("Loaded assembly identity '" + name + "' (MVID " + mvid +
+                ") at offset " + offset + " exceeds the 64 KiB UTF-8 response budget; shorten its name/path or remove it from the game before retrying.");
+        }
+
+ 
+
+        private static string CreateLoadedAssemblySnapshotId(List<Tuple<string, string, string, object>> entries)
+        {
+            using (IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            {
+                foreach (Tuple<string, string, string, object> entry in entries)
+                    hash.AppendData(Encoding.UTF8.GetBytes(entry.Item1 + "\0" + entry.Item2 + "\0" + entry.Item3 + "\n"));
+                return "loaded1." + BitConverter.ToString(hash.GetHashAndReset()).Replace("-", string.Empty).ToLowerInvariant();
+            }
         }
 
         private static string NormalizeRoot(string root)
@@ -876,20 +1007,31 @@ namespace ThunderRoadMcp.Bridge
             catch (Exception ex) when (ex is NotSupportedException || ex is IOException || ex is ArgumentException ||
                 ex is UnauthorizedAccessException || ex is System.Security.SecurityException) { return null; }
         }
+        private static string GetManagedRoot()
+        {
+            string managed = GetAssemblyDirectory(typeof(ThunderRoad.ThunderScript).Assembly);
+            if (managed != null) return managed;
+            string streamingAssets = Application.streamingAssetsPath;
+            if (string.IsNullOrEmpty(streamingAssets)) return null;
+            try { return Path.GetFullPath(Path.Combine(streamingAssets, "..", "Managed")); }
+            catch (Exception ex) when (ex is IOException || ex is ArgumentException ||
+                ex is UnauthorizedAccessException || ex is System.Security.SecurityException) { return null; }
+        }
+
 
         private static bool IsUnderRoot(string path, string root)
         {
             return root != null && path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
         }
 
-        private static string FindModsRoot()
+        private static string FindModsRoot(string managedRoot)
         {
-            string assemblyDirectory = GetAssemblyDirectory(Assembly.GetExecutingAssembly());
-            if (assemblyDirectory == null) return null;
-            DirectoryInfo directory = new DirectoryInfo(assemblyDirectory);
-            while (directory != null && !string.Equals(directory.Name, "Mods", StringComparison.OrdinalIgnoreCase))
-                directory = directory.Parent;
-            return directory == null ? null : directory.FullName;
+            string streamingAssets = Application.streamingAssetsPath;
+            if (!string.IsNullOrEmpty(streamingAssets))
+                return Path.Combine(streamingAssets, "Mods");
+            string managed = NormalizeRoot(managedRoot);
+            DirectoryInfo dataDirectory = managed == null ? null : Directory.GetParent(managed);
+            return dataDirectory == null ? null : Path.Combine(dataDirectory.FullName, "StreamingAssets", "Mods");
         }
 
         private async Task<string> Evaluate(string code, TimeSpan timeout, CancellationToken shutdownToken, BridgeRequestTimings timings)
@@ -931,12 +1073,14 @@ namespace ThunderRoadMcp.Bridge
                                 compiler.Release();
                             }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                         }
-                        var diagnostics = CompilationDiagnostics(exception);
+                        var diagnostics = CompilationDiagnostics(exception, out bool diagnosticsTruncated,
+                            out int omittedDiagnosticCount);
                         if (exception is OperationCanceledException)
                             throw new BridgeEvaluationException("evaluation.not_started",
-                                "Evaluation timed out before invocation began.", "not_started", diagnostics, exception);
+                                "Evaluation timed out before invocation began.", "not_started", diagnostics, exception,
+                                diagnosticsTruncated, omittedDiagnosticCount);
                         throw new BridgeEvaluationException("evaluation.compilation_failed", exception.Message,
-                            "not_started", diagnostics, exception);
+                            "not_started", diagnostics, exception, diagnosticsTruncated, omittedDiagnosticCount);
                     }
                 }
                 finally
@@ -1029,19 +1173,27 @@ namespace ThunderRoadMcp.Bridge
             }
         }
 
-        private static object[] CompilationDiagnostics(Exception exception)
+        private static object[] CompilationDiagnostics(Exception exception, out bool diagnosticsTruncated,
+            out int omittedDiagnosticCount)
         {
+            diagnosticsTruncated = false;
+            omittedDiagnosticCount = 0;
             var property = exception.GetType().GetProperty("Diagnostics", BindingFlags.Public | BindingFlags.Instance);
             if (property == null || !(property.GetValue(exception, null) is IEnumerable values))
                 return null;
             var diagnostics = new List<object>();
+            int diagnosticCount = 0;
             foreach (var value in values)
             {
                 if (value == null) continue;
+                diagnosticCount++;
+                if (diagnostics.Count == 20) continue;
                 var type = value.GetType();
                 string id = ReadDiagnosticString(type, value, "Id", 64);
                 string severity = ReadDiagnosticString(type, value, "Severity", 16);
-                string message = ReadDiagnosticString(type, value, "Message", 256);
+                string fullMessage = ReadDiagnosticString(type, value, "Message", int.MaxValue);
+                bool messageTruncated = fullMessage != null && fullMessage.Length > 256;
+                string message = messageTruncated ? fullMessage.Substring(0, 256) : fullMessage;
                 int? line = ReadDiagnosticInt(type, value, "Line");
                 int? column = ReadDiagnosticInt(type, value, "Column");
                 var spanValue = type.GetProperty("Span", BindingFlags.Public | BindingFlags.Instance)?.GetValue(value, null);
@@ -1055,17 +1207,19 @@ namespace ThunderRoadMcp.Bridge
                         length = ReadDiagnosticInt(spanType, spanValue, "Length")
                     };
                 }
-                diagnostics.Add(new { id, severity, message, line, column, span });
-                if (diagnostics.Count == 20) break;
+                diagnostics.Add(new { id, severity, message, messageTruncated, line, column, span });
             }
+            omittedDiagnosticCount = Math.Max(0, diagnosticCount - diagnostics.Count);
+            diagnosticsTruncated = omittedDiagnosticCount > 0;
             return diagnostics.ToArray();
         }
-
         private static string ReadDiagnosticString(Type type, object value, string name, int maxLength)
         {
-            string text = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(value, null) as string;
-            return text != null && text.Length > maxLength ? text.Substring(0, maxLength) : text;
+            var propertyValue = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(value, null);
+            if (!(propertyValue is string text)) return null;
+            return text.Length > maxLength ? text.Substring(0, maxLength) : text;
         }
+
 
         private static int? ReadDiagnosticInt(Type type, object value, string name)
         {

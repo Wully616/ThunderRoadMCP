@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 public static class ApiPersistentCacheCheck
 {
     private const string FixtureQualifiedName = "Fixture.Shared.SharedSurface";
+    private const string TaskFixtureQualifiedName = "Fixture.Shared.XmlDocumentationSurface";
 
     public static async Task RunAsync(Func<string, object, Task<JsonDocument>> apiToolJsonAsync,
         Action<bool, string> assert, ApiReuseContext context)
@@ -14,6 +15,18 @@ public static class ApiPersistentCacheCheck
         var assemblyId = assemblies.RootElement.GetProperty("assemblies").EnumerateArray()
             .Single(item => item.GetProperty("name").GetString() == "Fixture.Shared")
             .GetProperty("assemblyId").GetString()!;
+        var taskCacheDirectory = Path.Combine(context.CacheDirectory, "fresh-task-lookup");
+        var coldTaskLookup = await RunFreshHostSearchAsync(context, assemblyId, assert,
+            "fresh-host cold task lookup", build: -1, memoryHit: -1, diskHit: -1,
+            taskLookup: true, cacheDirectory: taskCacheDirectory);
+        assert(coldTaskLookup.Build > 0 && coldTaskLookup.DiskHit == 0,
+            "fresh-host cold task lookup builds metadata without loading a persisted API index");
+        var persistedTaskLookup = await RunFreshHostSearchAsync(context, assemblyId, assert,
+            "fresh-host persisted task lookup", build: -1, memoryHit: -1, diskHit: -1,
+            taskLookup: true, cacheDirectory: taskCacheDirectory);
+        assert(persistedTaskLookup.Build == 0 && persistedTaskLookup.DiskHit > 0,
+            "fresh-host persisted task lookup reuses cached metadata without rebuilding an API index");
+
 
         async Task<JsonDocument> SearchAsync() => await apiToolJsonAsync("api_search", new
         {
@@ -82,6 +95,21 @@ public static class ApiPersistentCacheCheck
         }
     }
 
+    private static void AssertCompleteFixtureTaskLookup(JsonDocument lookup, Action<bool, string> assert, string scenario)
+    {
+        var root = lookup.RootElement;
+        var fixtureResult = root.GetProperty("results").EnumerateArray().FirstOrDefault(result =>
+            result.GetProperty("qualifiedName").GetString() == TaskFixtureQualifiedName);
+        assert(root.GetProperty("mode").GetString() == "task" &&
+               root.GetProperty("effectiveScope").GetString() == "installed" &&
+               root.GetProperty("found").GetBoolean() &&
+               fixtureResult.ValueKind == JsonValueKind.Object &&
+               fixtureResult.GetProperty("relevance").GetProperty("documentationMatch").GetBoolean() &&
+               fixtureResult.GetProperty("relevance").GetProperty("matchedTokens").GetInt32() == 3 &&
+               fixtureResult.GetProperty("relevance").GetProperty("coveragePercent").GetInt32() == 100 &&
+               fixtureResult.GetProperty("relevance").GetProperty("confidence").GetString() == "supported",
+            $"{scenario} returns the XML-only moonstone Fixture.Shared task result with documentation evidence and supported confidence");
+    }
     private static void AssertCompleteFixtureResult(JsonDocument search, Action<bool, string> assert, string scenario)
     {
         var root = search.RootElement;
@@ -91,6 +119,7 @@ public static class ApiPersistentCacheCheck
                results[0].GetProperty("qualifiedName").GetString() == FixtureQualifiedName,
             $"{scenario} returns the complete Fixture.Shared result");
     }
+
 
     private static void AssertCounters(JsonDocument diagnostics, Action<bool, string> assert, string scenario,
         long build, long memoryHit, long diskHit)
@@ -182,7 +211,8 @@ public static class ApiPersistentCacheCheck
 
     private static async Task<(long Build, long MemoryHit, long DiskHit)> RunFreshHostSearchAsync(
         ApiReuseContext context, string assemblyId, Action<bool, string> assert,
-        string scenario, long build, long memoryHit, long diskHit)
+        string scenario, long build, long memoryHit, long diskHit,
+        bool taskLookup = false, string? cacheDirectory = null)
     {
         var start = new ProcessStartInfo("dotnet")
         {
@@ -196,7 +226,7 @@ public static class ApiPersistentCacheCheck
         start.Environment["THUNDERROAD_MCP_CONFIG"] = Path.GetFullPath(context.BridgeConfigPath);
         start.Environment["THUNDERROAD_MCP_LOG_DIR"] = Path.GetFullPath(context.LogDirectory);
         start.Environment["THUNDERROAD_MCP_LAUNCH_CONFIG"] = Path.GetFullPath(context.LaunchConfigPath);
-        start.Environment["THUNDERROAD_MCP_CACHE_DIR"] = Path.GetFullPath(context.CacheDirectory);
+        start.Environment["THUNDERROAD_MCP_CACHE_DIR"] = Path.GetFullPath(cacheDirectory ?? context.CacheDirectory);
         start.Environment["THUNDERROAD_MCP_DIAGNOSTICS"] = "1";
 
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start API cache child host.");
@@ -225,22 +255,31 @@ public static class ApiPersistentCacheCheck
                 jsonrpc = "2.0", id = 2, method = "tools/call",
                 @params = new
                 {
-                    name = "api_search",
-                    arguments = new { query = "SharedSurface", kind = "type", assemblyId, offset = 0, limit = 50 }
+                    name = taskLookup ? "api_lookup" : "api_search",
+                    arguments = taskLookup
+                        ? (object)new
+                        {
+                            query = "moonstone fixture surface", assemblyId, scope = "installed",
+                            maxResults = 3, maxChars = 8000, includeExamples = false,
+                        }
+                        : new { query = "SharedSurface", kind = "type", assemblyId, offset = 0, limit = 50 }
                 }
             });
 
             using var response = await ReadResponseAsync(process);
             var result = response.RootElement.GetProperty("result");
             if (result.TryGetProperty("isError", out var isError) && isError.GetBoolean())
-                throw new InvalidOperationException($"{scenario} api_search failed: {result.GetRawText()}");
+                throw new InvalidOperationException($"{scenario} {(taskLookup ? "api_lookup" : "api_search")} failed: {result.GetRawText()}");
             assert(result.TryGetProperty("structuredContent", out var structured) &&
                    structured.ValueKind == JsonValueKind.Object,
-                $"{scenario} api_search returns structured content");
+                $"{scenario} returns structured content");
             var text = result.GetProperty("content")[0].GetProperty("text").GetString()
-                ?? throw new InvalidOperationException($"{scenario} api_search returned no text content.");
+                ?? throw new InvalidOperationException($"{scenario} returned no text content.");
             using var search = JsonDocument.Parse(text);
-            AssertCompleteFixtureResult(search, assert, scenario);
+            if (taskLookup)
+                AssertCompleteFixtureTaskLookup(search, assert, scenario);
+            else
+                AssertCompleteFixtureResult(search, assert, scenario);
             using var diagnostics = await ReadDiagnosticAsync(process.StandardError);
             var actualBuild = Counter(diagnostics, "api.index.build");
             var actualMemoryHit = Counter(diagnostics, "api.index.memoryHit");

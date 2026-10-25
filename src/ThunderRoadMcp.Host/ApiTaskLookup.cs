@@ -226,7 +226,7 @@ public sealed partial class InstalledApiCatalog
 
         var page = ranked.Skip(offset).Take(maxResults).ToArray();
         var selectedHits = page.Select(result => result.Hit).ToArray();
-        var selectedSymbols = await ReadSelectedSymbolsAsync(snapshot, selectedHits, cancellationToken);
+        var selectedSymbols = new Dictionary<string, ApiIndexedSymbol>(StringComparer.Ordinal);
         var selectedCatalogTypes = selectedHits
             .Select(hit => NormalizeTypeName(hit.declaringType ?? hit.qualifiedName))
             .Where(name => name.Length > 0)
@@ -239,22 +239,12 @@ public sealed partial class InstalledApiCatalog
 
         var relatedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var relationOwners = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var symbol in selectedSymbols.Values)
-        {
-            AddRelatedName(symbol.Hit.declaringType, symbol.Hit.symbolId, relatedNames, relationOwners);
-            foreach (var name in symbol.RelatedTypeNames)
-                AddRelatedName(name, symbol.Hit.symbolId, relatedNames, relationOwners);
-        }
         foreach (var record in catalogRecords)
             AddRelatedName(record.DeclaredApiType, "catalog:" + record.EntryId, relatedNames, relationOwners);
-        var (relatedTypes, relatedResolutionComplete) = await ResolveRelatedTypesAsync(snapshot, relatedNames, relationOwners,
-            typeMap, diagnostics, cancellationToken, excludedAssemblyIds);
-        ToolTiming.Count("api.lookup.relatedConsidered", relatedNames.Count);
-        var resolvedRelatedNames = relatedTypes.Select(type => type.Symbol.Hit.qualifiedName)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var missingRelatedNames = relatedNames.Where(name => !resolvedRelatedNames.Contains(name) && !IsFrameworkTypeName(name))
-            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
-        indexComplete &= relatedResolutionComplete;
+        ApiTypeRecord[] relatedTypes = Array.Empty<ApiTypeRecord>();
+        var relatedResolutionComplete = true;
+        var resolvedRelatedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string[] missingRelatedNames = Array.Empty<string>();
         var relevantSymbols = selectedHits.Select(hit => hit.qualifiedName).ToArray();
         var examples = includeExamples ? GameplayExamples.ForQuery(query, relevantSymbols).Take(1).ToArray() : Array.Empty<ApiExample>();
 
@@ -306,16 +296,6 @@ public sealed partial class InstalledApiCatalog
             throw new ArgumentException("query and response envelope exceed maxChars; shorten query or raise maxChars.", nameof(maxChars));
         var responseWarnings = (JsonArray)response["warnings"]!;
         var warningsOmitted = diagnostics.Count > 4;
-        foreach (var warning in diagnostics.Take(4))
-        {
-            AddJsonString(responseWarnings, warning);
-            if (LogicalLength(response) > maxChars)
-            {
-                responseWarnings.RemoveAt(responseWarnings.Count - 1);
-                warningsOmitted = true;
-                break;
-            }
-        }
         var results = (JsonArray)response["results"]!;
         var missing = (JsonArray)response["missingInformation"]!;
         if (omittedCandidates > 0)
@@ -339,36 +319,22 @@ public sealed partial class InstalledApiCatalog
             node.Remove("attributes");
             node.Remove("attributesTruncated");
             node.Remove("typeContext");
+            node.Remove("xmlDocumentation");
         }
 
         static void PruneTopOptional(JsonObject node)
         {
             node.Remove("attributes");
             node.Remove("attributesTruncated");
-            if (node["typeContext"] is JsonObject context)
-            {
-                context.Remove("attributes");
-                context.Remove("attributesTruncated");
-                context.Remove("relatedTypeNames");
-                context.Remove("relatedTypeIds");
-                context.Remove("unresolvedTypeNames");
-            }
+            node.Remove("typeContext");
+            node.Remove("xmlDocumentation");
         }
 
         foreach (var rankedResult in page)
         {
-            if (!selectedSymbols.TryGetValue(rankedResult.Hit.symbolId, out var symbol))
-            {
-                truncated = true;
-                complete = false;
-                if (results.Count == 0)
-                {
-                    AddExactRecovery(rankedResult.Hit.assemblyId, rankedResult.Hit.symbolId);
-                    processedPageCount++;
-                }
-                break;
-            }
-            var node = JsonSerializer.SerializeToNode(symbol.Hit)!.AsObject();
+            var node = JsonSerializer.SerializeToNode(rankedResult.Hit)!.AsObject();
+            node.Remove("attributes");
+            node.Remove("attributesTruncated");
             node["relevance"] = new JsonObject
             {
                 ["score"] = rankedResult.Score,
@@ -380,19 +346,6 @@ public sealed partial class InstalledApiCatalog
                 ["documentationMatch"] = rankedResult.HasDocumentationMatch,
                 ["catalogMatch"] = rankedResult.HasCatalogMatch,
                 ["exactName"] = rankedResult.IsExact,
-            };
-            node["typeContext"] = new JsonObject
-            {
-                ["returnType"] = symbol.ReturnType,
-                ["attributes"] = JsonSerializer.SerializeToNode(symbol.Hit.attributes),
-                ["attributesTruncated"] = symbol.Hit.attributesTruncated,
-                ["parameters"] = ToJsonArray(symbol.ParameterSignatures),
-                ["genericConstraints"] = ToJsonArray(symbol.GenericConstraints),
-                ["relatedTypeNames"] = ToJsonArray(symbol.RelatedTypeNames.Take(MaxLookupRelatedNames)),
-                ["relatedTypeIds"] = new JsonArray(),
-                ["unresolvedTypeNames"] = new JsonArray(),
-                ["relevantMembers"] = new JsonArray(),
-                ["contextTruncated"] = symbol.RelatedTypeNames.Length > MaxLookupRelatedNames,
             };
             results.Add(node);
             if (LogicalLength(response) > maxChars)
@@ -429,11 +382,6 @@ public sealed partial class InstalledApiCatalog
                 complete = false;
                 AddJsonString(missing, $"'{rankedResult.Hit.qualifiedName}' is a low-confidence lexical match; confirm its declaration with api_type/api_search before treating it as an implementation plan.");
             }
-            if (symbol.RelatedTypeNames.Length > MaxLookupRelatedNames)
-            {
-                truncated = true;
-                complete = false;
-            }
         }
 
         if (results.Count > 1)
@@ -452,6 +400,101 @@ public sealed partial class InstalledApiCatalog
             complete = false;
             AddJsonString(missing, "The top result's optional attributes/related-name lists were omitted to preserve its callable signature, inherited-member context, and essential related types; use api_type for the full type surface.");
         }
+        foreach (var rankedResult in page)
+            if (resultNodes.ContainsKey(rankedResult.Hit.symbolId))
+                AddRelatedName(rankedResult.Hit.declaringType, rankedResult.Hit.symbolId, relatedNames, relationOwners);
+
+        foreach (var warning in diagnostics.Take(4))
+        {
+            AddJsonString(responseWarnings, warning);
+            if (LogicalLength(response) > maxChars)
+            {
+                responseWarnings.RemoveAt(responseWarnings.Count - 1);
+                warningsOmitted = true;
+                break;
+            }
+        }
+        if (warningsOmitted)
+        {
+            truncated = true;
+            complete = false;
+        }
+
+        var contextBudgetAvailable = LogicalLength(response) < maxChars;
+        if (contextBudgetAvailable)
+        {
+            var returnedHits = page.Where(result => resultNodes.ContainsKey(result.Hit.symbolId))
+                .Select(result => result.Hit).ToArray();
+            selectedSymbols = await ReadSelectedSymbolsAsync(snapshot, returnedHits, cancellationToken);
+            foreach (var rankedResult in page)
+            {
+                if (!resultNodes.ContainsKey(rankedResult.Hit.symbolId))
+                    continue;
+                if (!selectedSymbols.ContainsKey(rankedResult.Hit.symbolId))
+                {
+                    truncated = true;
+                    complete = false;
+                    AddExactRecovery(rankedResult.Hit.assemblyId, rankedResult.Hit.symbolId);
+                }
+            }
+            foreach (var symbol in selectedSymbols.Values)
+            {
+                AddRelatedName(symbol.Hit.declaringType, symbol.Hit.symbolId, relatedNames, relationOwners);
+                foreach (var name in symbol.RelatedTypeNames)
+                    AddRelatedName(name, symbol.Hit.symbolId, relatedNames, relationOwners);
+            }
+            if (results.FirstOrDefault() is JsonObject topContextResult &&
+                topContextResult["symbolId"]?.GetValue<string>() is { } topSymbolId &&
+                selectedSymbols.TryGetValue(topSymbolId, out var topSymbol))
+            {
+                topContextResult["attributes"] = JsonSerializer.SerializeToNode(topSymbol.Hit.attributes);
+                topContextResult["attributesTruncated"] = topSymbol.Hit.attributesTruncated;
+                topContextResult["typeContext"] = new JsonObject
+                {
+                    ["returnType"] = topSymbol.ReturnType,
+                    ["attributes"] = JsonSerializer.SerializeToNode(topSymbol.Hit.attributes),
+                    ["attributesTruncated"] = topSymbol.Hit.attributesTruncated,
+                    ["parameters"] = ToJsonArray(topSymbol.ParameterSignatures),
+                    ["genericConstraints"] = ToJsonArray(topSymbol.GenericConstraints),
+                    ["relatedTypeNames"] = ToJsonArray(topSymbol.RelatedTypeNames.Take(MaxLookupRelatedNames)),
+                    ["relatedTypeIds"] = new JsonArray(),
+                    ["unresolvedTypeNames"] = new JsonArray(),
+                    ["relevantMembers"] = new JsonArray(),
+                    ["contextTruncated"] = topSymbol.RelatedTypeNames.Length > MaxLookupRelatedNames,
+                };
+                if (topSymbol.RelatedTypeNames.Length > MaxLookupRelatedNames)
+                {
+                    truncated = true;
+                    complete = false;
+                }
+                if (LogicalLength(response) > maxChars)
+                {
+                    topContextResult.Remove("attributes");
+                    topContextResult.Remove("attributesTruncated");
+                    topContextResult.Remove("typeContext");
+                    truncated = true;
+                    complete = false;
+                }
+            }
+            var (resolvedTypes, resolutionComplete) = await ResolveRelatedTypesAsync(snapshot, relatedNames,
+                relationOwners, typeMap, diagnostics, cancellationToken, excludedAssemblyIds);
+            relatedTypes = resolvedTypes;
+            relatedResolutionComplete = resolutionComplete;
+            ToolTiming.Count("api.lookup.relatedConsidered", relatedNames.Count);
+            resolvedRelatedNames = relatedTypes.Select(type => type.Symbol.Hit.qualifiedName)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            missingRelatedNames = relatedNames.Where(name =>
+                    !resolvedRelatedNames.Contains(name) && !IsFrameworkTypeName(name))
+                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
+            indexComplete &= relatedResolutionComplete;
+        }
+        else if (results.Count > 0 || catalogRecords.Count > 0)
+        {
+            truncated = true;
+            complete = false;
+            AddJsonString(missing, "Optional API context was omitted to preserve declarations and relevance within maxChars; use api_type or catalog_search for full details.");
+        }
+
 
         void AppendExamples()
         {
@@ -544,9 +587,6 @@ public sealed partial class InstalledApiCatalog
                 List<ApiLookupRanker.RankedResult> rankedMembers;
                 using (ToolTiming.Measure("apiLookupRankingMs"))
                     rankedMembers = ApiLookupRanker.Rank(query, expansion.Members, 5).ToList();
-                if (!rankedMembers.Any(member => member.Hit.isInherited) &&
-                    expansion.Members.FirstOrDefault(member => member.isInherited) is { } inheritedHit)
-                    rankedMembers.Insert(0, ApiLookupRanker.ContextResult(inheritedHit));
                 foreach (var member in rankedMembers)
                 {
                     var memberNode = JsonSerializer.SerializeToNode(member.Hit)!.AsObject();
@@ -713,27 +753,6 @@ public sealed partial class InstalledApiCatalog
 
         var catalogNode = (JsonObject)response["catalog"]!;
         var catalogResultArray = (JsonArray)catalogNode["records"]!;
-        bool TrimLowerResults(long limit)
-        {
-            var trimmedAny = false;
-            while (LogicalLength(response) > limit && results.Count > 1)
-            {
-                var removed = results[^1]!.AsObject();
-                results.RemoveAt(results.Count - 1);
-                processedPageCount--;
-                if (removed["symbolId"]?.GetValue<string>() is { } removedId)
-                    resultNodes.Remove(removedId);
-                trimmedAny = true;
-            }
-            if (trimmedAny)
-            {
-                truncated = true;
-                complete = false;
-                AddJsonString(missing,
-                    "Lower-ranked result headers were omitted to preserve catalog IDs and related context; use the continuation for the remaining candidates.");
-            }
-            return trimmedAny;
-        }
         foreach (var record in catalogRecords)
         {
             var typeMatches = relatedTypes.Where(type => record.DeclaredApiType is not null &&
@@ -760,8 +779,6 @@ public sealed partial class InstalledApiCatalog
                 evidence = record.DeclaredApiType is null ? "no-direct-type-evidence" : "direct-$type",
             })!;
             catalogResultArray.Add(recordNode);
-            if (LogicalLength(response) > maxChars)
-                TrimLowerResults(maxChars);
             if (LogicalLength(response) > maxChars)
             {
                 catalogResultArray.RemoveAt(catalogResultArray.Count - 1);
@@ -811,51 +828,36 @@ public sealed partial class InstalledApiCatalog
                 fallbackMissing.Add("Base catalog omitted search terms: " + string.Join(", ", catalogOmittedTerms));
             if (omittedCandidates > 0)
                 fallbackMissing.Add($"Retained the top {ApiLookupRanker.MaxCandidates} ranked declarations; {omittedCandidates} lower-ranked matches were omitted.");
-            if (exactRecoveryMessages.Count > 0)
-                foreach (var recovery in exactRecoveryMessages)
-                    AddJsonString(fallbackMissing, recovery);
+            foreach (var recovery in exactRecoveryMessages)
+                AddJsonString(fallbackMissing, recovery);
             if (fallbackMissing.Count == 0)
                 fallbackMissing.Add("Optional context was omitted to stay within maxChars; use the stable continuation or raise the budget.");
             response["missingInformation"] = fallbackMissing;
             missing = fallbackMissing;
+
             var fallbackRelatedArray = (JsonArray)response["relatedTypes"]!;
-            while (LogicalLength(response) > maxChars && fallbackRelatedArray.Count > 1)
-                fallbackRelatedArray.RemoveAt(fallbackRelatedArray.Count - 1);
-            var remainingRelatedIds = fallbackRelatedArray.OfType<JsonObject>()
-                .Select(node => node["symbolId"]?.GetValue<string>()).OfType<string>()
-                .ToHashSet(StringComparer.Ordinal);
+            fallbackRelatedArray.Clear();
             foreach (var resultNode in resultNodes.Values)
             {
-                if (resultNode["typeContext"] is not JsonObject context ||
-                    context["relatedTypeIds"] is not JsonArray idArray)
-                    continue;
-                for (var idIndex = idArray.Count - 1; idIndex >= 0; idIndex--)
-                    if (idArray[idIndex]?.GetValue<string>() is { } id && !remainingRelatedIds.Contains(id))
-                        idArray.RemoveAt(idIndex);
+                resultNode.Remove("attributes");
+                resultNode.Remove("attributesTruncated");
+                resultNode.Remove("typeContext");
+                resultNode.Remove("xmlDocumentation");
             }
-            var exampleArray = (JsonArray)response["examples"]!;
-            while (LogicalLength(response) > maxChars && exampleArray.Count > 1)
-                exampleArray.RemoveAt(exampleArray.Count - 1);
+            ((JsonArray)response["examples"]!).Clear();
+            catalogResultArray.Clear();
+            catalogNode["complete"] = false;
+
             while (LogicalLength(response) > maxChars && results.Count > 1)
             {
                 results.RemoveAt(results.Count - 1);
                 processedPageCount--;
             }
-            if (LogicalLength(response) > maxChars && exampleArray.Count > 0)
-                exampleArray.Clear();
-            while (LogicalLength(response) > maxChars && catalogResultArray.Count > 1)
-                catalogResultArray.RemoveAt(catalogResultArray.Count - 1);
-            if (LogicalLength(response) > maxChars)
+            if (LogicalLength(response) > maxChars && results.LastOrDefault() is JsonObject unfitResult &&
+                unfitResult["assemblyId"]?.GetValue<string>() is { } unfitAssemblyId &&
+                unfitResult["symbolId"]?.GetValue<string>() is { } unfitSymbolId)
             {
-                fallbackRelatedArray.Clear();
-                if (results.LastOrDefault() is JsonObject removedResult &&
-                    removedResult["assemblyId"]?.GetValue<string>() is { } removedAssemblyId &&
-                    removedResult["symbolId"]?.GetValue<string>() is { } removedSymbolId)
-                {
-                    var recovery = ExactRecoveryMessage(removedAssemblyId, removedSymbolId);
-                    exactRecoveryMessages.Add(recovery);
-                    AddJsonString(missing, recovery);
-                }
+                AddExactRecovery(unfitAssemblyId, unfitSymbolId);
                 results.Clear();
             }
             response["truncated"] = true;

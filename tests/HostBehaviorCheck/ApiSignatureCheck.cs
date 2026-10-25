@@ -18,9 +18,11 @@ public static class ApiSignatureCheck
             {
                 query, kind, assemblyId, offset = 0, limit = 50
             });
+            var nameSuffix = "." + query;
             var matches = result.RootElement.GetProperty("results").EnumerateArray()
-                .Where(item => exactQualifiedName is null ||
-                    item.GetProperty("qualifiedName").GetString() == exactQualifiedName).ToArray();
+                .Where(item => exactQualifiedName is null
+                    ? item.GetProperty("qualifiedName").GetString()!.EndsWith(nameSuffix, StringComparison.Ordinal)
+                    : item.GetProperty("qualifiedName").GetString() == exactQualifiedName).ToArray();
             assert(matches.Length == 1, $"{query} returns one {kind} signature, got {matches.Length}: " +
                 string.Join(", ", matches.Select(item => item.GetProperty("qualifiedName").GetString())));
             return matches[0].Clone();

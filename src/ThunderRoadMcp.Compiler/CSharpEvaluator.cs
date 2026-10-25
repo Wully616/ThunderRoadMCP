@@ -96,11 +96,15 @@ namespace ThunderRoadMcp.Compiler
                 EmitResult emitted = Measure("emitMs", recordTiming, () => compilation.Emit(image, cancellationToken: token));
                 if (!emitted.Success)
                 {
-                    var diagnostics = string.Join(Environment.NewLine, emitted.Diagnostics.Select(d => d.ToString()));
+                    var orderedDiagnostics = emitted.Diagnostics
+                        .Distinct(DiagnosticIdentityComparer.Instance)
+                        .OrderBy(GetDiagnosticPriority)
+                        .ToArray();
+                    var diagnostics = string.Join(Environment.NewLine, orderedDiagnostics.Select(d => d.ToString()));
 
                     const string prefix = SourcePrefix;
                     var codeSource = SourceText.From(code);
-                    var structured = emitted.Diagnostics
+                    var structured = orderedDiagnostics
                         .Select(d => CreateDiagnosticInfo(d, prefix.Length, codeSource))
                         .ToArray();
                     throw new EvaluationCompilationException("C# compilation failed:" + Environment.NewLine + diagnostics, structured);
@@ -137,6 +141,47 @@ namespace ThunderRoadMcp.Compiler
             return new EvaluationDiagnosticInfo(diagnostic.Id, diagnostic.Severity.ToString().ToLowerInvariant(),
                 diagnostic.GetMessage(), line, column, span);
         }
+        private static int GetDiagnosticPriority(Diagnostic diagnostic)
+        {
+            if (diagnostic.Severity == DiagnosticSeverity.Error) return 0;
+            if (diagnostic.Severity == DiagnosticSeverity.Warning) return 1;
+            return 2;
+        }
+
+        private sealed class DiagnosticIdentityComparer : IEqualityComparer<Diagnostic>
+        {
+            public static readonly DiagnosticIdentityComparer Instance = new DiagnosticIdentityComparer();
+
+            public bool Equals(Diagnostic left, Diagnostic right)
+            {
+                if (ReferenceEquals(left, right)) return true;
+                if (left == null || right == null) return false;
+                var leftLocation = left.Location;
+                var rightLocation = right.Location;
+                return left.Severity == right.Severity &&
+                    string.Equals(left.Id, right.Id, StringComparison.Ordinal) &&
+                    string.Equals(left.GetMessage(), right.GetMessage(), StringComparison.Ordinal) &&
+                    leftLocation.Kind == rightLocation.Kind &&
+                    string.Equals(leftLocation.GetLineSpan().Path, rightLocation.GetLineSpan().Path, StringComparison.Ordinal) &&
+                    leftLocation.SourceSpan.Equals(rightLocation.SourceSpan);
+            }
+
+            public int GetHashCode(Diagnostic diagnostic)
+            {
+                var location = diagnostic.Location;
+                unchecked
+                {
+                    int hash = (int)diagnostic.Severity;
+                    hash = (hash * 397) ^ StringComparer.Ordinal.GetHashCode(diagnostic.Id ?? string.Empty);
+                    hash = (hash * 397) ^ StringComparer.Ordinal.GetHashCode(diagnostic.GetMessage() ?? string.Empty);
+                    hash = (hash * 397) ^ (int)location.Kind;
+                    hash = (hash * 397) ^ StringComparer.Ordinal.GetHashCode(location.GetLineSpan().Path ?? string.Empty);
+                    hash = (hash * 397) ^ location.SourceSpan.GetHashCode();
+                    return hash;
+                }
+            }
+        }
+
 
         private static T Measure<T>(string name, Action<string, double> recordTiming, Func<T> operation)
         {

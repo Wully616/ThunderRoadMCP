@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.IO;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text.Json;
@@ -8,6 +9,7 @@ public sealed class GameProcess
 {
     private const int MaxLaunchArgumentCount = 64;
     private const int MaxLaunchArgumentLength = 4096;
+    private const int LoadedAssemblyPageSize = 32;
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromSeconds(5);
     private readonly BridgeClient _bridgeClient;
     private Process? _ownedProcess;
@@ -69,6 +71,89 @@ public sealed class GameProcess
         catch (Exception exception) when (exception is IOException or SocketException or TimeoutException or InvalidOperationException)
         {
             return JsonSerializer.Serialize(new { gameProcessRunning = processRunning ? true : (bool?)null, bridgeConnected = false, bridgeReady = false, currentLevel = (string?)null, levelState = (string?)null, sceneReady = (bool?)null, bridgeError = exception.Message });
+        }
+    }
+
+    public async Task<string> LoadedAssemblyInventoryAsync(CancellationToken cancellationToken)
+    {
+        string statusJson = await StatusAsync(false, cancellationToken);
+        using var statusDocument = JsonDocument.Parse(statusJson);
+        var statusRoot = statusDocument.RootElement;
+        if (!statusRoot.TryGetProperty("bridgeConnected", out var connected) || connected.ValueKind != JsonValueKind.True)
+            return statusJson;
+
+        try
+        {
+            var assemblies = new List<JsonElement>();
+            string? snapshotId = null;
+            int count = -1;
+            bool? inventoryComplete = null;
+            int offset = 0;
+            while (true)
+            {
+                string response = await _bridgeClient.RequestAsync("loaded_assemblies",
+                    new { offset, limit = LoadedAssemblyPageSize, snapshotId }, cancellationToken);
+                using var pageDocument = JsonDocument.Parse(response);
+                var page = pageDocument.RootElement;
+                var pageSnapshotId = page.GetProperty("inventorySnapshotId").GetString();
+                if (string.IsNullOrWhiteSpace(pageSnapshotId) ||
+                    snapshotId is not null && !string.Equals(snapshotId, pageSnapshotId, StringComparison.Ordinal))
+                    throw new InvalidDataException("Loaded assembly inventory changed between pages.");
+                snapshotId ??= pageSnapshotId;
+
+                int pageCount = page.GetProperty("loadedAssemblyCount").GetInt32();
+                int pageOffset = page.GetProperty("loadedAssembliesOffset").GetInt32();
+                bool pageComplete = page.GetProperty("inventoryComplete").GetBoolean();
+                var pageAssemblies = page.GetProperty("loadedAssemblies");
+                var next = page.GetProperty("nextOffset");
+                int? nextOffset = next.ValueKind == JsonValueKind.Null ? null : next.GetInt32();
+                bool pageTruncated = page.GetProperty("loadedAssembliesTruncated").GetBoolean();
+                if (pageCount < 0 || pageOffset != offset || pageAssemblies.ValueKind != JsonValueKind.Array ||
+                    pageAssemblies.GetArrayLength() > LoadedAssemblyPageSize ||
+                    count >= 0 && count != pageCount ||
+                    inventoryComplete.HasValue && inventoryComplete.Value != pageComplete ||
+                    pageTruncated != nextOffset.HasValue)
+                    throw new InvalidDataException("Loaded assembly inventory page metadata is inconsistent.");
+                count = pageCount;
+                inventoryComplete = pageComplete;
+                foreach (var assembly in pageAssemblies.EnumerateArray())
+                    assemblies.Add(assembly.Clone());
+
+                int expectedNext = offset + pageAssemblies.GetArrayLength();
+                if (nextOffset is null)
+                {
+                    if (expectedNext != count)
+                        throw new InvalidDataException("Loaded assembly inventory ended before its reported count.");
+                    break;
+                }
+                if (nextOffset.Value != expectedNext || nextOffset.Value <= offset || nextOffset.Value >= count)
+                    throw new InvalidDataException("Loaded assembly inventory page offset is inconsistent.");
+                offset = nextOffset.Value;
+            }
+            if (assemblies.Count != count)
+                throw new InvalidDataException("Loaded assembly inventory is incomplete.");
+            return JsonSerializer.Serialize(new
+            {
+                bridgeConnected = true,
+                inventoryAvailable = true,
+                inventorySnapshotId = snapshotId,
+                inventoryComplete = inventoryComplete ?? false,
+                loadedAssemblyCount = count,
+                loadedAssemblies = assemblies
+            });
+        }
+        catch (Exception exception) when (exception is IOException or SocketException or TimeoutException or
+            InvalidOperationException or JsonException or KeyNotFoundException or FormatException or OverflowException)
+        {
+            var message = exception is BridgeRequestException { Message: "Unknown method: loaded_assemblies" }
+                ? "The connected bridge does not support paged loaded assembly inventory; update/reinstall the ThunderRoadMcp bridge mod and restart the game."
+                : exception.Message;
+            return JsonSerializer.Serialize(new
+            {
+                bridgeConnected = true,
+                inventoryAvailable = false,
+                inventoryError = message.Length <= 512 ? message : message[..512]
+            });
         }
     }
 

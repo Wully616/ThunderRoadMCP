@@ -95,7 +95,9 @@ internal static class ToolInvocation
             {
                 var bridgeFailure = exception as BridgeRequestException;
                 return EvaluationFailure(exception.Message, bridgeFailure?.ErrorCode ?? "evaluation.failed",
-                    bridgeFailure?.ExecutionOutcome ?? "unknown", bridgeFailure?.Diagnostics, started);
+                    bridgeFailure?.ExecutionOutcome ?? "unknown", bridgeFailure?.Diagnostics, started,
+                    bridgeFailure?.MessageTruncated ?? false, bridgeFailure?.DiagnosticsTruncated ?? false,
+                    bridgeFailure?.OmittedDiagnosticCount);
             }
             RecordFailure(started);
             throw new McpException(exception.Message, exception);
@@ -103,9 +105,12 @@ internal static class ToolInvocation
     }
 
     private static CallToolResult EvaluationFailure(string message, string errorCode, string executionOutcome,
-        JsonElement? diagnostics, long started)
+        JsonElement? diagnostics, long started, bool messageTruncated = false, bool diagnosticsTruncated = false,
+        int? omittedDiagnosticCount = null)
     {
         RecordFailure(started);
+        var truncatedMessage = message.Length > 4096;
+        var boundedMessage = truncatedMessage ? message[..4096] : message;
         var structured = new JsonObject
         {
             ["errorCode"] = errorCode,
@@ -113,17 +118,20 @@ internal static class ToolInvocation
             ["error"] = new JsonObject
             {
                 ["code"] = errorCode,
-                ["message"] = message.Length <= 4096 ? message : message[..4096],
-                ["messageTruncated"] = message.Length > 4096,
+                ["message"] = boundedMessage,
+                ["messageTruncated"] = messageTruncated || truncatedMessage,
                 ["recovery"] = null,
             },
+            ["diagnosticsTruncated"] = diagnosticsTruncated,
         };
+        if (omittedDiagnosticCount is { } count)
+            structured["omittedDiagnosticCount"] = count;
         if (diagnostics is { } value)
             structured["diagnostics"] = JsonNode.Parse(value.GetRawText());
         return new CallToolResult
         {
             IsError = true,
-            Content = [new TextContentBlock { Text = message }],
+            Content = [new TextContentBlock { Text = boundedMessage }],
             StructuredContent = JsonSerializer.SerializeToElement(structured),
         };
     }

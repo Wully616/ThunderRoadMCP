@@ -40,7 +40,7 @@ public static class ApiDiscoveryTools
         [Description("Zero-based result offset.")] int offset = 0,
         [Description("Maximum results in this page.")] int limit = 50,
         [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
-        [Description("Assembly scope: auto (default), installed (game plus enabled mods; offline modding), or loaded (only what the running game loaded; for evaluate_csharp).")] string? scope = null,
+        [Description("Assembly scope: auto (default), installed (game plus enabled mods; offline modding), or loaded (game APIs plus installed mods matching the running game's paged assembly inventory).")] string? scope = null,
         [Description("Pagination contract version: 1 is legacy best-effort; 2 requires scopeSnapshotId for offset pages.")] int paginationVersion = 1,
         [Description("Scope identity from the first page; required for offset>0 when paginationVersion=2.")] string? scopeSnapshotId = null,
         CancellationToken cancellationToken = default) =>
@@ -64,40 +64,75 @@ public static class ApiDiscoveryTools
         if (requested == "installed")
             return CreateScope(requested, null, false, "Assembly scope: installed (game assemblies and enabled mods on disk).");
         string? unavailable = null;
-        using var status = JsonDocument.Parse(await gameProcess.StatusAsync(true, cancellationToken));
-        var root = status.RootElement;
+        using var inventory = JsonDocument.Parse(await gameProcess.LoadedAssemblyInventoryAsync(cancellationToken));
+        var root = inventory.RootElement;
         var bridgeConnected = root.TryGetProperty("bridgeConnected", out var connected) &&
                               connected.ValueKind == JsonValueKind.True;
         var loaded = InstalledApiCatalog.CreateLoadedAssemblyIdentitySet();
         var truncatedInventory = false;
         if (!bridgeConnected)
             unavailable = "the game bridge is not connected";
-        else if (!root.TryGetProperty("status", out var bridgeStatus) ||
-                 !bridgeStatus.TryGetProperty("loadedAssemblies", out var assemblies) ||
+        else if (!root.TryGetProperty("inventoryAvailable", out var inventoryAvailable) ||
+                 inventoryAvailable.ValueKind != JsonValueKind.True)
+        {
+            string? inventoryErrorText = root.TryGetProperty("inventoryError", out var inventoryError) &&
+                                         inventoryError.ValueKind == JsonValueKind.String
+                ? inventoryError.GetString()
+                : null;
+            unavailable = string.IsNullOrWhiteSpace(inventoryErrorText)
+                ? "the connected bridge does not report a consistent loaded assembly inventory"
+                : inventoryErrorText;
+        }
+        else if (!root.TryGetProperty("loadedAssemblies", out var assemblies) ||
                  assemblies.ValueKind != JsonValueKind.Array)
-            unavailable = "the connected bridge does not report loaded assemblies";
+            unavailable = "the connected bridge returned an invalid loaded assembly inventory";
         else
         {
+            truncatedInventory = !root.TryGetProperty("inventoryComplete", out var complete) ||
+                                 complete.ValueKind != JsonValueKind.True;
             foreach (var assembly in assemblies.EnumerateArray())
             {
-                if (!assembly.TryGetProperty("origin", out var assemblyOrigin) ||
-                    assemblyOrigin.ValueKind != JsonValueKind.String ||
-                    !string.Equals(assemblyOrigin.GetString(), "mod", StringComparison.OrdinalIgnoreCase) ||
-                    !assembly.TryGetProperty("relativePath", out var relativePath) ||
-                    relativePath.ValueKind != JsonValueKind.String ||
+                if (assembly.ValueKind != JsonValueKind.Object ||
+                    !assembly.TryGetProperty("name", out var nameElement) ||
+                    nameElement.ValueKind != JsonValueKind.String ||
+                    string.IsNullOrWhiteSpace(nameElement.GetString()) ||
+                    !assembly.TryGetProperty("version", out var versionElement) ||
+                    versionElement.ValueKind != JsonValueKind.String ||
+                    string.IsNullOrWhiteSpace(versionElement.GetString()) ||
                     !assembly.TryGetProperty("moduleVersionId", out var moduleVersionId) ||
                     moduleVersionId.ValueKind != JsonValueKind.String ||
-                    !Guid.TryParse(moduleVersionId.GetString(), out var parsedMvid))
+                    !Guid.TryParse(moduleVersionId.GetString(), out var parsedMvid) ||
+                    !assembly.TryGetProperty("origin", out var assemblyOrigin) ||
+                    !assembly.TryGetProperty("relativePath", out var relativePath))
+                {
+                    truncatedInventory = true;
                     continue;
-                loaded.Add(InstalledApiCatalog.CreateLoadedAssemblyIdentity(relativePath.GetString()!, parsedMvid));
+                }
+                if (assemblyOrigin.ValueKind == JsonValueKind.String &&
+                    string.Equals(assemblyOrigin.GetString(), "game", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (assemblyOrigin.ValueKind == JsonValueKind.String &&
+                    string.Equals(assemblyOrigin.GetString(), "mod", StringComparison.OrdinalIgnoreCase) &&
+                    relativePath.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(relativePath.GetString()))
+                {
+                    loaded.Add(InstalledApiCatalog.CreateLoadedAssemblyIdentity(relativePath.GetString()!,
+                        nameElement.GetString()!, versionElement.GetString()!, parsedMvid));
+                    continue;
+                }
+                if (assemblyOrigin.ValueKind == JsonValueKind.Null && relativePath.ValueKind == JsonValueKind.Null)
+                {
+                    loaded.Add(InstalledApiCatalog.CreateLoadedAssemblyIdentity(
+                        nameElement.GetString()!, versionElement.GetString()!, parsedMvid));
+                    continue;
+                }
+                truncatedInventory = true;
             }
-            truncatedInventory = bridgeStatus.TryGetProperty("loadedAssembliesTruncated", out var truncated) &&
-                                 truncated.ValueKind == JsonValueKind.True;
         }
         if (unavailable is null)
         {
             var diagnostic = truncatedInventory
-                ? "Assembly scope: loaded (mods reported by the running game); the bridge inventory was truncated, so some loaded mods may be missing."
+                ? "Assembly scope: loaded (mods reported by the running game); the bridge inventory was incomplete, so some loaded mods may be missing."
                 : "Assembly scope: loaded (mods reported by the running game).";
             return CreateScope(requested, loaded, truncatedInventory, diagnostic);
         }
@@ -116,9 +151,14 @@ public static class ApiDiscoveryTools
         var assemblies = loaded is null
             ? Array.Empty<ScopeAssembly>()
             : loaded.Select(identity => new ScopeAssembly(
-                    OperatingSystem.IsWindows() ? identity.RelativePath.ToUpperInvariant() : identity.RelativePath,
+                    identity.RelativePath is null ? null :
+                        (OperatingSystem.IsWindows() ? identity.RelativePath.ToUpperInvariant() : identity.RelativePath),
+                    identity.Name,
+                    identity.Version,
                     identity.ModuleVersionId))
                 .OrderBy(identity => identity.RelativePath, StringComparer.Ordinal)
+                .ThenBy(identity => identity.Name, StringComparer.Ordinal)
+                .ThenBy(identity => identity.Version, StringComparer.Ordinal)
                 .ThenBy(identity => identity.ModuleVersionId)
                 .ToArray();
         var bytes = JsonSerializer.SerializeToUtf8Bytes(
@@ -129,7 +169,7 @@ public static class ApiDiscoveryTools
 
     private sealed record ScopeFingerprint(string Requested, string Effective, bool InventoryTruncated,
         ScopeAssembly[] LoadedAssemblies);
-    private sealed record ScopeAssembly(string RelativePath, Guid ModuleVersionId);
+    private sealed record ScopeAssembly(string? RelativePath, string? Name, string? Version, Guid ModuleVersionId);
 
     [McpServerTool(Name = "api_type", Title = "Inspect an installed API type", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(JsonObject))]
     [Description("Inspect a discovered type's declaration, bases, interfaces, generic constraints, and paged members. Use the type symbolId and assemblyId from api_search; inherited members report their declaring assembly and type. Carry snapshotId and nextOffset to continue. Members omit fields identical to the type's own provenance; inherited members from other assemblies keep assemblyId and declaringType.")]
@@ -160,7 +200,7 @@ public static class ApiDiscoveryTools
     [Description("One-based first source line in symbol mode.")] int startLine = 1,
     [Description("Number of source lines to return in symbol mode.")] int lineCount = 200,
     [Description("Snapshot identifier from the previous page.")] string? snapshotId = null,
-    [Description("Assembly scope for query modes: auto (default), installed (game plus enabled mods; offline modding), or loaded (only what the running game loaded; for evaluate_csharp).")] string? scope = null,
+    [Description("Assembly scope for query modes: auto (default), installed (game plus enabled mods; offline modding), or loaded (game APIs plus installed mods matching the running game's paged assembly inventory).")] string? scope = null,
     CancellationToken cancellationToken = default) =>
     ToolInvocation.Run(async () =>
     {

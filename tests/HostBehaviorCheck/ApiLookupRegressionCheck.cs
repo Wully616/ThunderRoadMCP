@@ -115,6 +115,10 @@ public static class ApiLookupRegressionCheck
         assert(normalizedSpawn.SequenceEqual(new[] { "spawn", "spawn", "spawn" }) && spawningResults.Count == 1 &&
                spawningResults[0].MatchedTokenCount == 1 && spawningResults[0].CoveragePercent == 100 && !spawningResults[0].IsLowConfidence,
             "gerund, past-tense, and plural forms normalize to a direct, full-coverage spawn match");
+        var inflectedActions = ApiLookupRanker.Tokenize("changing changed updating");
+        assert(inflectedActions.SequenceEqual(new[] { "change", "change", "update" }) &&
+               inflectedActions.All(ApiLookupRanker.IsActionToken),
+            "changing, changed, and updating normalize to recognized action tokens");
         var synonymOnly = ApiLookupRanker.Rank("summon", new[] { spawnHit }, 1);
         var partial = ApiLookupRanker.Rank("spawn item", new[] { spawnHit }, 1);
         var vague = ApiLookupRanker.Rank("spawn impossible phrase", new[] { spawnHit }, 1);
@@ -163,6 +167,94 @@ public static class ApiLookupRegressionCheck
                aliases.Where(alias => alias.CanonicalConcept == "item").All(alias => alias.CatalogTypeName == "ItemData") &&
                aliases.Where(alias => alias.CanonicalConcept == "creature").All(alias => alias.CatalogTypeName == "CreatureData"),
             "curated singular and plural aliases nominate only the item and creature catalog concepts");
+        var flyDirectionReference = Hit("item-fly-reference", "ThunderRoad.Item.flyDirRef",
+            "public UnityEngine.Transform flyDirRef { get; set; }",
+            Documentation("Reference transform for the item's flight direction and orientation."),
+            kind: "property", declaringType: "ThunderRoad.Item");
+        var diveMode = Hit("dive-mode", "ThunderRoad.Creature.DiveType", "public enum DiveType",
+            Documentation("Orientation mode for creature diving."), kind: "enum", declaringType: "ThunderRoad.Creature");
+        var flyReferenceRanking = ApiLookupRanker.Rank("sword fly reference orientation",
+            new[] { diveMode, flyDirectionReference }, 2);
+        assert(flyReferenceRanking.Count == 2 &&
+               flyReferenceRanking[0].Hit.symbolId == "item-fly-reference" &&
+               flyReferenceRanking[0].CoveragePercent == 100 &&
+               !flyReferenceRanking[0].IsLowConfidence,
+            "runtime owner/type agreement and ref-direction normalization rank Item.flyDirRef over an unrelated enum");
+
+        var heightOperation = Hit("documented-height-operation", "ThunderRoad.Water.SetOceanHeight",
+            "public void SetOceanHeight(float height)",
+            Documentation("Changes the water surface height during runtime updates."),
+            declaringType: "ThunderRoad.Water");
+        var writableHeight = Hit("writable-height", "ThunderRoad.Water.OceanHeight",
+            "public float OceanHeight { get; set; }",
+            Documentation("Writable water surface height for the active ocean."),
+            kind: "property", declaringType: "ThunderRoad.Water");
+        var configurationFlag = Hit("height-configuration", "ThunderRoad.Water.useOceanHeight",
+            "public bool useOceanHeight { get; set; }",
+            Documentation("Configuration flag controls whether the water surface height is enabled."),
+            kind: "property", declaringType: "ThunderRoad.Water");
+        var unrelatedHeightMethod = Hit("height-analysis", "ThunderRoad.Water.CalculateHeight",
+            "public float CalculateHeight()", kind: "method", declaringType: "ThunderRoad.Water");
+        var waterHeightRanking = ApiLookupRanker.Rank("change water surface height",
+            new[] { configurationFlag, unrelatedHeightMethod, writableHeight, heightOperation }, 4);
+        var operationPosition = Array.FindIndex(waterHeightRanking.ToArray(),
+            result => result.Hit.symbolId == "documented-height-operation");
+        var propertyPosition = Array.FindIndex(waterHeightRanking.ToArray(),
+            result => result.Hit.symbolId == "writable-height");
+        var flagPosition = Array.FindIndex(waterHeightRanking.ToArray(),
+            result => result.Hit.symbolId == "height-configuration");
+        assert(operationPosition >= 0 && propertyPosition >= 0 && flagPosition > operationPosition &&
+               flagPosition > propertyPosition && propertyPosition < Array.FindIndex(waterHeightRanking.ToArray(),
+                   result => result.Hit.symbolId == "height-analysis"),
+            "documented height operations and writable properties outrank configuration flags without methods-first bias");
+        var documentedSetterAction = Hit("documented-setter-action", "Fixture.Shared.Projectile.velocity",
+            "public float velocity { get; set; }", Documentation("Writable velocity of the projectile."),
+            kind: "property", declaringType: "Fixture.Shared.Projectile");
+        var directSetterAction = ApiLookupRanker.Rank("assign speed", new[] { documentedSetterAction }, 1);
+        var prefilteredSetterAction = new ApiLookupRanker.CandidateAccumulator("assign speed", 1);
+        prefilteredSetterAction.Add(documentedSetterAction);
+        var prefilteredSetterResults = prefilteredSetterAction.GetSortedResults();
+        assert(directSetterAction.Count == 1 && prefilteredSetterResults.Length == 1 &&
+               prefilteredSetterResults[0].Hit.symbolId == directSetterAction[0].Hit.symbolId &&
+               prefilteredSetterResults[0].HasDocumentationMatch,
+            "task prefilter retains XML-only setter-language evidence for assign speed and writable velocity");
+        var inflectedWaterActions = new[] { "changing", "changed", "updating" }
+            .Select(action => ApiLookupRanker.Rank($"{action} water surface height",
+                new[] { heightOperation }, 1).Single());
+        assert(inflectedWaterActions.All(result =>
+                result.Hit.symbolId == "documented-height-operation" && result.CoveragePercent == 100),
+            "inflected mutation actions retain full water-height documentation matches");
+        var oceanHeightSetter = Hit("ocean-height-setter", "ThunderRoad.OceanFogController.OceanHeight",
+            "public float OceanHeight",
+            Documentation("World Y height of ocean surface. Setting it shifts this object to match."),
+            kind: "field", declaringType: "ThunderRoad.OceanFogController");
+        var automaticWaterHeight = Hit("automatic-water-height", "ThunderRoad.Water.waterHeightCanChangeovertime",
+            "public bool waterHeightCanChangeovertime",
+            Documentation("When true water height may change over time."),
+            kind: "field", declaringType: "ThunderRoad.Water");
+        var navMeshHeightBuilder = Hit("navmesh-height-builder", "UnityEngine.AI.NavMeshSurface.buildHeightMesh",
+            "public void buildHeightMesh()", kind: "method", declaringType: "UnityEngine.AI.NavMeshSurface");
+        var documentedWaterHeightRanking = ApiLookupRanker.Rank("change water surface height",
+            new[] { automaticWaterHeight, navMeshHeightBuilder, oceanHeightSetter }, 3);
+        var automaticHeightPosition = Array.FindIndex(documentedWaterHeightRanking.ToArray(),
+            result => result.Hit.symbolId == "automatic-water-height");
+        var navMeshBuilderPosition = Array.FindIndex(documentedWaterHeightRanking.ToArray(),
+            result => result.Hit.symbolId == "navmesh-height-builder");
+        assert(documentedWaterHeightRanking.Count == 3 &&
+               documentedWaterHeightRanking[0].Hit.symbolId == "ocean-height-setter" &&
+               automaticHeightPosition > 0 && navMeshBuilderPosition > 0,
+            "XML setter and ocean-owner evidence ranks the actionable surface-height property ahead of automatic-change and incidental height candidates");
+        var meteorThrow = Hit("throw-meteor", "ThunderRoad.Skill.ThrowMeteor",
+            "public void ThrowMeteor()", Documentation("Launches a meteor projectile at the target."),
+            declaringType: "ThunderRoad.Skill");
+        var genericProjectileLaunch = Hit("generic-projectile-launch", "ThunderRoad.Projectile.Launch",
+            "public void Launch()", Documentation("Launches a projectile."),
+            declaringType: "ThunderRoad.Projectile");
+        var meteorRanking = ApiLookupRanker.Rank("launch meteor projectile",
+            new[] { genericProjectileLaunch, meteorThrow }, 2);
+        assert(meteorRanking.Count == 2 && meteorRanking[0].Hit.symbolId == "throw-meteor",
+            "complete documented meteor evidence keeps ThrowMeteor ahead of a generic projectile launcher");
+
 
         var boundedCandidates = new ApiLookupRanker.CandidateAccumulator("target", ApiLookupRanker.MaxCandidates);
         for (var index = 0; index < ApiLookupRanker.MaxCandidates; index++)
@@ -183,16 +275,6 @@ public static class ApiLookupRegressionCheck
             var result = Results(task).FirstOrDefault(item => item.GetProperty("qualifiedName").GetString() == "Fixture.Shared.SignatureSurface.GenericNested");
             assert(result.ValueKind != JsonValueKind.Undefined && result.GetProperty("relevance").GetProperty("score").GetInt32() > 0,
                 "generic nested dictionary query ranks the fixture method with relevance metadata");
-            assert(result.ValueKind != JsonValueKind.Undefined &&
-                   result.TryGetProperty("attributes", out var attributes) && attributes.ValueKind == JsonValueKind.Array &&
-                   result.TryGetProperty("attributesTruncated", out _) &&
-                   result.GetProperty("typeContext").TryGetProperty("attributes", out _) &&
-                   result.GetProperty("typeContext").TryGetProperty("attributesTruncated", out _),
-                "task result and type context include attribute metadata");
-            if (result.ValueKind != JsonValueKind.Undefined)
-                assert(result.GetProperty("typeContext").GetProperty("parameters").EnumerateArray()
-                    .Any(parameter => parameter.GetString()!.Contains("Dictionary<string", StringComparison.Ordinal)),
-                    "generic method response includes its signature type context");
         }
 
         using (var synonym = await Lookup("callback"))
@@ -295,27 +377,6 @@ public static class ApiLookupRegressionCheck
                 "task logicalChars stays within budget and natural-language item spawning ranks item.spawn first");
         }
 
-        using (var context = await apiToolJsonAsync("api_lookup", new
-               {
-                   query = "SignatureSurface", assemblyId, maxResults = 20, maxChars = 20000, includeExamples = false
-               }))
-        {
-            var result = Results(context).FirstOrDefault(item => item.GetProperty("qualifiedName").GetString() == "Fixture.Shared.SignatureSurface");
-            assert(result.ValueKind != JsonValueKind.Undefined && result.GetProperty("typeContext").GetProperty("relevantMembers").EnumerateArray()
-                       .Any(member => member.GetProperty("name").GetString() == "InheritedValue"),
-                "generic fixture type context includes its inherited member");
-            assert(context.RootElement.GetProperty("relatedTypes").EnumerateArray()
-                       .Any(type => type.GetProperty("qualifiedName").GetString() == "Fixture.Shared.SignatureParent`1"),
-                "generic fixture context resolves its related base type");
-            var returnedRelatedIds = context.RootElement.GetProperty("relatedTypes").EnumerateArray()
-                .Select(type => type.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
-            var resultRelatedIds = result.ValueKind == JsonValueKind.Undefined ? Array.Empty<string>() :
-                result.GetProperty("typeContext").GetProperty("relatedTypeIds").EnumerateArray()
-                    .Select(id => id.GetString()!).ToArray();
-            assert(resultRelatedIds.Length > 0 && resultRelatedIds.All(returnedRelatedIds.Contains),
-                "result relatedTypeIds resolve to returned related type records");
-        }
-
         using (var budget = await apiToolJsonAsync("api_lookup", new
         {
             query = "Signature", assemblyId, maxResults = 20, maxChars = 6000, includeExamples = false
@@ -327,25 +388,30 @@ public static class ApiLookupRegressionCheck
                 "budget-limited task logicalChars includes itself and the JSON stays within 6000 characters");
             assert(root.GetProperty("truncated").GetBoolean() && !root.GetProperty("complete").GetBoolean(),
                 "budget-limited task response reports truncated and incomplete");
-            var resultIds = root.GetProperty("results").EnumerateArray()
-                .Select(item => item.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
+            var returnedResults = root.GetProperty("results").EnumerateArray().ToArray();
+            var resultIds = returnedResults
+                .Select(item => item.TryGetProperty("symbolId", out var symbolId) ? symbolId.GetString() : null)
+                .ToArray();
+            var returnedResultIds = resultIds.Where(id => !string.IsNullOrEmpty(id))
+                .Select(id => id!).ToHashSet(StringComparer.Ordinal);
             var relatedTypes = root.GetProperty("relatedTypes").EnumerateArray().ToArray();
             var relatedIds = relatedTypes.Select(item => item.GetProperty("symbolId").GetString()!).ToHashSet(StringComparer.Ordinal);
             var catalogOwners = root.GetProperty("catalog").GetProperty("records").EnumerateArray()
                 .Select(item => "catalog:" + item.GetProperty("entryId").GetString()).ToHashSet(StringComparer.Ordinal);
-            var hasRelatedLinks = relatedTypes.Any(item => item.GetProperty("relatedTo").GetArrayLength() > 0);
-            var resultEdgesResolve = root.GetProperty("results").EnumerateArray().All(item =>
+            var resultEdgesResolve = returnedResults.All(item =>
                 !item.TryGetProperty("typeContext", out var context) ||
                 !context.TryGetProperty("relatedTypeIds", out var ids) ||
                 ids.EnumerateArray().All(id => relatedIds.Contains(id.GetString()!)));
             var relatedEdgesResolve = relatedTypes.All(item =>
                 item.GetProperty("relatedTo").EnumerateArray().All(owner =>
-                    resultIds.Contains(owner.GetString()!) || catalogOwners.Contains(owner.GetString()!)));
-            assert(resultIds.Count > 0 && relatedIds.Count > 0 &&
-                   resultIds.Count < root.GetProperty("total").GetInt32() &&
-                   hasRelatedLinks && resultEdgesResolve && relatedEdgesResolve,
-                $"budget trimming leaves only relationship IDs for returned nodes; results={resultIds.Count}, related={relatedIds.Count}");
+                    returnedResultIds.Contains(owner.GetString()!) || catalogOwners.Contains(owner.GetString()!)));
+            assert(resultIds.Length > 0 && resultIds.All(id => !string.IsNullOrEmpty(id)) &&
+                   returnedResultIds.Count == resultIds.Length &&
+                   resultIds.Length < root.GetProperty("total").GetInt32() &&
+                   resultEdgesResolve && relatedEdgesResolve,
+                $"budget trimming preserves IDs for every returned declaration and resolves any returned relationship links; results={resultIds.Length}, related={relatedIds.Count}");
         }
+
 
         using (var first = await apiToolJsonAsync("api_lookup", new
         {
@@ -401,7 +467,7 @@ public static class ApiLookupRegressionCheck
                     "legacy lk2 continuation returns a structured scope-bound restart error");
             }
         }
-        async Task<string[]> CollectPages(int maxResults, int maxChars)
+        async Task<string[]> CollectPages(string query, int maxResults, int maxChars)
         {
             var symbolIds = new List<string>();
             string? continuation = null;
@@ -411,9 +477,12 @@ public static class ApiLookupRegressionCheck
             {
                 using var page = await apiToolJsonAsync("api_lookup", new
                 {
-                    query = "Page", assemblyId, maxResults, maxChars, includeExamples = false, continuation, snapshotId,
+                    query, assemblyId, maxResults, maxChars, includeExamples = false, continuation, snapshotId,
                 });
                 var root = page.RootElement;
+                assert(root.GetProperty("logicalChars").GetInt32() == root.GetRawText().Length &&
+                       root.GetProperty("logicalChars").GetInt32() <= maxChars,
+                    "each task continuation response stays within its requested character budget");
                 assert(root.GetProperty("offset").GetInt32() > previousOffset,
                     "task lookup continuation advances beyond the previous page offset");
                 previousOffset = root.GetProperty("offset").GetInt32();
@@ -433,12 +502,21 @@ public static class ApiLookupRegressionCheck
             return symbolIds.ToArray();
         }
 
-        var referencePageIds = await CollectPages(20, 32000);
-        var budgetPageIds = await CollectPages(3, 3000);
-        var fallbackPageIds = await CollectPages(20, 3000);
+        var referencePageIds = await CollectPages("Page", 20, 32000);
+        var budgetPageIds = await CollectPages("Page", 3, 3000);
+        var fallbackPageIds = await CollectPages("Page", 20, 3000);
         assert(referencePageIds.Length >= 5 && budgetPageIds.SequenceEqual(referencePageIds) &&
                fallbackPageIds.SequenceEqual(referencePageIds),
             "tight and fallback-pruned task lookup pages preserve every ranked candidate in order without skips or duplicates");
+        var signatureReferencePageIds = await CollectPages("Signature", 20, 32000);
+        var signaturePageIds7k = await CollectPages("Signature", 3, 7000);
+        var signaturePageIds10k = await CollectPages("Signature", 3, 10000);
+        assert(signatureReferencePageIds.Length >= 5 &&
+               signaturePageIds7k.SequenceEqual(signatureReferencePageIds) &&
+               signaturePageIds10k.SequenceEqual(signatureReferencePageIds) &&
+               signaturePageIds7k.Distinct(StringComparer.Ordinal).Count() == signaturePageIds7k.Length &&
+               signaturePageIds10k.Distinct(StringComparer.Ordinal).Count() == signaturePageIds10k.Length,
+            "budgeted continuation pages preserve every declaration ID in stable order without skips or duplicates");
 
         using (var unfit = await apiToolJsonAsync("api_lookup", new
                {

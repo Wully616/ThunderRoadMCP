@@ -62,11 +62,14 @@ internal static class BridgeResultContractCheck
             "oversized evaluation envelope becomes a small parseable structured failure within the 64-KiB limit");
 
         VerifyRoslynDiagnostics(handler);
+        VerifyWarningFloodDiagnostics(handler);
         VerifyEvaluationOutcomes(handler);
         VerifyPostStartCancellation(handler);
         VerifyPostInvocationCancellation(handler);
         VerifyBoundedCompilerDiagnostics(handler);
+        VerifyClippedFailureMessage();
     }
+
 
     private static void VerifyRoslynDiagnostics(BridgeRequestHandler handler)
     {
@@ -90,6 +93,38 @@ internal static class BridgeResultContractCheck
                 "compiler errors preserve readable text and actual Roslyn ID, severity, message, and snippet coordinates");
         }
     }
+    private static void VerifyWarningFloodDiagnostics(BridgeRequestHandler handler)
+    {
+        string code = string.Join("\n", Enumerable.Repeat("#warning repeated diagnostic", 25)) +
+            "\nreturn missingAfterWarnings;";
+        try
+        {
+            DispatchAndDrain(handler, EvaluationRequest(code));
+            throw new Exception("Expected the warning-flood evaluation to fail compilation.");
+        }
+        catch (BridgeEvaluationException exception)
+        {
+            var diagnostics = JArray.FromObject(exception.diagnostics);
+            int firstError = exception.Message.IndexOf("CS0103", StringComparison.Ordinal);
+            int firstWarning = exception.Message.IndexOf("CS1030", StringComparison.Ordinal);
+            int retainedRepeatedWarnings = diagnostics.Count(item => (string)item["id"] == "CS1030");
+            int distinctWarningLines = diagnostics.Children<JObject>()
+                .Where(item => (string)item["id"] == "CS1030")
+                .Select(item => (int)item["line"])
+                .Distinct()
+                .Count();
+            var allDiagnostics = exception.InnerException?.GetType().GetProperty("Diagnostics")
+                ?.GetValue(exception.InnerException) as System.Collections.IEnumerable;
+            int omittedCount = (allDiagnostics?.Cast<object>().Count() ?? 0) - diagnostics.Count;
+            Assert(diagnostics.Count == 20 && (string)diagnostics[0]["id"] == "CS0103" &&
+                   diagnostics.Count(item => (string)item["severity"] == "warning") == 19 &&
+                   retainedRepeatedWarnings >= 2 && distinctWarningLines == retainedRepeatedWarnings &&
+                   firstError >= 0 && firstWarning > firstError && exception.diagnosticsTruncated &&
+                   exception.omittedDiagnosticCount == omittedCount && omittedCount >= 6,
+                "late compiler errors rank ahead of warning floods while repeated warnings at distinct source locations remain and omissions are counted");
+        }
+    }
+
 
     private static void VerifyEvaluationOutcomes(BridgeRequestHandler handler)
     {
@@ -228,11 +263,27 @@ internal static class BridgeResultContractCheck
             var responseDiagnostic = ((JArray)response["diagnostics"]).Children<JObject>()
                 .Single(item => (string)item["id"] == "CS0103");
             Assert(((string)diagnostic["message"]).Length == 256 &&
+                   (bool)diagnostic["messageTruncated"] &&
                    ((string)responseDiagnostic["message"]).Length == 256 &&
+                   (bool)responseDiagnostic["messageTruncated"] &&
+                   (bool)response["diagnosticsTruncated"] == false &&
+                   (int)response["omittedDiagnosticCount"] == 0 &&
                    responseBytes.Length <= BridgeRequestHandler.MaxLineBytes &&
                    responseBytes[responseBytes.Length - 1] == (byte)'\n',
-                "long Roslyn messages are bounded before the structured bridge error envelope is serialized");
+                "long Roslyn messages carry truthful per-message truncation metadata within the bounded bridge envelope");
         }
+    }
+
+    private static void VerifyClippedFailureMessage()
+    {
+        var failure = new BridgeEvaluationException("evaluation.compilation_failed", new string('x', 5000),
+            "not_started");
+        byte[] responseBytes = SerializeFailure(failure);
+        var response = JObject.Parse(Encoding.UTF8.GetString(responseBytes).TrimEnd('\n'));
+        Assert(((string)response["error"]).Length == 4096 && (bool)response["messageTruncated"] &&
+               responseBytes.Length <= BridgeRequestHandler.MaxLineBytes &&
+               responseBytes[responseBytes.Length - 1] == (byte)'\n',
+            "bridge error clipping is explicitly reported and remains within the bounded wire payload");
     }
 
     private static byte[] SerializeFailure(BridgeEvaluationException exception)

@@ -211,21 +211,23 @@ namespace ThunderRoadMcp.Bridge
         private static async Task WriteFailure(Stream stream, string id, string error, Dictionary<string, double> timings, TcpClient client)
         {
             if (error == null) error = "Request failed.";
-            if (error.Length > 4096)
+            bool messageTruncated = error.Length > 4096;
+            if (messageTruncated)
             {
                 const string marker = " …[truncated]";
                 error = error.Substring(0, 4096 - marker.Length) + marker;
             }
             object response = timings is null
-                ? new { id, success = false, error }
-                : (object)new { id, success = false, error, timings };
+                ? new { id, success = false, error, messageTruncated }
+                : (object)new { id, success = false, error, messageTruncated, timings };
             await WriteResponse(stream, id, response, client, timings).ConfigureAwait(false);
         }
         internal static async Task WriteFailure(Stream stream, string id, BridgeEvaluationException failure,
             Dictionary<string, double> timings, TcpClient client)
         {
             string error = failure.Message ?? "Evaluation failed.";
-            if (error.Length > 4096)
+            bool messageTruncated = error.Length > 4096;
+            if (messageTruncated)
             {
                 const string marker = " …[truncated]";
                 error = error.Substring(0, 4096 - marker.Length) + marker;
@@ -235,9 +237,12 @@ namespace ThunderRoadMcp.Bridge
                 ["id"] = id,
                 ["success"] = false,
                 ["error"] = error,
+                ["messageTruncated"] = messageTruncated,
                 ["errorCode"] = failure.errorCode,
                 ["executionOutcome"] = failure.executionOutcome,
-                ["diagnostics"] = failure.diagnostics
+                ["diagnostics"] = failure.diagnostics,
+                ["diagnosticsTruncated"] = failure.diagnosticsTruncated,
+                ["omittedDiagnosticCount"] = failure.omittedDiagnosticCount
             };
             if (timings != null)
                 response["timings"] = timings;
@@ -247,12 +252,13 @@ namespace ThunderRoadMcp.Bridge
         private static async Task WriteFailure(Stream stream, string id, string error, TcpClient client)
         {
             if (error == null) error = "Request failed.";
-            if (error.Length > 4096)
+            bool messageTruncated = error.Length > 4096;
+            if (messageTruncated)
             {
                 const string marker = " …[truncated]";
                 error = error.Substring(0, 4096 - marker.Length) + marker;
             }
-            await WriteResponse(stream, id, new { id, success = false, error }, client).ConfigureAwait(false);
+            await WriteResponse(stream, id, new { id, success = false, error, messageTruncated }, client).ConfigureAwait(false);
         }
 
 

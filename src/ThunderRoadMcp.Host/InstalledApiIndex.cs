@@ -2,6 +2,7 @@ using System.Reflection.Metadata.Ecma335;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Xml;
 using System.Xml.Linq;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.Documentation;
@@ -11,7 +12,7 @@ using ICSharpCode.Decompiler.TypeSystem;
 public sealed partial class InstalledApiCatalog
 {
     private const int ApiIndexSchemaVersion = 6;
-    private const string ApiFormatterVersion = "signature-v11+xml-docs-v1";
+    private const string ApiFormatterVersion = "signature-v11+xml-docs-v2";
     private const int MaxApiIndexFileBytes = 32 * 1024 * 1024;
     private const long MaxApiIndexMemoryBytes = 384L * 1024 * 1024;
     private const long MaxApiIndexDiskBytes = 384L * 1024 * 1024;
@@ -531,27 +532,76 @@ public sealed partial class InstalledApiCatalog
             return null;
 
         var path = Path.ChangeExtension(entry.FullPath, ".xml");
-        if (!File.Exists(path))
-            throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed during the request; rerun discovery.");
-        var canonicalPath = ResolveCanonicalPath(path);
-        if (!PathComparer.Equals(canonicalPath, entry.XmlDocumentationPath))
-            throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed during the request; rerun discovery.");
-
         try
         {
-            using var stream = new FileStream(canonicalPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            var length = stream.Length;
-            var contentHash = Convert.ToHexString(SHA256.HashData(stream));
-            if (stream.Length != length || !contentHash.Equals(entry.XmlDocumentationContentHash, StringComparison.Ordinal))
-                throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed during the request; rerun discovery.");
-            return new XmlDocumentationProvider(canonicalPath);
+            return CreateXmlDocumentationProvider(entry.Root, path, entry.XmlDocumentationPath,
+                entry.XmlDocumentationContentHash);
         }
-        catch (AssemblyChangedException) { throw; }
+        catch (AssemblyChangedException exception)
+        {
+            throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed during the request; rerun discovery.", exception);
+        }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or
-                                          InvalidOperationException or NotSupportedException or System.Xml.XmlException)
+                                          InvalidOperationException or NotSupportedException or XmlException or OverflowException)
         {
             throw new AssemblyChangedException($"XML documentation for '{entry.Origin}/{entry.RelativePath}' changed or became invalid during the request; rerun discovery.", exception);
         }
+    }
+
+    internal static XmlDocumentationProvider CreateXmlDocumentationProvider(
+        string root, string path, string expectedCanonicalPath, string expectedContentHash)
+    {
+        var canonicalPath = ResolveCanonicalPath(path);
+        if (!PathComparer.Equals(canonicalPath, expectedCanonicalPath))
+            throw new AssemblyChangedException("XML documentation path changed during the request; rerun discovery.");
+        EnsureAllowedCanonicalAssemblyPath(root, "game", canonicalPath);
+
+        using var stream = new FileStream(canonicalPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        EnsureAllowedOpenedAssemblyPath(root, "game", stream);
+        var length = stream.Length;
+        var bytes = new byte[checked((int)length)];
+        stream.ReadExactly(bytes);
+        if (stream.ReadByte() != -1 || stream.Length != length)
+            throw new AssemblyChangedException("XML documentation changed while it was being read.");
+        VerifyEntryPath(root, path, canonicalPath);
+        var contentHash = Convert.ToHexString(SHA256.HashData(bytes));
+        if (!contentHash.Equals(expectedContentHash, StringComparison.Ordinal))
+            throw new AssemblyChangedException("XML documentation changed during the request; rerun discovery.");
+        return new AdmittedXmlDocumentationProvider(bytes);
+    }
+
+    private sealed class AdmittedXmlDocumentationProvider : XmlDocumentationProvider
+    {
+        private readonly Dictionary<string, string> _documentation = new(StringComparer.Ordinal);
+
+        public AdmittedXmlDocumentationProvider(byte[] bytes)
+        {
+            using var stream = new MemoryStream(bytes, writable: false);
+            using var reader = XmlReader.Create(stream, new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null,
+            });
+            if (reader.MoveToContent() != XmlNodeType.Element || reader.LocalName != "doc" ||
+                reader.NamespaceURI.Length != 0)
+                throw new XmlException("The XML documentation root element must be <doc>.");
+            while (!reader.EOF)
+            {
+                if (reader.NodeType == XmlNodeType.Element && reader.LocalName == "member" &&
+                    reader.NamespaceURI.Length == 0)
+                {
+                    var key = reader.GetAttribute("name");
+                    var documentation = reader.ReadInnerXml();
+                    if (key is not null)
+                        _documentation.TryAdd(key, documentation);
+                    continue;
+                }
+                reader.Read();
+            }
+        }
+
+        public override string? GetDocumentation(string documentationKey) =>
+            _documentation.GetValueOrDefault(documentationKey);
     }
 
     private static ApiXmlDocumentation? ReadXmlDocumentation(IEntity entity, XmlDocumentationProvider? provider)
@@ -567,7 +617,7 @@ public sealed partial class InstalledApiCatalog
         string? ReadSingle(string name)
         {
             var element = documentation.Children.FirstOrDefault(child => child.Name == name);
-            return element is null ? null : TakeXmlDocumentationText(element.TextContent, ref remaining, ref truncated);
+            return element is null ? null : TakeXmlDocumentationText(XmlDocumentationText(element), ref remaining, ref truncated);
         }
 
         var summary = ReadSingle("summary");
@@ -576,7 +626,7 @@ public sealed partial class InstalledApiCatalog
         foreach (var parameter in documentation.Children.Where(child => child.Name == "param"))
         {
             var name = TakeXmlDocumentationText(parameter.GetAttribute("name"), ref remaining, ref truncated);
-            var description = TakeXmlDocumentationText(parameter.TextContent, ref remaining, ref truncated);
+            var description = TakeXmlDocumentationText(XmlDocumentationText(parameter), ref remaining, ref truncated);
             if (!string.IsNullOrEmpty(name) && description is not null)
                 (parameters ??= new()).Add(new ApiXmlDocumentationParameter(name, description));
         }
@@ -585,7 +635,7 @@ public sealed partial class InstalledApiCatalog
         List<string>? examples = null;
         foreach (var example in documentation.Children.Where(child => child.Name == "example"))
         {
-            var text = TakeXmlDocumentationText(example.TextContent, ref remaining, ref truncated);
+            var text = TakeXmlDocumentationText(XmlDocumentationText(example), ref remaining, ref truncated);
             if (text is not null)
                 (examples ??= new()).Add(text);
         }
@@ -594,6 +644,33 @@ public sealed partial class InstalledApiCatalog
             return null;
         return new ApiXmlDocumentation(summary, remarks, parameters?.ToArray(), returns, value, examples?.ToArray(),
             truncated ? true : null);
+    }
+    private static string XmlDocumentationText(XmlDocumentationElement element)
+    {
+        if (element.IsTextNode)
+            return element.TextContent;
+        if (element.Name is "paramref" or "typeparamref")
+            return element.GetAttribute("name") ?? "";
+        if (element.Name == "see")
+        {
+            var displayText = XmlDocumentationChildrenText(element);
+            if (!string.IsNullOrWhiteSpace(displayText))
+                return displayText;
+            var langword = element.GetAttribute("langword");
+            if (!string.IsNullOrEmpty(langword))
+                return langword;
+            var cref = element.GetAttribute("cref");
+            return cref is { Length: > 2 } && cref[1] == ':' ? cref[2..] : cref ?? "";
+        }
+        return XmlDocumentationChildrenText(element);
+    }
+
+    private static string XmlDocumentationChildrenText(XmlDocumentationElement element)
+    {
+        var builder = new StringBuilder();
+        foreach (var child in element.Children)
+            builder.Append(XmlDocumentationText(child));
+        return builder.ToString();
     }
 
     private static string? TakeXmlDocumentationText(string? text, ref int remaining, ref bool truncated)
@@ -1141,7 +1218,7 @@ public sealed partial class InstalledApiCatalog
     private static string ApiIndexIdentity(AssemblyEntry entry)
     {
         var value = string.Join("\n", "api-index", ApiIndexSchemaVersion.ToString(), ApiFormatterVersion,
-            ApiLookupRanker.Version, typeof(CSharpDecompiler).Assembly.GetName().Version?.ToString() ?? "unknown",
+            typeof(CSharpDecompiler).Assembly.GetName().Version?.ToString() ?? "unknown",
             Environment.Version.ToString(), entry.Id, entry.XmlDocumentationStatus, entry.XmlDocumentationContentHash ?? "");
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
     }

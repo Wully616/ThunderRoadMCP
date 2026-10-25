@@ -45,6 +45,7 @@ internal static class BridgeSelfTest
         Assert(runtimeProbe == "none", "eval compiles against the bridge runtime host");
 
         VerifyStatusAndAssemblyIdentity(thunderRoad, managed);
+        VerifyLoadedAssemblyPaging();
         VerifyRuntimeValues();
         VerifyRequestTimings();
         VerifyBridgeServerRoundTrip();
@@ -944,6 +945,36 @@ internal static class BridgeSelfTest
         Assert((string)reported["origin"] == "game" && (string)reported["relativePath"] == "ThunderRoad.dll",
             "ThunderRoad assembly origin and relative path");
         Assert((Guid)reported["moduleVersionId"] == thunderRoad.ManifestModule.ModuleVersionId, "ThunderRoad actual MVID reported");
+        Assembly byteLoadedBridge = Assembly.Load(File.ReadAllBytes(typeof(McpRuntime).Assembly.Location));
+        Assert(!byteLoadedBridge.IsDynamic && string.IsNullOrEmpty(byteLoadedBridge.Location),
+            "Assembly.Load(byte[]) fixture has a non-dynamic fileless location");
+        string externalManaged = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"), "Managed");
+        string externalMods = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"), "Mods");
+        Assembly locatedBridge = typeof(McpRuntime).Assembly;
+        Assert(!string.IsNullOrEmpty(locatedBridge.Location) &&
+               locatedBridge.GetName().Name == byteLoadedBridge.GetName().Name &&
+               locatedBridge.GetName().Version == byteLoadedBridge.GetName().Version &&
+               locatedBridge.ManifestModule.ModuleVersionId == byteLoadedBridge.ManifestModule.ModuleVersionId,
+            "located and byte-loaded bridge fixtures have identical assembly identity");
+        LoadedAssemblyStatus locatedInventory = BridgeRequestHandler.BuildLoadedAssemblyStatus(
+            new[] { locatedBridge }, externalManaged, externalMods);
+        Assert(locatedInventory.loadedAssemblyCount == 0 && locatedInventory.inventoryComplete,
+            "located assembly outside selected roots is excluded from inventory");
+        LoadedAssemblyStatus byteLoadedInventory = BridgeRequestHandler.BuildLoadedAssemblyStatus(
+            new[] { byteLoadedBridge }, externalManaged, externalMods);
+        JObject byteLoadedReported = (JObject)JObject.Parse(
+            BridgeRequestHandler.SerializeResult(byteLoadedInventory))["loadedAssemblies"][0];
+        Assert((string)byteLoadedReported["name"] == byteLoadedBridge.GetName().Name &&
+               (string)byteLoadedReported["version"] == byteLoadedBridge.GetName().Version.ToString() &&
+               (Guid)byteLoadedReported["moduleVersionId"] == byteLoadedBridge.ManifestModule.ModuleVersionId &&
+               byteLoadedReported["origin"].Type == JTokenType.Null &&
+               byteLoadedReported["relativePath"].Type == JTokenType.Null &&
+               byteLoadedInventory.inventoryComplete,
+            "byte-loaded bridge assembly retains exact identity with explicitly unknown provenance");
+        Assert(BridgeRequestHandler.BuildLoadedAssemblyStatus(
+                   new[] { byteLoadedBridge }, externalManaged, externalMods).inventorySnapshotId ==
+               byteLoadedInventory.inventorySnapshotId,
+            "fileless assembly inventory snapshot remains stable");
         JObject status = JObject.Parse(BridgeRequestHandler.SerializeResult(BridgeRequestHandler.BuildStatusPayload(
             1, "product", "game", "unity", "test-level", "Loaded", true, true, assemblyStatus)));
         Assert(status["currentLevel"].Type == JTokenType.String && (string)status["currentLevel"] == "test-level",
@@ -951,17 +982,168 @@ internal static class BridgeSelfTest
         Assert((string)status["levelState"] == "Loaded" && (bool)status["sceneReady"] &&
             status["loadedAssemblies"].Type == JTokenType.Array &&
             (Guid)status["loadedAssemblies"][0]["moduleVersionId"] == thunderRoad.ManifestModule.ModuleVersionId &&
-            (int)status["loadedAssemblyCount"] == 1 && !(bool)status["loadedAssembliesTruncated"],
-            "status inventory opt-in retains assembly inventory and MVID");
+            (int)status["loadedAssemblyCount"] == 1 && !(bool)status["loadedAssembliesTruncated"] &&
+            (bool)status["inventoryComplete"],
+            "status inventory opt-in retains assembly inventory, MVID, and completeness");
         JObject compactStatus = JObject.Parse(BridgeRequestHandler.SerializeResult(BridgeRequestHandler.BuildStatusPayload(
             1, "product", "game", "unity", "test-level", "Loaded", true, false, assemblyStatus)));
         Assert(compactStatus.Property("loadedAssemblies") == null &&
                compactStatus.Property("loadedAssemblyCount") == null &&
-               compactStatus.Property("loadedAssembliesTruncated") == null,
+               compactStatus.Property("loadedAssembliesTruncated") == null &&
+               compactStatus.Property("inventoryComplete") == null,
             "compact status omits loaded assembly inventory");
         JObject noLevelStatus = JObject.Parse(BridgeRequestHandler.SerializeResult(BridgeRequestHandler.BuildStatusPayload(
             1, "product", "game", "unity", null, "Unloaded", false, false, assemblyStatus)));
         Assert(noLevelStatus["currentLevel"].Type == JTokenType.Null, "status currentLevel can be null");
+    }
+    private static void VerifyLoadedAssemblyPaging()
+    {
+        const int assemblyCount = 130;
+        var entries = new object[assemblyCount];
+        for (int index = 0; index < assemblyCount - 1; index++)
+        {
+            entries[index] = new
+            {
+                name = "Game." + index.ToString("D3"),
+                version = "1.0.0.0",
+                moduleVersionId = Guid.NewGuid(),
+                origin = "game",
+                relativePath = "Game." + index.ToString("D3") + ".dll"
+            };
+        }
+        entries[assemblyCount - 1] = new
+        {
+            name = "Late.Mod",
+            version = "1.0.0.0",
+            moduleVersionId = Guid.NewGuid(),
+            origin = "mod",
+            relativePath = "ZMod/Late.Mod.dll"
+        };
+        var inventory = new LoadedAssemblyStatus
+        {
+            allLoadedAssemblies = entries,
+            loadedAssemblies = new object[128],
+            loadedAssemblyCount = assemblyCount,
+            loadedAssembliesTruncated = true,
+            inventoryComplete = true,
+            inventorySnapshotId = "loaded1.fixture"
+        };
+
+        int offset = 0;
+        int pageCount = 0;
+        int collected = 0;
+        bool foundLateMod = false;
+        while (true)
+        {
+            string json = BridgeRequestHandler.BuildLoadedAssemblyPage(
+                inventory, offset, 32, offset == 0 ? null : inventory.inventorySnapshotId);
+            Assert(System.Text.Encoding.UTF8.GetByteCount(json) <= BridgeRequestHandler.MaxLineBytes - 512,
+                "loaded assembly page stays within the bridge result budget");
+            JObject page = JObject.Parse(json);
+            JArray assemblies = (JArray)page["loadedAssemblies"];
+            Assert((string)page["inventorySnapshotId"] == inventory.inventorySnapshotId &&
+                   (int)page["loadedAssemblyCount"] == assemblyCount &&
+                   (bool)page["inventoryComplete"],
+                "loaded assembly page identity and completeness are stable");
+            pageCount++;
+            collected += assemblies.Count;
+            foreach (var item in assemblies)
+            {
+                var assembly = (JObject)item;
+                if ((string)assembly["origin"] == "mod" && (string)assembly["relativePath"] == "ZMod/Late.Mod.dll")
+                    foundLateMod = true;
+            }
+
+            JToken next = page["nextOffset"];
+            bool hasMore = next.Type != JTokenType.Null;
+            Assert((bool)page["loadedAssembliesTruncated"] == hasMore,
+                "page truncation metadata agrees with its continuation");
+            if (!hasMore) break;
+            int nextOffset = (int)next;
+            Assert(nextOffset == offset + assemblies.Count && nextOffset > offset,
+                "loaded assembly pages advance without gaps");
+            offset = nextOffset;
+        }
+        Assert(pageCount == 5 && collected == assemblyCount && foundLateMod,
+            "bounded loaded assembly pages include late-sorted mods beyond the former cap");
+
+        bool staleRejected = false;
+        try
+        {
+            BridgeRequestHandler.BuildLoadedAssemblyPage(inventory, 32, 32, "loaded1.stale");
+        }
+        catch (InvalidDataException exception)
+        {
+            staleRejected = exception.Message.Contains("changed");
+        }
+        Assert(staleRejected, "loaded assembly pages reject changed inventory snapshots");
+        const int unicodeAssemblyCount = 4;
+        var unicodeEntries = new object[unicodeAssemblyCount];
+        for (int index = 0; index < unicodeEntries.Length; index++)
+        {
+            unicodeEntries[index] = new
+            {
+                name = "Mod.界." + index,
+                version = "1.0.0.0",
+                moduleVersionId = Guid.NewGuid(),
+                origin = "mod",
+                relativePath = "Mods/" + new string('界', 12000) + "/" + index + ".dll"
+            };
+        }
+        var unicodeInventory = new LoadedAssemblyStatus
+        {
+            allLoadedAssemblies = unicodeEntries,
+            loadedAssemblies = new object[0],
+            loadedAssemblyCount = unicodeAssemblyCount,
+            inventoryComplete = true,
+            inventorySnapshotId = "loaded1.unicode"
+        };
+        int unicodeOffset = 0;
+        int unicodePages = 0;
+        int unicodeCollected = 0;
+        while (unicodeOffset < unicodeAssemblyCount)
+        {
+            string pageJson = BridgeRequestHandler.BuildLoadedAssemblyPage(
+                unicodeInventory, unicodeOffset, 32, unicodeOffset == 0 ? null : unicodeInventory.inventorySnapshotId);
+            Assert(System.Text.Encoding.UTF8.GetByteCount(pageJson) <= BridgeRequestHandler.MaxLineBytes - 512,
+                "multibyte long-path pages fit the UTF-8 response budget");
+            JObject page = JObject.Parse(pageJson);
+            int pageItems = ((JArray)page["loadedAssemblies"]).Count;
+            Assert(pageItems > 0, "multibyte page always advances by at least one identity");
+            unicodeCollected += pageItems;
+            unicodePages++;
+            JToken next = page["nextOffset"];
+            if (next.Type == JTokenType.Null) break;
+            unicodeOffset = (int)next;
+        }
+        Assert(unicodePages > 1 && unicodeCollected == unicodeAssemblyCount,
+            "multibyte long paths reduce page item count without omitting identities");
+
+        var oversizedInventory = new LoadedAssemblyStatus
+        {
+            allLoadedAssemblies = new object[]
+            {
+                new
+                {
+                    name = "Oversized.Mod",
+                    version = "1.0.0.0",
+                    moduleVersionId = Guid.NewGuid(),
+                    origin = "mod",
+                    relativePath = new string('界', 22000)
+                }
+            },
+            loadedAssemblies = new object[0],
+            loadedAssemblyCount = 1,
+            inventoryComplete = true,
+            inventorySnapshotId = "loaded1.oversized"
+        };
+        bool oversizedIdentityRejected = false;
+        try { BridgeRequestHandler.BuildLoadedAssemblyPage(oversizedInventory, 0, 32, null); }
+        catch (InvalidDataException exception)
+        {
+            oversizedIdentityRejected = exception.Message.Contains("64 KiB UTF-8 response budget");
+        }
+        Assert(oversizedIdentityRejected, "a single oversized identity fails with actionable response-budget guidance");
     }
 
     private static void VerifyReferenceSourcePrecedence(string managed)

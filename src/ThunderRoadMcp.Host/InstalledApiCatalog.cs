@@ -1,3 +1,6 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using System.Globalization;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
@@ -157,8 +160,7 @@ public sealed partial class InstalledApiCatalog
             cancellationToken.ThrowIfCancellationRequested();
             if (origin is not null && entry.Origin != origin)
                 continue;
-            if (loadedModAssemblies is not null && entry.Origin == "mod" &&
-                !loadedModAssemblies.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId))))
+            if (loadedModAssemblies is not null && entry.Origin == "mod" && !Matches(entry, loadedModAssemblies))
                 continue;
             try
             {
@@ -765,11 +767,11 @@ public sealed partial class InstalledApiCatalog
                     byte[] bytes;
                     try
                     {
-                        bytes = await ReadEntryBytesAsync(root, file, cancellationToken);
+                        bytes = await ReadEntryBytesAsync(root, file, configuredRoot.Origin, cancellationToken);
                     }
                     catch (AssemblyTooLargeException tooLarge)
                     {
-                        var oversizedContentHash = await HashOversizedEntryAsync(root, file, tooLarge.Length, cancellationToken);
+                        var oversizedContentHash = await HashOversizedEntryAsync(root, file, configuredRoot.Origin, tooLarge.Length, cancellationToken);
                         AddDiagnostic(diagnostics, $"Ignored {configuredRoot.Origin}/{relativePath}: DLL exceeds the {MaxAssemblyBytes} byte scan limit.");
                         fingerprints.Add($"{configuredRoot.Origin}|{relativePath}|oversize|{oversizedContentHash}");
                         continue;
@@ -848,7 +850,7 @@ public sealed partial class InstalledApiCatalog
                 return new XmlDocumentationScan(null, "invalid", "The XML documentation sidecar resolves outside the game Managed directory.", null);
 
             var contentHash = await HashXmlDocumentationAsync(root, canonicalDocumentation, cancellationToken);
-            var diagnostic = ValidateXmlDocumentation(canonicalDocumentation, assemblyName);
+            var diagnostic = ValidateXmlDocumentation(root, canonicalDocumentation, assemblyName);
             return diagnostic is null
                 ? new XmlDocumentationScan(canonicalDocumentation, "available", null, contentHash)
                 : new XmlDocumentationScan(canonicalDocumentation, "invalid", diagnostic, contentHash);
@@ -870,6 +872,7 @@ public sealed partial class InstalledApiCatalog
             throw new IOException("Resolved XML documentation path leaves its configured installation root.");
         await using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read, FileShare.Read,
             65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        EnsureAllowedOpenedAssemblyPath(root, "game", stream);
         var length = stream.Length;
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[65536];
@@ -886,9 +889,11 @@ public sealed partial class InstalledApiCatalog
         return Convert.ToHexString(hash.GetHashAndReset());
     }
 
-    private static string? ValidateXmlDocumentation(string path, string assemblyName)
+    private static string? ValidateXmlDocumentation(string root, string path, string assemblyName)
     {
-        using var reader = XmlReader.Create(path, new XmlReaderSettings
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        EnsureAllowedOpenedAssemblyPath(root, "game", stream);
+        using var reader = XmlReader.Create(stream, new XmlReaderSettings
         {
             DtdProcessing = DtdProcessing.Prohibit,
             XmlResolver = null,
@@ -956,14 +961,14 @@ public sealed partial class InstalledApiCatalog
                             AddDiagnostic(diagnostics, $"Skipped reparse point under {origin}/{Path.GetRelativePath(root, path).Replace(Path.DirectorySeparatorChar, '/')}; links are not traversed.");
                             continue;
                         }
-                        var canonical = ResolveCanonicalPath(path);
-                        if (!IsUnderRoot(canonical, root))
-                        {
-                            AddDiagnostic(diagnostics, $"Skipped path outside the canonical {origin} root: {Path.GetRelativePath(root, path).Replace(Path.DirectorySeparatorChar, '/')}.");
-                            continue;
-                        }
                         if ((attributes & FileAttributes.Directory) != 0)
                         {
+                            var canonical = ResolveCanonicalPath(path);
+                            if (!IsUnderRoot(canonical, root))
+                            {
+                                AddDiagnostic(diagnostics, $"Skipped path outside the canonical {origin} root: {Path.GetRelativePath(root, path).Replace(Path.DirectorySeparatorChar, '/')}.");
+                                continue;
+                            }
                             stack.Push((canonical, depth + 1));
                         }
                         else if (Path.GetExtension(path).Equals(".dll", StringComparison.OrdinalIgnoreCase))
@@ -974,7 +979,8 @@ public sealed partial class InstalledApiCatalog
                                 truncated = true;
                                 return files;
                             }
-                            files.Add(canonical);
+                            // ReadEntryBytesAsync rechecks the canonical path before reading a DLL.
+                            files.Add(path);
                         }
                     }
                     catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
@@ -1015,7 +1021,7 @@ public sealed partial class InstalledApiCatalog
         byte[] bytes;
         try
         {
-            bytes = await ReadEntryBytesAsync(entry.Root, entry.FullPath, cancellationToken);
+            bytes = await ReadEntryBytesAsync(entry.Root, entry.FullPath, entry.Origin, cancellationToken);
         }
         catch (AssemblyTooLargeException)
         {
@@ -1028,7 +1034,7 @@ public sealed partial class InstalledApiCatalog
         return OpenPe(entry.FullPath, bytes);
     }
 
-    private static async Task<byte[]> ReadEntryBytesAsync(string root, string fullPath, CancellationToken cancellationToken)
+    private static async Task<byte[]> ReadEntryBytesAsync(string root, string fullPath, string origin, CancellationToken cancellationToken)
     {
         using var timing = ToolTiming.Measure("apiFileValidationMs");
         Exception? lastFailure = null;
@@ -1038,10 +1044,10 @@ public sealed partial class InstalledApiCatalog
             try
             {
                 var canonical = ResolveCanonicalPath(fullPath);
-                if (!IsUnderRoot(canonical, root))
-                    throw new IOException("Resolved assembly path leaves its configured installation root.");
+                EnsureAllowedCanonicalAssemblyPath(root, origin, canonical);
                 await using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read,
                     FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                EnsureAllowedOpenedAssemblyPath(root, origin, stream);
                 if (stream.Length > MaxAssemblyBytes)
                 {
                     VerifyEntryPath(root, fullPath, canonical);
@@ -1066,7 +1072,7 @@ public sealed partial class InstalledApiCatalog
         throw AssemblyChanged(fullPath, lastFailure);
     }
 
-    private static async Task<string> HashOversizedEntryAsync(string root, string fullPath, long expectedLength,
+    private static async Task<string> HashOversizedEntryAsync(string root, string fullPath, string origin, long expectedLength,
         CancellationToken cancellationToken)
     {
         using var timing = ToolTiming.Measure("apiFileValidationMs");
@@ -1078,10 +1084,10 @@ public sealed partial class InstalledApiCatalog
             try
             {
                 var canonical = ResolveCanonicalPath(fullPath);
-                if (!IsUnderRoot(canonical, root))
-                    throw new IOException("Resolved assembly path leaves its configured installation root.");
+                EnsureAllowedCanonicalAssemblyPath(root, origin, canonical);
                 await using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read,
                     FileShare.Read, buffer.Length, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                EnsureAllowedOpenedAssemblyPath(root, origin, stream);
                 if (stream.Length != expectedLength || stream.Length <= MaxAssemblyBytes)
                     throw new AssemblyChangedException("Assembly size changed while it was being scanned.");
                 using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -1115,6 +1121,58 @@ public sealed partial class InstalledApiCatalog
         if (!IsUnderRoot(after, root) || !PathComparer.Equals(canonical, after))
             throw new AssemblyChangedException("Assembly path changed while it was being read.");
     }
+
+    private static void EnsureAllowedCanonicalAssemblyPath(string root, string origin, string canonical)
+    {
+        if (!IsUnderRoot(canonical, root))
+            throw new IOException("Resolved assembly path leaves its configured installation root.");
+        if (origin == "mod" && IsUnderscorePrefixedModFolder(Path.GetRelativePath(root, canonical).Replace(Path.DirectorySeparatorChar, '/')))
+            throw new IOException("Resolved assembly path is inside a disabled mod folder.");
+    }
+    internal static void EnsureAllowedOpenedAssemblyPath(string root, string origin, FileStream opened)
+    {
+        if (!OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException("Opened-file admission requires Windows handle path resolution.");
+        var canonicalRoot = NormalizeWindowsPath(root);
+        var openedPath = ResolveOpenedFilePath(opened.SafeFileHandle);
+        EnsureAllowedCanonicalAssemblyPath(canonicalRoot, origin, openedPath);
+    }
+
+    private static string ResolveOpenedFilePath(SafeFileHandle handle)
+    {
+        var buffer = new StringBuilder(512);
+        while (true)
+        {
+            var length = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, 0);
+            if (length == 0)
+                throw new IOException("Could not resolve the opened file handle path.",
+                    new Win32Exception(Marshal.GetLastWin32Error()));
+            if (length >= buffer.Capacity)
+            {
+                buffer.EnsureCapacity(checked((int)length + 1));
+                continue;
+            }
+            return NormalizeWindowsPath(buffer.ToString(0, (int)length));
+        }
+    }
+
+    private static string NormalizeWindowsPath(string path)
+    {
+        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+            path = @"\\" + path[8..];
+        else if (path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase) &&
+                 path.Length >= 7 && char.IsAsciiLetter(path[4]) && path[5] == ':' &&
+                 (path[6] == Path.DirectorySeparatorChar || path[6] == Path.AltDirectorySeparatorChar))
+            path = path[4..];
+        if (!Path.IsPathFullyQualified(path))
+            throw new IOException("Resolved Windows path is not fully qualified.");
+        return Path.GetFullPath(path);
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", CharSet = CharSet.Unicode,
+        ExactSpelling = true, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder path, uint pathLength, uint flags);
+
 
     private static AssemblyChangedException AssemblyChanged(string fullPath, Exception? innerException = null) =>
         new($"Installed assembly '{Path.GetFileName(fullPath)}' changed or could not be read consistently after {MaxAssemblyReadAttempts} attempts; rerun api_assemblies and use its current IDs.", innerException);
@@ -1153,13 +1211,26 @@ public sealed partial class InstalledApiCatalog
         new(LoadedAssemblyIdentityComparer.Instance);
 
     internal static LoadedAssemblyIdentity CreateLoadedAssemblyIdentity(string relativePath, Guid moduleVersionId) =>
-        new(relativePath.Replace('\\', '/'), moduleVersionId);
+        new(relativePath.Replace('\\', '/'), moduleVersionId, null, null);
+
+    internal static LoadedAssemblyIdentity CreateLoadedAssemblyIdentity(string name, string version, Guid moduleVersionId) =>
+        new(null, moduleVersionId, name, version);
+
+    internal static LoadedAssemblyIdentity CreateLoadedAssemblyIdentity(string relativePath, string name, string version,
+        Guid moduleVersionId) =>
+        new(relativePath.Replace('\\', '/'), moduleVersionId, name, version);
+
+    private static bool Matches(AssemblyEntry entry, IReadOnlySet<LoadedAssemblyIdentity> loaded)
+    {
+        var moduleVersionId = Guid.Parse(entry.ModuleVersionId);
+        return loaded.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, moduleVersionId)) ||
+               loaded.Contains(CreateLoadedAssemblyIdentity(entry.Name, entry.Version, moduleVersionId));
+    }
     /// <summary>Ids of installed mod assemblies the bridge did not report as loaded; empty for installed scope.</summary>
     private static HashSet<string> ExcludedModAssemblyIds(CatalogSnapshot snapshot, IReadOnlySet<LoadedAssemblyIdentity>? loaded) =>
         loaded is null
             ? new HashSet<string>(StringComparer.Ordinal)
-            : snapshot.Assemblies.Where(entry => entry.Origin == "mod" &&
-                    !loaded.Contains(CreateLoadedAssemblyIdentity(entry.RelativePath, Guid.Parse(entry.ModuleVersionId))))
+            : snapshot.Assemblies.Where(entry => entry.Origin == "mod" && !Matches(entry, loaded))
                 .Select(entry => entry.Id).ToHashSet(StringComparer.Ordinal);
 
     private static bool IsUnderscorePrefixedModFolder(string relativePath) =>
@@ -1916,7 +1987,7 @@ public sealed partial class InstalledApiCatalog
         return Path.GetFullPath(current);
     }
 
-    private static byte[] ReadEntryBytes(string root, string fullPath)
+    private static byte[] ReadEntryBytes(string root, string fullPath, string origin)
     {
         Exception? lastFailure = null;
         for (var attempt = 0; attempt < MaxAssemblyReadAttempts; attempt++)
@@ -1924,9 +1995,9 @@ public sealed partial class InstalledApiCatalog
             try
             {
                 var canonical = ResolveCanonicalPath(fullPath);
-                if (!IsUnderRoot(canonical, root))
-                    throw new IOException("Resolved assembly path leaves its configured installation root.");
+                EnsureAllowedCanonicalAssemblyPath(root, origin, canonical);
                 using var stream = new FileStream(canonical, FileMode.Open, FileAccess.Read, FileShare.Read);
+                EnsureAllowedOpenedAssemblyPath(root, origin, stream);
                 if (stream.Length > MaxAssemblyBytes)
                     throw new AssemblyChangedException($"Installed assembly '{Path.GetFileName(fullPath)}' grew beyond the scan limit.");
                 var bytes = new byte[checked((int)stream.Length)];
@@ -2020,7 +2091,7 @@ public sealed partial class InstalledApiCatalog
             }
             try
             {
-                var bytes = selected.ScanBytes ?? ReadEntryBytes(selected.Root, selected.FullPath);
+                var bytes = selected.ScanBytes ?? ReadEntryBytes(selected.Root, selected.FullPath, selected.Origin);
                 if (selected.ScanBytes is null)
                 {
                     var contentHash = Convert.ToHexString(SHA256.HashData(bytes));
@@ -2073,17 +2144,27 @@ public sealed partial class InstalledApiCatalog
     }
 
 
-    internal readonly record struct LoadedAssemblyIdentity(string RelativePath, Guid ModuleVersionId);
+    internal readonly record struct LoadedAssemblyIdentity(string? RelativePath, Guid ModuleVersionId, string? Name, string? Version);
 
     private sealed class LoadedAssemblyIdentityComparer : IEqualityComparer<LoadedAssemblyIdentity>
     {
         public static readonly LoadedAssemblyIdentityComparer Instance = new();
 
-        public bool Equals(LoadedAssemblyIdentity left, LoadedAssemblyIdentity right) =>
-            left.ModuleVersionId == right.ModuleVersionId && PathComparer.Equals(left.RelativePath, right.RelativePath);
+        public bool Equals(LoadedAssemblyIdentity left, LoadedAssemblyIdentity right)
+        {
+            if (left.ModuleVersionId != right.ModuleVersionId) return false;
+            if (left.RelativePath is not null || right.RelativePath is not null)
+                return left.RelativePath is not null && right.RelativePath is not null &&
+                       PathComparer.Equals(left.RelativePath, right.RelativePath);
+            return string.Equals(left.Name, right.Name, StringComparison.Ordinal) &&
+                   string.Equals(left.Version, right.Version, StringComparison.Ordinal);
+        }
 
         public int GetHashCode(LoadedAssemblyIdentity identity) =>
-            HashCode.Combine(PathComparer.GetHashCode(identity.RelativePath), identity.ModuleVersionId);
+            identity.RelativePath is not null
+                ? HashCode.Combine(0, PathComparer.GetHashCode(identity.RelativePath), identity.ModuleVersionId)
+                : HashCode.Combine(1, StringComparer.Ordinal.GetHashCode(identity.Name ?? string.Empty),
+                    StringComparer.Ordinal.GetHashCode(identity.Version ?? string.Empty), identity.ModuleVersionId);
     }
 
     private sealed record InstallRoot(string Origin, string Path);

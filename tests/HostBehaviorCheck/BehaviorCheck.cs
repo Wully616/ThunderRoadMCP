@@ -179,9 +179,12 @@ var bridgeRequests = 0;
 var delayNextLevelRequest = 0;
 var reloadAlreadyCurrentNext = 0;
 var sameLevelReloadPhase = 0;
-var oldBridgeStatus = false;
+var unsupportedLoadedInventory = false;
+var malformedLoadedInventoryPage = false;
 var oldBridgeRuntime = false;
 var loadedInventoryTruncated = false;
+var changeInventoryAfterFirstPage = 0;
+var loadedInventoryVersion = 0;
 string loadedModMvid;
 using (var loadedModStream = File.OpenRead(apiModSharedPath))
 using (var loadedModPe = new PEReader(loadedModStream))
@@ -189,6 +192,20 @@ using (var loadedModPe = new PEReader(loadedModStream))
     var loadedModMetadata = loadedModPe.GetMetadataReader();
     loadedModMvid = loadedModMetadata.GetGuid(loadedModMetadata.GetModuleDefinition().Mvid).ToString("D");
 }
+var byteLoadedMod = System.Reflection.Assembly.Load(File.ReadAllBytes(apiModSharedPath));
+Assert(!byteLoadedMod.IsDynamic && string.IsNullOrEmpty(byteLoadedMod.Location),
+    "Assembly.Load(byte[]) mod fixture has a non-dynamic fileless location");
+var byteLoadedModName = byteLoadedMod.GetName();
+var filelessLoadedMod = new
+{
+    name = byteLoadedModName.Name,
+    version = byteLoadedModName.Version!.ToString(),
+    moduleVersionId = byteLoadedMod.ManifestModule.ModuleVersionId.ToString("D"),
+    origin = (string?)null,
+    relativePath = (string?)null,
+};
+Assert(filelessLoadedMod.moduleVersionId == loadedModMvid,
+    "byte-loaded mod fixture uses the installed DLL's real MVID");
 var loadedAssemblyFixture = new List<object>
 {
     new
@@ -333,23 +350,11 @@ try
             Assert(inventory.GetProperty("loadedAssemblies").GetArrayLength() == 1 &&
                    inventory.GetProperty("loadedAssemblies")[0].GetProperty("moduleVersionId").GetString() == loadedModMvid &&
                    inventory.GetProperty("loadedAssemblyCount").GetInt32() == 1 &&
-                   !inventory.GetProperty("loadedAssembliesTruncated").GetBoolean(),
-                "game_status explicitly requests loaded assembly inventory and preserves MVID metadata");
+                   !inventory.GetProperty("loadedAssembliesTruncated").GetBoolean() &&
+                   inventory.GetProperty("inventoryComplete").GetBoolean(),
+                "game_status explicitly requests loaded assembly inventory, MVID, and completeness");
         }
     }
-    oldBridgeStatus = true;
-    using (var oldStatus = await ApiToolJsonAsync("game_status", new { }))
-    {
-        var status = oldStatus.RootElement;
-        var rawStatus = status.GetProperty("status");
-        Assert(status.GetProperty("currentLevel").ValueKind == JsonValueKind.Null &&
-               status.GetProperty("levelState").ValueKind == JsonValueKind.Null &&
-               status.GetProperty("sceneReady").ValueKind == JsonValueKind.Null &&
-               !rawStatus.TryGetProperty("loadedAssemblies", out _) &&
-               rawStatus.GetProperty("loadedAssemblyCount").GetInt32() == 1,
-            "older bridge inventory is stripped while its other raw fields remain");
-    }
-    oldBridgeStatus = false;
 
     using (var waitReady = await ApiToolJsonAsync("game_wait_ready", new { level = "arena" }))
     {
@@ -829,6 +834,25 @@ async Task CheckApiToolsAsync()
             candidate.GetProperty("catalogArchivePath").GetString() is { Length: > 0 }),
         "game_installations reports store, executable, and catalog paths for every candidate");
 
+    unsupportedLoadedInventory = true;
+    using (var unsupportedInventory = await ToolAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(IsError(unsupportedInventory) &&
+               ErrorText(unsupportedInventory).Contains("update/reinstall the ThunderRoadMcp bridge mod", StringComparison.Ordinal),
+            "unsupported bridge paging returns actionable upgrade guidance instead of capped status inventory");
+    unsupportedLoadedInventory = false;
+    var originalLoadedIdentity = loadedAssemblyFixture[0];
+    malformedLoadedInventoryPage = true;
+    using (var malformedInventory = await ToolAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(IsError(malformedInventory) &&
+               ErrorText(malformedInventory).Contains("page offset", StringComparison.OrdinalIgnoreCase),
+            "malformed inventory page metadata is rejected");
+    malformedLoadedInventoryPage = false;
     using var incompleteAssemblies = await ApiToolJsonAsync("api_assemblies", new { offset = 0, limit = 50 });
     Assert(incompleteAssemblies.RootElement.GetProperty("assemblies").GetArrayLength() >= 2,
         "invalid and native files do not block unrelated managed assembly discovery");
@@ -843,6 +867,26 @@ async Task CheckApiToolsAsync()
     var modAssembly = modSharedAssemblies.RootElement.GetProperty("assemblies").EnumerateArray().Single();
     var gameAssemblyId = gameAssembly.GetProperty("assemblyId").GetString()!;
     var modAssemblyId = modAssembly.GetProperty("assemblyId").GetString()!;
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(new
+    {
+        name = "Fixture.Shared",
+        version = "1.0.0.0",
+        origin = (string?)null,
+        relativePath = (string?)null,
+    });
+    using (var missingIdentity = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(missingIdentity.RootElement.GetProperty("partial").GetBoolean() &&
+               missingIdentity.RootElement.GetProperty("scopeInventoryTruncated").GetBoolean() &&
+               missingIdentity.RootElement.GetProperty("results").GetArrayLength() == 1 &&
+               missingIdentity.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == gameAssemblyId,
+            "loaded scope marks a real identity missing its MVID incomplete without inventing a match");
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(originalLoadedIdentity);
+
     Assert(gameAssemblyId != modAssemblyId, "same-named game and mod assemblies have distinct IDs");
     Assert(gameAssembly.GetProperty("origin").GetString() == "game" && modAssembly.GetProperty("origin").GetString() == "mod", "assembly origin filters distinguish game and mod");
     using (var fixtureStream = File.OpenRead(apiGameSharedPath))
@@ -957,6 +1001,72 @@ async Task CheckApiToolsAsync()
            strictPageIds.Distinct(StringComparer.Ordinal).Count() == 2 &&
            strictPageIds.ToHashSet(StringComparer.Ordinal).SetEquals(sharedHits.Select(hit => hit.GetProperty("symbolId").GetString()!)),
         "unchanged strict search pages return every matching record once without shifting");
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(filelessLoadedMod);
+    using (var filelessLoadedSearch = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(filelessLoadedSearch.RootElement.GetProperty("results").EnumerateArray()
+                   .Any(hit => hit.GetProperty("assemblyId").GetString() == modAssemblyId) &&
+               !filelessLoadedSearch.RootElement.GetProperty("partial").GetBoolean(),
+            "fileless loaded mod matches its installed binary by exact name, version, and MVID");
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(new
+    {
+        name = filelessLoadedMod.name,
+        version = filelessLoadedMod.version,
+        moduleVersionId = Guid.Empty.ToString("D"),
+        origin = (string?)null,
+        relativePath = (string?)null,
+    });
+    using (var mismatchedFilelessSearch = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(mismatchedFilelessSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
+               mismatchedFilelessSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == gameAssemblyId &&
+               !mismatchedFilelessSearch.RootElement.GetProperty("partial").GetBoolean(),
+            "fileless loaded identity with nonmatching MVID does not include an installed mod or imply incomplete inventory");
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(new
+    {
+        name = filelessLoadedMod.name,
+        version = "9.9.9.9",
+        moduleVersionId = filelessLoadedMod.moduleVersionId,
+        origin = (string?)null,
+        relativePath = (string?)null,
+    });
+    using (var mismatchedFilelessVersionSearch = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(mismatchedFilelessVersionSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
+               mismatchedFilelessVersionSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == gameAssemblyId,
+            "fileless loaded identity with nonmatching version does not match an installed mod");
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(loadedModFixture);
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(new
+    {
+        name = "Fixture.Shared",
+        version = "1.0.0.0",
+        moduleVersionId = loadedModMvid,
+        origin = "mod",
+        relativePath = "OtherMod/Fixture.Shared.dll",
+    });
+    using (var mismatchedLocatedPathSearch = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(mismatchedLocatedPathSearch.RootElement.GetProperty("results").GetArrayLength() == 1 &&
+               mismatchedLocatedPathSearch.RootElement.GetProperty("results")[0].GetProperty("assemblyId").GetString() == gameAssemblyId,
+            "located loaded identity keeps path disambiguation even when name, version, and MVID match");
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(loadedModFixture);
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(loadedModFixture);
+    loadedAssemblyFixture.Clear();
     var mismatchedLoadedMod = new
     {
         name = "Fixture.Shared",
@@ -1036,6 +1146,49 @@ async Task CheckApiToolsAsync()
             "truncated loaded inventory marks task lookup incomplete");
     }
     loadedInventoryTruncated = false;
+    loadedAssemblyFixture.Clear();
+    for (int index = 0; index < 130; index++)
+    {
+        loadedAssemblyFixture.Add(new
+        {
+            name = "Game." + index.ToString("D3"),
+            version = "1.0.0.0",
+            moduleVersionId = Guid.NewGuid().ToString("D"),
+            origin = "game",
+            relativePath = "Game." + index.ToString("D3") + ".dll",
+        });
+    }
+    loadedAssemblyFixture.Add(loadedModFixture);
+    using (var pagedLoadedSearch = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+    {
+        var pagedLoadedRoot = pagedLoadedSearch.RootElement;
+        Assert(pagedLoadedRoot.GetProperty("results").EnumerateArray()
+                   .Any(hit => hit.GetProperty("assemblyId").GetString() == modAssemblyId) &&
+               !pagedLoadedRoot.GetProperty("scopeInventoryTruncated").GetBoolean() &&
+               !pagedLoadedRoot.GetProperty("partial").GetBoolean(),
+            "loaded scope pages past 128 game assemblies to include the late-sorted mod");
+    }
+    Interlocked.Exchange(ref changeInventoryAfterFirstPage, 1);
+    using (var changedInventorySearch = await ToolAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "loaded",
+           }))
+        Assert(IsError(changedInventorySearch) && ErrorText(changedInventorySearch).Contains("changed between pages", StringComparison.Ordinal),
+            "loaded scope rejects pages from different inventory snapshots");
+    using (var refreshedScope = await ApiToolJsonAsync("api_search", new
+           {
+               query = "SharedSurface", kind = "type", scope = "auto",
+           }))
+        Assert(refreshedScope.RootElement.GetProperty("effectiveScope").GetString() == "loaded" &&
+               !refreshedScope.RootElement.GetProperty("partial").GetBoolean() &&
+               refreshedScope.RootElement.GetProperty("results").EnumerateArray()
+                   .Any(hit => hit.GetProperty("assemblyId").GetString() == modAssemblyId),
+            "fresh scope resolution starts from the changed inventory instead of combining stale pages");
+    loadedAssemblyFixture.Clear();
+    loadedAssemblyFixture.Add(loadedModFixture);
     using var overloadSearch = await ApiToolJsonAsync("api_search", new { query = "overload", assemblyId = modAssemblyId });
     var overloads = overloadSearch.RootElement.GetProperty("results").EnumerateArray().ToArray();
     Assert(overloads.Length == 2 && overloads.Select(hit => hit.GetProperty("symbolId").GetString()).Distinct().Count() == 2,
@@ -1453,20 +1606,78 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
         var id = root.GetProperty("id").GetString();
         var parameters = root.GetProperty("parameters");
         var method = root.GetProperty("method").GetString();
+        if (method == "loaded_assemblies" && Volatile.Read(ref unsupportedLoadedInventory))
+        {
+            var unsupportedResponse = JsonSerializer.Serialize(new { id, success = false, error = "Unknown method: loaded_assemblies" }) + "\n";
+            await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(unsupportedResponse), token);
+            return;
+        }
+        if (method == "loaded_assemblies")
+        {
+            int offset = parameters.GetProperty("offset").GetInt32();
+            int limit = parameters.GetProperty("limit").GetInt32();
+            string? requestedSnapshot = parameters.TryGetProperty("snapshotId", out var requestedToken) &&
+                                       requestedToken.ValueKind == JsonValueKind.String
+                ? requestedToken.GetString()
+                : null;
+            string snapshot = "fixture." + Volatile.Read(ref loadedInventoryVersion);
+            if (requestedSnapshot is not null && requestedSnapshot != snapshot)
+            {
+                await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
+                {
+                    id,
+                    success = false,
+                    error = "Loaded assembly inventory changed between pages.",
+                }) + "\n"), token);
+                return;
+            }
+            var entries = loadedAssemblyFixture
+                .Select(entry => JsonSerializer.SerializeToElement(entry))
+                .OrderBy(entry => entry.GetProperty("origin").GetString(), StringComparer.Ordinal)
+                .ThenBy(entry => entry.GetProperty("relativePath").GetString(), StringComparer.Ordinal)
+                .ThenBy(entry => entry.GetProperty("name").GetString(), StringComparer.Ordinal)
+                .ThenBy(entry => entry.GetProperty("version").GetString(), StringComparer.Ordinal)
+                .ThenBy(entry => entry.TryGetProperty("moduleVersionId", out var mvid) &&
+                                 mvid.ValueKind == JsonValueKind.String ? mvid.GetString() : null, StringComparer.Ordinal)
+                .ToArray();
+            var pageAssemblies = entries.Skip(offset).Take(limit).ToArray();
+            int? nextOffset = offset + pageAssemblies.Length < entries.Length
+                ? offset + pageAssemblies.Length
+                : null;
+            if (Volatile.Read(ref malformedLoadedInventoryPage) && offset == 0)
+                nextOffset = offset;
+            var pageResult = new
+            {
+                inventorySnapshotId = snapshot,
+                inventoryComplete = !loadedInventoryTruncated,
+                loadedAssemblyCount = entries.Length,
+                loadedAssembliesOffset = offset,
+                loadedAssemblies = pageAssemblies,
+                loadedAssembliesTruncated = nextOffset.HasValue,
+                nextOffset,
+            };
+            var pageResponse = JsonSerializer.Serialize(new { id, success = true, result = pageResult }) + "\n";
+            if (offset == 0 && Interlocked.Exchange(ref changeInventoryAfterFirstPage, 0) != 0)
+            {
+                loadedAssemblyFixture.Add(new
+                {
+                    name = "Game.Changed",
+                    version = "1.0.0.0",
+                    moduleVersionId = Guid.NewGuid().ToString("D"),
+                    origin = "game",
+                    relativePath = "Game.Changed.dll",
+                });
+                Interlocked.Increment(ref loadedInventoryVersion);
+            }
+            await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(pageResponse), token);
+            return;
+        }
         if (method == "status")
         {
             var includeAssemblies = parameters.TryGetProperty("includeAssemblies", out var include) &&
                                     include.ValueKind == JsonValueKind.True;
             object statusResult;
-            if (oldBridgeStatus)
-                statusResult = new
-                {
-                    processId = 123,
-                    bridgeReady = true,
-                    loadedAssemblies = loadedAssemblyFixture,
-                    loadedAssemblyCount = loadedAssemblyFixture.Count,
-                };
-            else if (!includeAssemblies && Volatile.Read(ref sameLevelReloadPhase) > 0)
+            if (!includeAssemblies && Volatile.Read(ref sameLevelReloadPhase) > 0)
             {
                 var phase = Interlocked.CompareExchange(ref sameLevelReloadPhase, 0, 0);
                 if (phase == 1)
@@ -1493,9 +1704,10 @@ async Task HandleRequestAsync(TcpClient client, CancellationToken token)
                     currentLevel = "Arena",
                     levelState = "Loaded",
                     sceneReady = true,
-                    loadedAssemblies = loadedAssemblyFixture,
+                    loadedAssemblies = loadedAssemblyFixture.Take(128).ToArray(),
                     loadedAssemblyCount = loadedAssemblyFixture.Count,
-                    loadedAssembliesTruncated = loadedInventoryTruncated,
+                    loadedAssembliesTruncated = loadedInventoryTruncated || loadedAssemblyFixture.Count > 128,
+                    inventoryComplete = !loadedInventoryTruncated,
                 };
             else
                 statusResult = new { processId = 123, bridgeReady = true, currentLevel = "Arena", levelState = "Loaded", sceneReady = true };

@@ -14,7 +14,7 @@
       <example>XML_DOC_TYPE_EXAMPLE demonstrates normalized example text.</example>
     </member>
     <member name="M:Fixture.Shared.XmlDocumentationSurface.DocumentedOperation(System.String)">
-      <summary>XML_DOC_MEMBER_SUMMARY describes the documented operation.</summary>
+      <summary>XML_DOC_MEMBER_SUMMARY describes the documented operation at world <paramref name="point"/>; generic <typeparamref name="T"/> references <see cref="T:Fixture.Shared.SharedSurface"/>, plus <see langword="null"/> and <see cref="T:System.String"><c>XML_DOC_SEE_DISPLAY_LABEL</c></see>.</summary>
       <param name="target">XML_DOC_PARAMETER_DESCRIPTION identifies the operation target.</param>
       <returns>XML_DOC_RETURN_DESCRIPTION returns the documented target.</returns>
       <example>XML_DOC_MEMBER_EXAMPLE shows a member example.</example>

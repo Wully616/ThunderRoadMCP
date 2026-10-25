@@ -410,7 +410,7 @@ public sealed partial class InstalledApiCatalog
 
     private static async Task<NavigationMetadata> LoadNavigationMetadataAsync(AssemblyEntry entry, CancellationToken cancellationToken)
     {
-        var bytes = entry.ScanBytes ?? await ReadEntryBytesAsync(entry.Root, entry.FullPath, cancellationToken);
+        var bytes = entry.ScanBytes ?? await ReadEntryBytesAsync(entry.Root, entry.FullPath, entry.Origin, cancellationToken);
         if (entry.ScanBytes is null && !Convert.ToHexString(SHA256.HashData(bytes)).Equals(entry.ContentHash, StringComparison.Ordinal))
             throw new AssemblyChangedException($"Assembly '{entry.Origin}/{entry.RelativePath}' changed during navigation; rerun api_assemblies and use its fresh IDs.");
         var stream = new MemoryStream(bytes, writable: false);

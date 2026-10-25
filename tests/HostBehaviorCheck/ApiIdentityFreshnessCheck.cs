@@ -64,7 +64,71 @@ public static class ApiIdentityFreshnessCheck
             Directory.Delete(secondInstall, recursive: true);
         }
         await CheckXmlDocumentationAsync(apiToolJsonAsync, assert, context);
+        CheckOpenedHandleAdmission(assert, context);
     }
+
+    private static void CheckOpenedHandleAdmission(Action<bool, string> assert, ApiReuseContext context)
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var fixtureRoot = Path.Combine(context.WorkDirectory, "api-open-handle-" + Guid.NewGuid().ToString("N"));
+        var enabledRoot = Path.Combine(fixtureRoot, new string('a', 80), new string('b', 80), new string('c', 80));
+        var enabledAssembly = Path.Combine(enabledRoot, "Fixture.Shared.dll");
+        var modRoot = Path.Combine(fixtureRoot, "mods");
+        var disabledAssembly = Path.Combine(modRoot, "_disabled", "Fixture.Shared.dll");
+        var outsideAssembly = Path.Combine(fixtureRoot, "outside", "Fixture.Shared.dll");
+        try
+        {
+            Directory.CreateDirectory(ExtendedWindowsPath(enabledRoot));
+            Directory.CreateDirectory(ExtendedWindowsPath(Path.GetDirectoryName(disabledAssembly)!));
+            Directory.CreateDirectory(ExtendedWindowsPath(Path.GetDirectoryName(outsideAssembly)!));
+            File.WriteAllBytes(ExtendedWindowsPath(enabledAssembly), new byte[] { 1 });
+            File.WriteAllBytes(ExtendedWindowsPath(disabledAssembly), new byte[] { 1 });
+            File.WriteAllBytes(ExtendedWindowsPath(outsideAssembly), new byte[] { 1 });
+
+            using (var opened = new FileStream(ExtendedWindowsPath(enabledAssembly), FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                InstalledApiCatalog.EnsureAllowedOpenedAssemblyPath(ExtendedWindowsPath(enabledRoot).ToUpperInvariant(), "game", opened);
+                assert(true, "opened-handle admission accepts a long enabled root with casing and extended-prefix differences");
+            }
+
+            using (var opened = new FileStream(ExtendedWindowsPath(outsideAssembly), FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                var denied = IsDenied(enabledRoot, "game", opened);
+                assert(denied, "opened-handle admission rejects an opened target outside the selected root");
+            }
+
+            using (var opened = new FileStream(ExtendedWindowsPath(disabledAssembly), FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                var denied = IsDenied(modRoot, "mod", opened);
+                assert(denied, "opened-handle admission rejects an opened target in a disabled mod folder");
+            }
+        }
+        finally
+        {
+            Directory.Delete(ExtendedWindowsPath(fixtureRoot), recursive: true);
+        }
+
+        static bool IsDenied(string root, string origin, FileStream opened)
+        {
+            try
+            {
+                InstalledApiCatalog.EnsureAllowedOpenedAssemblyPath(root, origin, opened);
+                return false;
+            }
+            catch (IOException)
+            {
+                return true;
+            }
+        }
+
+        static string ExtendedWindowsPath(string path) =>
+            path.StartsWith(@"\\", StringComparison.Ordinal)
+                ? @"\\?\UNC\" + path[2..]
+                : @"\\?\" + path;
+    }
+
     private static async Task CheckXmlDocumentationAsync(
         Func<string, object, Task<JsonDocument>> apiToolJsonAsync, Action<bool, string> assert, ApiReuseContext context)
     {
@@ -78,6 +142,30 @@ public static class ApiIdentityFreshnessCheck
             var initialAssembly = initialAssemblies.RootElement.GetProperty("assemblies").EnumerateArray().Single();
             var assemblyId = initialAssembly.GetProperty("assemblyId").GetString()!;
             var initialSnapshot = initialAssemblies.RootElement.GetProperty("snapshotId").GetString()!;
+            if (OperatingSystem.IsWindows())
+            {
+                var provider = InstalledApiCatalog.CreateXmlDocumentationProvider(
+                    context.GameManagedDirectory, xmlPath, Path.GetFullPath(xmlPath),
+                    Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(originalXml)));
+                try
+                {
+                    var changedProviderXml = System.Text.Encoding.UTF8.GetString(originalXml)
+                        .Replace("XML_DOC_MEMBER_SUMMARY", "XML_DOC_CHANGED_MEMBER_SUMMARY", StringComparison.Ordinal);
+                    await File.WriteAllTextAsync(xmlPath, changedProviderXml);
+                    var providerText = provider.GetDocumentation(
+                        "M:Fixture.Shared.XmlDocumentationSurface.DocumentedOperation(System.String)");
+                    assert(providerText is not null &&
+                           providerText.Contains("XML_DOC_MEMBER_SUMMARY", StringComparison.Ordinal) &&
+                           !providerText.Contains("XML_DOC_CHANGED_MEMBER_SUMMARY", StringComparison.Ordinal),
+                        "XML provider serves its admitted, hashed bytes after the sidecar changes");
+                }
+                finally
+                {
+                    await File.WriteAllBytesAsync(xmlPath, originalXml);
+                    File.SetLastWriteTimeUtc(xmlPath, originalTimestamp);
+                }
+            }
+
             assert(initialAssembly.GetProperty("xmlDocumentation").GetProperty("status").GetString() == "available",
                 "matching XML sidecar is reported available");
 
@@ -104,6 +192,49 @@ public static class ApiIdentityFreshnessCheck
                    memberDocumentation.GetProperty("returns").GetString() ==
                        "XML_DOC_RETURN_DESCRIPTION returns the documented target.",
                 "api_type exposes normalized type, parameter, return, and example documentation");
+
+            var memberSummary = memberDocumentation.GetProperty("summary").GetString()!;
+            assert(memberSummary ==
+                   "XML_DOC_MEMBER_SUMMARY describes the documented operation at world point; generic T references Fixture.Shared.SharedSurface, plus null and XML_DOC_SEE_DISPLAY_LABEL.",
+                "XML inline references render parameter/type-parameter names, cref/langword labels, and nested display text once");
+            using var referenceSearch = await apiToolJsonAsync("api_search",
+                new { query = "Fixture.Shared.SharedSurface", assemblyId, kind = "method" });
+            var referenceHit = referenceSearch.RootElement.GetProperty("results").EnumerateArray()
+                .FirstOrDefault(hit => hit.GetProperty("qualifiedName").GetString() ==
+                                       "Fixture.Shared.XmlDocumentationSurface.DocumentedOperation");
+            assert(referenceHit.ValueKind != System.Text.Json.JsonValueKind.Undefined &&
+                   referenceHit.GetProperty("xmlDocumentation").GetProperty("summary").GetString() == memberSummary,
+                "api_search finds a cref identifier rendered from XML documentation");
+            string? lookupContinuation = null;
+            string? lookupSnapshotId = null;
+            var lookupFound = false;
+            for (var pageIndex = 0; pageIndex < 32; pageIndex++)
+            {
+                using var inlineLookup = await apiToolJsonAsync("api_lookup", new
+                {
+                    query = "Fixture.Shared.SharedSurface", assemblyId, kind = "method",
+                    maxResults = 5, maxChars = 16000, includeExamples = false,
+                    continuation = lookupContinuation, snapshotId = lookupSnapshotId,
+                });
+                var lookupRoot = inlineLookup.RootElement;
+                var lookupHit = lookupRoot.GetProperty("results").EnumerateArray()
+                    .FirstOrDefault(hit => hit.GetProperty("qualifiedName").GetString() ==
+                                           "Fixture.Shared.XmlDocumentationSurface.DocumentedOperation");
+                if (lookupHit.ValueKind != System.Text.Json.JsonValueKind.Undefined)
+                {
+                    assert(lookupHit.GetProperty("relevance").GetProperty("documentationMatch").GetBoolean(),
+                        "api_lookup ranks a cref identifier as XML documentation evidence");
+                    lookupFound = true;
+                    break;
+                }
+                if (!lookupRoot.GetProperty("hasMore").GetBoolean())
+                    break;
+                lookupContinuation = lookupRoot.GetProperty("continuation").GetString();
+                lookupSnapshotId = lookupRoot.GetProperty("snapshotId").GetString();
+                if (string.IsNullOrEmpty(lookupContinuation))
+                    break;
+            }
+            assert(lookupFound, "api_lookup continuation pages find a method documented by a cref identifier");
 
             using var source = await apiToolJsonAsync("api_decompile", new
             {
@@ -167,7 +298,7 @@ public static class ApiIdentityFreshnessCheck
                 new { query = "DocumentedOperation", assemblyId, kind = "method" });
             assert(changedMemberSearch.RootElement.GetProperty("results")[0].GetProperty("xmlDocumentation")
                        .GetProperty("summary").GetString() ==
-                   "XML_DOC_CHANGED_MEMBER_SUMMARY describes the documented operation.",
+                   "XML_DOC_CHANGED_MEMBER_SUMMARY describes the documented operation at world point; generic T references Fixture.Shared.SharedSurface, plus null and XML_DOC_SEE_DISPLAY_LABEL.",
                 "the rebuilt API index exposes updated sidecar text");
 
             File.Delete(xmlPath);

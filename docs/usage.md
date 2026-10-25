@@ -53,6 +53,8 @@ To enable host timings for an MCP session, set `THUNDERROAD_MCP_DIAGNOSTICS=1` i
 
 `game_spawn_item` resolves a catalog `ItemData` id and returns a runtime key; later calls retrieve the `Item` with `McpRuntime.Current.Get<Item>(key)`. A level load destroys the object, so remove the stale key and spawn again. For custom creature spawning use `api_lookup(query:"spawn a creature", includeExamples:true)` to resolve the installed API and full configuration/callback path; do not guess a spawn method. See the [game guide](game-guide.md).
 
+For custom live-item code, do not treat a non-null `Item` reference as proof the item is still owned: despawned items may be pooled and reused. Retain and unsubscribe the exact lifecycle delegates, release tracked ownership on `Item.OnDespawnEvent`, and ignore spawn callbacks after the owner stops. Check optional `Item.flyDirRef` before aiming an item, and avoid `Burning.Ignite` when the requested flame should be visual-only; see [safe gameplay probes](game-guide.md#safe-gameplay-probes).
+
 Event handlers must be retained and explicitly unsubscribed: keep the same delegate in `McpRuntime`, remove an earlier subscription before repeating setup, unsubscribe before removing its runtime key, and do not rely on `clear` to remove game events. See the guide's [managed runtime event example](game-guide.md#managed-runtime).
 
 ### Compile-checking examples without execution

@@ -150,8 +150,14 @@ public sealed class BridgeClient
             JsonElement? diagnostics = root.TryGetProperty("diagnostics", out var diagnosticElement)
                 ? diagnosticElement.Clone()
                 : null;
+            var messageTruncated = root.TryGetProperty("messageTruncated", out var messageTruncatedElement) &&
+                messageTruncatedElement.ValueKind == JsonValueKind.True;
+            var diagnosticsTruncated = root.TryGetProperty("diagnosticsTruncated", out var diagnosticsTruncatedElement) &&
+                diagnosticsTruncatedElement.ValueKind == JsonValueKind.True;
+            int? omittedDiagnosticCount = root.TryGetProperty("omittedDiagnosticCount", out var omittedDiagnosticCountElement) &&
+                omittedDiagnosticCountElement.TryGetInt32(out var count) && count >= 0 ? count : null;
             throw new BridgeRequestException(root.GetProperty("error").GetString() ?? "Bridge request failed.",
-                errorCode, executionOutcome, diagnostics);
+                errorCode, executionOutcome, diagnostics, messageTruncated, diagnosticsTruncated, omittedDiagnosticCount);
         }
         return root.GetProperty("result").GetRawText();
     }

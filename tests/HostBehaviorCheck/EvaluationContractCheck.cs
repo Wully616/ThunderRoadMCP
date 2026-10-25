@@ -70,9 +70,53 @@ internal static class EvaluationContractCheck
         Assert(compilerDiagnostics.GetProperty("id").GetString() == "CS0103" &&
                Structured(compileFailure).GetProperty("errorCode").GetString() == "evaluation.compilation_failed" &&
                compilerDiagnostics.GetProperty("line").GetInt32() == 2 &&
-               compilerDiagnostics.GetProperty("span").GetProperty("length").GetInt32() == 13,
-            "host error shaping forwards structured compiler diagnostics and preserves the compilation error code");
+               compilerDiagnostics.GetProperty("span").GetProperty("length").GetInt32() == 13 &&
+               !Structured(compileFailure).GetProperty("error").GetProperty("messageTruncated").GetBoolean() &&
+               !Structured(compileFailure).GetProperty("diagnosticsTruncated").GetBoolean(),
+            "host error shaping forwards structured compiler diagnostics and preserves untruncated compilation metadata");
 
+        var warningFloodDiagnostics = new List<object>
+        {
+            new
+            {
+                id = "CS0103", severity = "error", message = "missing final symbol", messageTruncated = false,
+                line = (int?)30, column = (int?)8, span = (object)new { start = 300, length = 7 }
+            }
+        };
+        warningFloodDiagnostics.AddRange(Enumerable.Range(0, 19).Select(index => (object)new
+        {
+            id = "CS0219",
+            severity = "warning",
+            message = index == 0 ? new string('w', 256) : "unused local " + index,
+            messageTruncated = index == 0,
+            line = (int?)(index + 1),
+            column = (int?)5,
+            span = (object)new { start = index, length = 1 }
+        }));
+        string warningFloodResponse = JsonSerializer.Serialize(new
+        {
+            id = "depth-check",
+            success = false,
+            error = new string('x', 4096),
+            messageTruncated = true,
+            errorCode = "evaluation.compilation_failed",
+            executionOutcome = "not_started",
+            diagnostics = warningFloodDiagnostics,
+            diagnosticsTruncated = true,
+            omittedDiagnosticCount = 6
+        });
+        var warningFloodFailure = CaptureBridgeFailureResponse(warningFloodResponse);
+        var warningFloodResult = await ToolInvocation.RunEvaluation(() => Task.FromException<string>(warningFloodFailure));
+        var warningFloodEnvelope = Structured(warningFloodResult);
+        var prioritizedDiagnostics = warningFloodEnvelope.GetProperty("diagnostics");
+        Assert(warningFloodFailure.MessageTruncated && warningFloodEnvelope.GetProperty("error").GetProperty("messageTruncated").GetBoolean() &&
+               warningFloodResult.Content.OfType<TextContentBlock>().Single().Text.Length == 4096 &&
+               prioritizedDiagnostics.GetArrayLength() == 20 &&
+               prioritizedDiagnostics[0].GetProperty("id").GetString() == "CS0103" &&
+               prioritizedDiagnostics[1].GetProperty("messageTruncated").GetBoolean() &&
+               warningFloodEnvelope.GetProperty("diagnosticsTruncated").GetBoolean() &&
+               warningFloodEnvelope.GetProperty("omittedDiagnosticCount").GetInt32() == 6,
+            "host preserves an upstream-clipped message, the late error ahead of warning flood, per-diagnostic truncation, and omitted count");
         var success = await ToolInvocation.RunEvaluation(() => Task.FromResult("{\"value\":42}"));
         Assert(success.IsError != true && Structured(success).GetProperty("value").GetInt32() == 42 &&
                success.Content.OfType<TextContentBlock>().Single().Text == "{\"value\":42}",
@@ -153,6 +197,19 @@ internal static class EvaluationContractCheck
         }
         throw new InvalidOperationException("Evaluation contract check expected a bridge failure response.");
     }
+    private static BridgeRequestException CaptureBridgeFailureResponse(string response)
+    {
+        try
+        {
+            BridgeClient.ParseResponse(Encoding.UTF8.GetBytes(response), "depth-check");
+        }
+        catch (BridgeRequestException exception)
+        {
+            return exception;
+        }
+        throw new InvalidOperationException("Evaluation contract check expected a bridge failure response.");
+    }
+
 
     private static void AssertOutcome(CallToolResult result, string outcome, string errorCode)
     {

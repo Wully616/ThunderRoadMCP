@@ -152,6 +152,22 @@ game_spawn_creature(creatureId: "<CreatureData id>", key: "demo-creature")
 
 `game_spawn_effect(effectId, x?, y?, z?, key?)` resolves `Catalog.GetData<EffectData>(effectId)`, spawns it with `EffectData.Spawn`, calls `EffectInstance.Play()`, stores the `EffectInstance` under `key` (generated as `effect-<12 hex>` when omitted), and returns `{key,effectId,position:{x,y,z}}`. Omit `x`/`y`/`z` to play it 1.5 m in front of the player. Find ids with `catalog_search(catalogType="EffectData")`. Stop it with `McpRuntime.Current.Get<EffectInstance>(key).End()` (or `Despawn()`), then `McpRuntime.Current.Remove(key)`.
 
+### Safe gameplay probes
+
+#### Aim an item's flight axis
+
+`Item.flyDirRef` is optional. When present, it defines the item's flight direction; its local **+Z** axis is forward. Do not assume `item.transform.forward` is the flight axis or dereference a missing `flyDirRef`. Check the reference first and report/handle its absence. To aim the reference at `desiredFlyRotation`, compute the item's root rotation as `desiredFlyRotation * Quaternion.Inverse(rootRelativeFlyRotation)`, where `rootRelativeFlyRotation` is the reference rotation relative to the item's root. If `targetPivotPosition` is where the reference pivot should be, compensate for its offset with `rootPosition = targetPivotPosition - desiredFlyRotation * rootRelativeFlyPosition`, where `rootRelativeFlyPosition` is the reference position relative to the root. Confirm the installed API and hierarchy before applying this to a particular item.
+
+#### Avoid accidental lethal damage
+
+`Burning.Ignite` schedules a direct `Kill`; setting a damage multiplier to zero does not make that operation nonlethal. If the goal is only to show flames without killing or damaging the target, use a visual flame effect rather than `Ignite`. Keep the probe small and confirm the target and effect before changing live state.
+
+#### Respect pooled item lifetime
+
+`Item.Despawn()` can return an item to a pool: a retained C# reference may remain non-null, and that same `Item` may later represent a reused object. Treat despawn as loss of ownership, not proof that the reference was destroyed. For code that tracks an item beyond one callback, retain the exact `Item.SpawnEvent` delegates, release that item's ownership in `Item.OnDespawnEvent`, and explicitly unsubscribe the same delegates when the owner stops. Guard spawn callbacks with an owner-active flag so a late callback cannot recreate ownership after cleanup. Do not rely on `item == null` or `game_runtime(action:"clear")` for this cleanup.
+
+Physics changes such as impulses are reflected after the physics simulation tick; a value read immediately in the same evaluation may still be the pre-simulation value. Observe it on a later frame/tick when checking the result.
+
 ## API workflow
 
 Choose the workflow by task:
@@ -316,6 +332,7 @@ The loop ends by itself when the item is destroyed (for example after a level lo
    ```
 
    `game_runtime(action:"clear")` drops references and stops managed coroutines; it does not despawn objects. Use `Item.Despawn()` for spawned items instead of destroying their GameObjects directly.
+
 
 
 ## Troubleshooting
