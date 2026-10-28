@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
@@ -35,6 +36,7 @@ internal static class BridgeSelfTest
         BridgeResultContractCheck.Run();
         VerifyExampleCompilation();
         VerifyReferenceSourcePrecedence(managed);
+        VerifyCompileOnlyValidation();
         object arithmetic = CSharpEvaluator.Compile("return 6 * 7;", CancellationToken.None)();
         Assert((int)arithmetic == 42, "arithmetic result");
 
@@ -687,6 +689,75 @@ internal static class BridgeSelfTest
         catch (InvalidDataException ex)
         {
             Assert(ex.Message.Contains("api_search"), "unknown component type points to api_search");
+        }
+    }
+
+    private static void VerifyCompileOnlyValidation()
+    {
+        var handler = new BridgeRequestHandler(new BridgeConfig());
+        int loadedEvaluationAssembliesBefore = CountEvaluationAssemblies();
+        string sideEffectPath = Path.Combine(Path.GetTempPath(), "thunderroad-mcp-validation-" + Guid.NewGuid().ToString("N") + ".txt");
+        try
+        {
+            AssertValidationRejected(handler, new { code = " ", timeoutMs = 30000 }, "validate rejects an empty body");
+            AssertValidationRejected(handler, new { code = "return null;", timeoutMs = 30001 }, "validate rejects timeout above the limit");
+            JObject success = DispatchValidation(handler, "return 42;");
+            Assert((bool)success["valid"] && ((JArray)success["diagnostics"]).Count == 0,
+                "compile-only validation accepts valid code: " + success.ToString());
+
+            JObject warning = DispatchValidation(handler, "int unused = 1; return null;");
+            Assert((bool)warning["valid"] && ((JArray)warning["diagnostics"]).Any(d => (string)d["severity"] == "warning"),
+                "compile-only validation keeps warning-only code valid and reports warnings");
+
+            JObject failure = DispatchValidation(handler, "\nreturn missingValidationName;");
+            JObject diagnostic = (JObject)((JArray)failure["diagnostics"])[0];
+            Assert(!(bool)failure["valid"] && (string)diagnostic["id"] == "CS0103" &&
+                   (int)diagnostic["line"] == 2 && (int)diagnostic["column"] == 8 &&
+                   (int)diagnostic["span"]["start"] == 8,
+                "compile-only validation returns semantic errors mapped to submitted source coordinates");
+
+            JObject syntaxFailure = DispatchValidation(handler, "return (");
+            Assert(!(bool)syntaxFailure["valid"] &&
+                   ((JArray)syntaxFailure["diagnostics"]).Any(d => (string)d["severity"] == "error"),
+                "compile-only validation returns syntax errors as invalid results");
+
+            string escapedPath = sideEffectPath.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            JObject sideEffect = DispatchValidation(handler,
+                "System.IO.File.WriteAllText(\"" + escapedPath + "\", \"executed\"); return null;");
+            Assert((bool)sideEffect["valid"] && !File.Exists(sideEffectPath),
+                "compile-only validation never invokes the submitted body");
+            Assert(CountEvaluationAssemblies() == loadedEvaluationAssembliesBefore,
+                "compile-only validation never loads an evaluation assembly");
+        }
+        finally
+        {
+            if (File.Exists(sideEffectPath)) File.Delete(sideEffectPath);
+        }
+    }
+
+    private static JObject DispatchValidation(BridgeRequestHandler handler, string code)
+    {
+        var result = (BridgeJsonResult)DispatchAndDrain(handler, new BridgeRequest
+        {
+            method = "validate",
+            parameters = JObject.FromObject(new { code, timeoutMs = 30000 })
+        }, BridgeRequestTimings.CreateForSelfTest());
+        return JObject.Parse(result.Json);
+    }
+    private static void AssertValidationRejected(BridgeRequestHandler handler, object parameters, string message)
+    {
+        try
+        {
+            handler.DispatchAsync(new BridgeRequest
+            {
+                method = "validate",
+                parameters = JObject.FromObject(parameters)
+            }, CancellationToken.None, BridgeRequestTimings.CreateForSelfTest()).GetAwaiter().GetResult();
+            throw new Exception("Expected validation request rejection.");
+        }
+        catch (InvalidDataException)
+        {
+            Assert(true, message);
         }
     }
 

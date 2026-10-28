@@ -292,6 +292,19 @@ public static class GameTools
             return bridgeClient.RequestAsync("evaluate", new { code, timeoutMs }, cancellationToken);
         });
 
+    [McpServerTool(Name = "validate_csharp", Title = "Validate C# without executing", ReadOnly = true, OpenWorld = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
+    [Description("Compile a C# statement body against the game's loaded references without invoking it or loading the emitted evaluation assembly. Returns valid plus bounded Roslyn diagnostics; compilation success does not prove runtime behavior.")]
+    public static Task<CallToolResult> ValidateCSharp(BridgeClient bridgeClient,
+        [Description("C# statement body to compile; never executed by this tool.")] string code,
+        [Description("Compilation deadline in milliseconds, from 1 to 30000.")] int timeoutMs = 30000,
+        CancellationToken cancellationToken = default) =>
+        ToolInvocation.Run(() =>
+        {
+            if (timeoutMs is < 1 or > 30_000)
+                throw new ArgumentOutOfRangeException(nameof(timeoutMs), "timeoutMs must be between 1 and 30000.");
+            return RequestBridgeFeatureAsync(bridgeClient, "validate", new { code, timeoutMs }, "validate_csharp", cancellationToken);
+        });
+
     [McpServerTool(Name = "game_logs", Title = "Read Unity game logs", ReadOnly = true, UseStructuredContent = true, OutputSchemaType = typeof(System.Text.Json.Nodes.JsonObject))]
     [Description("Read bounded pages from the current Player.log, previous Player-prev.log, or the authenticated in-game bridge log ring. File pagination uses beforeByteOffset plus snapshotId; bridge pagination uses since, where 0 returns the newest entries and nextSequence advances forward.")]
     public static Task<CallToolResult> GameLogs(BridgeClient bridgeClient,

@@ -34,7 +34,7 @@ namespace ThunderRoadMcp.Bridge
         private static Assembly compilerAssembly;
         private static readonly Dictionary<string, Assembly> PayloadAssemblies = new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
         private static Func<string, string, CancellationToken, Action<string, double>, Func<object>> compileEntryPoint;
-        private static Action<string, string, CancellationToken, Action<string, double>> validateEntryPoint;
+        private static Func<string, string, CancellationToken, Action<string, double>, object> validateEntryPoint;
         private static bool loadingCompiler;
         private static ResolveEventHandler resolveHandler;
 
@@ -70,10 +70,10 @@ namespace ThunderRoadMcp.Bridge
             return compileEntryPoint(code, bridgeAssemblyPath, token, recordTiming);
         }
 
-        public static void Validate(string code, CancellationToken token, Action<string, double> recordTiming)
+        public static object Validate(string code, CancellationToken token, Action<string, double> recordTiming)
         {
             LoadCompiler();
-            validateEntryPoint(code, bridgeAssemblyPath, token, recordTiming);
+            return validateEntryPoint(code, bridgeAssemblyPath, token, recordTiming);
         }
 
         private static Assembly LoadCompiler()
@@ -104,8 +104,8 @@ namespace ThunderRoadMcp.Bridge
                     throw new MissingMethodException(CompilerAssemblyName, "CSharpEvaluator.Validate(code, bridgeAssemblyPath, token, recordTiming)");
                 var compile = (Func<string, string, CancellationToken, Action<string, double>, Func<object>>)Delegate.CreateDelegate(
                     typeof(Func<string, string, CancellationToken, Action<string, double>, Func<object>>), compileMethod);
-                var validate = (Action<string, string, CancellationToken, Action<string, double>>)Delegate.CreateDelegate(
-                    typeof(Action<string, string, CancellationToken, Action<string, double>>), validateMethod);
+                var validate = (Func<string, string, CancellationToken, Action<string, double>, object>)Delegate.CreateDelegate(
+                    typeof(Func<string, string, CancellationToken, Action<string, double>, object>), validateMethod);
                 lock (Gate)
                 {
                     if (compilerAssembly == null)

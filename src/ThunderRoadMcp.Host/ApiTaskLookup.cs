@@ -280,11 +280,11 @@ public sealed partial class InstalledApiCatalog
             ["examples"] = new JsonArray(),
             ["executionContract"] = new JsonObject
             {
-                ["body"] = "evaluate_csharp accepts a C# statement body; use return to return a value.",
+                ["body"] = "validate_csharp and evaluate_csharp accept a C# statement body; use return to return a value.",
                 ["imports"] = "System, System.Linq, System.Collections.Generic, UnityEngine, ThunderRoad, ThunderRoadMcp.Bridge",
-                ["threading"] = "Execution is synchronous on Unity's main thread; use a managed coroutine for work spanning frames.",
+                ["threading"] = "validate_csharp compiles without execution; evaluate_csharp executes synchronously on Unity's main thread. Use a managed coroutine for work spanning frames.",
                 ["async"] = "Do not use top-level await or return Task/Task<T>.",
-                ["safety"] = "This lookup is read-only metadata; it does not execute target assemblies or prove live behavior.",
+                ["safety"] = "This lookup is read-only metadata and does not execute target assemblies; validate_csharp checks compilation only and does not prove live behavior.",
             },
             ["warnings"] = new JsonArray(),
             ["missingInformation"] = new JsonArray(),

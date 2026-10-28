@@ -173,7 +173,7 @@ Physics changes such as impulses are reflected after the physics simulation tick
 Choose the workflow by task:
 
 - Existing game action: use its dedicated tool, such as `game_spawn_item`, `game_spawn_creature`, or `game_spawn_effect`, and `game_find_objects` to locate live scene components; search catalog data only if the required ID is unknown. Readiness checks are needed only before bridge-backed actions.
-- Custom script: one `api_lookup(query:"...")` call returns ranked signatures, bounded related declarations, relevant examples, and execution/cleanup context; then write a purposeful statement-body snippet and call `evaluate_csharp`.
+- Custom script: one `api_lookup(query:"...")` call returns ranked signatures, bounded related declarations, relevant examples, and execution/cleanup context; write a purposeful statement body, use `validate_csharp` for compile-only checking when useful, then call `evaluate_csharp` only when execution is intended.
 - Exact implementation question: use `api_lookup(mode:"symbol", query:"...")` or the lower-level `api_search`, `api_type`, and `api_decompile` tools. Do not fetch exhaustive inventory, inspect unrelated types, or read the guide twice by default.
 
 The API tools inspect installed files without executing them. They cover the game's `Managed` assemblies and enabled mod folders; disabled (underscore-prefixed) mod folders are never included. `api_search` and `api_lookup` take `scope`: before writing `evaluate_csharp` code, use `scope:"loaded"` (or the default `auto` while the bridge is connected) so results only include mods the running game actually loaded; for offline mod authoring, `scope:"installed"` covers every enabled mod. Base catalog records are shipped data, not proof that an object exists in the mod-merged runtime. Snapshot IDs reject stale symbols after files change.
@@ -202,6 +202,7 @@ Use `source:"current"` and `source:"previous"` to read `Player.log` and `Player-
 - Every successful eval leaves a compiled assembly loaded until the game process restarts. Prefer a small number of purposeful snippets over a stream of one-liners.
 - The code is trusted arbitrary C# with full game-process and filesystem access. Prefer read-only probes; mutate only when that is the goal.
 - Runtime exceptions return bounded exception type, message, and stack details; compiler diagnostics report physical line and column in the submitted snippet, unaffected by `#line` directives. Errors include `executionOutcome`: `not_started`, `completed_result_unavailable`, or `unknown`; do not automatically retry an `unknown` evaluation.
+- Use `validate_csharp(code, timeoutMs?)` to compile the same statement body without invoking it or loading the emitted assembly. It returns `{valid,diagnostics,diagnosticsTruncated,omittedDiagnosticCount}`; warning-only code is valid, while Roslyn errors set `valid:false`. Diagnostics are capped at 20 entries and 256 message characters. Compile success only checks compilation, not runtime behavior; use `evaluate_csharp` only when execution is intended.
 
 ## Unity 2021.3 guidance
 

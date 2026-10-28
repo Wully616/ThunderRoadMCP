@@ -53,17 +53,35 @@ namespace ThunderRoadMcp.Compiler
         }
 
         /// <summary>Compile the evaluator wrapper and emit it without loading or executing its assembly.</summary>
-        public static void Validate(string code, string bridgeAssemblyPath, CancellationToken token)
+        public static CSharpValidationResult Validate(string code, string bridgeAssemblyPath, CancellationToken token)
         {
-            Validate(code, bridgeAssemblyPath, token, null);
+            return Validate(code, bridgeAssemblyPath, token, null);
         }
 
-        public static void Validate(string code, string bridgeAssemblyPath, CancellationToken token,
+        public static CSharpValidationResult Validate(string code, string bridgeAssemblyPath, CancellationToken token,
             Action<string, double> recordTiming)
         {
             CSharpCompilation compilation = CreateCompilation(code, bridgeAssemblyPath, token, recordTiming);
-            using (Emit(compilation, code, token, recordTiming)) { }
+            using (var image = new MemoryStream())
+            {
+                EmitResult emitted = Measure("emitMs", recordTiming, () => compilation.Emit(image, cancellationToken: token));
+                token.ThrowIfCancellationRequested();
+                Diagnostic[] diagnostics = emitted.Diagnostics
+                    .Where(d => d.Severity != DiagnosticSeverity.Hidden)
+                    .Distinct(DiagnosticIdentityComparer.Instance)
+                    .OrderBy(GetDiagnosticPriority)
+                    .ToArray();
+                bool hasErrors = diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error);
+                if (!emitted.Success && !hasErrors)
+                    throw new InvalidOperationException("Roslyn emit failed without reporting compiler errors.");
+                SourceText codeSource = SourceText.From(code);
+                EvaluationDiagnosticInfo[] mapped = diagnostics
+                    .Select(d => CreateDiagnosticInfo(d, SourcePrefix.Length, codeSource))
+                    .ToArray();
+                return new CSharpValidationResult(!hasErrors, mapped);
+            }
         }
+
 
         private static CSharpCompilation CreateCompilation(string code, string bridgeAssemblyPath, CancellationToken token,
             Action<string, double> recordTiming)
@@ -253,6 +271,17 @@ namespace ThunderRoadMcp.Compiler
         public IReadOnlyList<EvaluationDiagnosticInfo> Diagnostics { get; }
         public EvaluationCompilationException(string message, IReadOnlyList<EvaluationDiagnosticInfo> diagnostics) : base(message) =>
             Diagnostics = diagnostics;
+    }
+
+    public sealed class CSharpValidationResult
+    {
+        public bool Valid { get; }
+        public IReadOnlyList<EvaluationDiagnosticInfo> Diagnostics { get; }
+        public CSharpValidationResult(bool valid, IReadOnlyList<EvaluationDiagnosticInfo> diagnostics)
+        {
+            Valid = valid;
+            Diagnostics = diagnostics;
+        }
     }
 
     public sealed class EvaluationDiagnosticInfo

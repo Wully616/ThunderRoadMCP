@@ -175,6 +175,15 @@ namespace ThunderRoadMcp.Bridge
                         throw new BridgeEvaluationException("evaluation.not_started", exception.Message,
                             "not_started", null, exception);
                     }
+                case "validate":
+                    string validationCode = (string)args["code"];
+                    if (string.IsNullOrWhiteSpace(validationCode) || Encoding.UTF8.GetByteCount(validationCode) > MaxLineBytes)
+                        throw new InvalidDataException("validate.code must be non-empty and at most 64 KiB UTF-8.");
+                    long validationTimeout = GetInteger(args, "timeoutMs", 30000);
+                    if (validationTimeout < 1 || validationTimeout > 30000)
+                        throw new InvalidDataException("validate.timeoutMs must be between 1 and 30000.");
+                    return new BridgeJsonResult(await ValidateCode(validationCode,
+                        TimeSpan.FromMilliseconds(validationTimeout), token, timings).ConfigureAwait(false));
                 case "runtime":
                     return await RuntimeAsync(args, token).ConfigureAwait(false);
                 case "load_level":
@@ -1032,6 +1041,88 @@ namespace ThunderRoadMcp.Bridge
             string managed = NormalizeRoot(managedRoot);
             DirectoryInfo dataDirectory = managed == null ? null : Directory.GetParent(managed);
             return dataDirectory == null ? null : Path.Combine(dataDirectory.FullName, "StreamingAssets", "Mods");
+        }
+
+        private async Task<string> ValidateCode(string code, TimeSpan timeout, CancellationToken requestToken,
+            BridgeRequestTimings timings)
+        {
+            using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(requestToken))
+            {
+                deadline.CancelAfter(timeout);
+                CancellationToken token = deadline.Token;
+                using (timings.Measure("compilerQueueWaitMs"))
+                    await compiler.WaitAsync(token).ConfigureAwait(false);
+                Task<object> compile = null;
+                bool releaseDeferred = false;
+                try
+                {
+                    compile = Task.Run(() =>
+                    {
+                        using (timings.Measure("compilationMs"))
+                            return CSharpEvaluator.Validate(code, token, timings);
+                    }, token);
+                    object result;
+                    try { result = await AwaitWithCancellation(compile, token).ConfigureAwait(false); }
+                    catch
+                    {
+                        if (!compile.IsCompleted)
+                        {
+                            releaseDeferred = true;
+                            _ = compile.ContinueWith(t =>
+                            {
+                                if (t.IsFaulted) { var ignored = t.Exception; }
+                                compiler.Release();
+                            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                        }
+                        throw;
+                    }
+                    return SerializeResult(FormatValidationResult(result));
+                }
+                finally
+                {
+                    if (!releaseDeferred) compiler.Release();
+                }
+            }
+        }
+
+        private static object FormatValidationResult(object result)
+        {
+            Type resultType = result.GetType();
+            bool valid = (bool)resultType.GetProperty("Valid").GetValue(result, null);
+            IEnumerable values = resultType.GetProperty("Diagnostics").GetValue(result, null) as IEnumerable;
+            var diagnostics = new List<object>();
+            int diagnosticCount = 0;
+            if (values != null)
+            {
+                foreach (object value in values)
+                {
+                    if (value == null) continue;
+                    diagnosticCount++;
+                    if (diagnostics.Count == 20) continue;
+                    Type type = value.GetType();
+                    string message = (string)type.GetProperty("Message").GetValue(value, null);
+                    bool messageTruncated = message != null && message.Length > 256;
+                    if (messageTruncated) message = message.Substring(0, 256);
+                    object spanValue = type.GetProperty("Span").GetValue(value, null);
+                    object span = spanValue == null ? null : new
+                    {
+                        start = spanValue.GetType().GetProperty("Start").GetValue(spanValue, null),
+                        length = spanValue.GetType().GetProperty("Length").GetValue(spanValue, null)
+                    };
+                    diagnostics.Add(new
+                    {
+                        id = type.GetProperty("Id").GetValue(value, null),
+                        severity = type.GetProperty("Severity").GetValue(value, null),
+                        message,
+                        messageTruncated,
+                        line = type.GetProperty("Line").GetValue(value, null),
+                        column = type.GetProperty("Column").GetValue(value, null),
+                        span
+                    });
+                }
+            }
+            int omitted = Math.Max(0, diagnosticCount - diagnostics.Count);
+            return new { valid, diagnostics, diagnosticsTruncated = omitted > 0, omittedDiagnosticCount = omitted };
         }
 
         private async Task<string> Evaluate(string code, TimeSpan timeout, CancellationToken shutdownToken, BridgeRequestTimings timings)
